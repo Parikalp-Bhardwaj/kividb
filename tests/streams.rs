@@ -2161,20 +2161,26 @@ fn test_xdelex_acked_waits_for_every_group() {
 }
 
 #[test]
-fn test_xdelex_acked_without_groups_deletes_nothing() {
+fn test_xdelex_acked_without_groups_deletes() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
     c.cmds(&["XADD", "s", "1-0", "f", "v"]);
+    c.cmds(&["XADD", "s", "2-0", "f", "v"]);
 
-    // No consumer group has acknowledged it — there are none — so ACKED
-    // leaves it, and says so with 2 (as Redis documents).
+    // With no consumer groups nothing refers to an entry: ACKED deletes it,
+    // as in Redis 8.10.
     let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "1-0"]);
+    assert_eq!(r.as_array()[0].as_int(), 1);
+
+    // And once the last group that held it back is destroyed.
+    c.cmds(&["XGROUP", "CREATE", "s", "g", "0"]);
+    c.cmds(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+    let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "2-0"]);
     assert_eq!(r.as_array()[0].as_int(), 2);
-    assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 1);
-    // The default policy deletes it.
-    let r = c.cmds(&["XDELEX", "s", "IDS", "1", "1-0"]);
+    c.cmds(&["XGROUP", "DESTROY", "s", "g"]);
+    let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "2-0"]);
     assert_eq!(r.as_array()[0].as_int(), 1);
     assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 0);
 }
@@ -3089,4 +3095,34 @@ fn test_approximate_trim_ends_nodes_at_stream_node_max_bytes() {
     c.cmds(&["CONFIG", "SET", "stream-node-max-bytes", "4kb"]);
     let r = c.cmds(&["CONFIG", "GET", "stream-node-max-bytes"]);
     assert_eq!(r.as_array()[1].as_str(), "4096");
+}
+
+/// `XTRIM … ACKED`, with `~` or without, passes over an entry a group still
+/// needs and goes on to the next, as Redis does (8.10's unit/type/stream).
+#[test]
+fn test_xtrim_acked_passes_over_what_a_group_still_needs() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for approx in [true, false] {
+        c.cmds(&["DEL", "s"]);
+        for id in ["1-0", "2-0", "3-0", "4-0", "5-0"] {
+            c.cmds(&["XADD", "s", id, "f", "v"]);
+        }
+        c.cmds(&["XGROUP", "CREATE", "s", "g", "0"]);
+        c.cmds(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+        c.cmds(&["XACK", "s", "g", "1-0", "2-0", "4-0"]);
+
+        let how = if approx { "~" } else { "=" };
+        let r = c.cmds(&["XTRIM", "s", "MINID", how, "6-0", "ACKED"]);
+        assert_eq!(r.as_int(), 3, "{how}");
+        let left = c.cmds(&["XRANGE", "s", "-", "+"]);
+        let ids: Vec<&str> = left
+            .as_array()
+            .iter()
+            .map(|e| e.as_array()[0].as_str())
+            .collect();
+        assert_eq!(ids, ["3-0", "5-0"], "{how}");
+    }
 }

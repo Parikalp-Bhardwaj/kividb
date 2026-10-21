@@ -94,6 +94,13 @@ written against an earlier KiviDB may notice them.
   `CLIENT UNBLOCK` sent straight after found the `BLPOP` the pause had held
   not yet blocked, and answered 0. They also go on at once; they looked
   again only every millisecond.
+  **`XTRIM` and `XADD` trimming with `ACKED` pass over an entry a group
+  still needs** and go on to the next, as Redis does; they stopped at it.
+  With `~`, under `DELREF` or `ACKED`, a node that cannot go whole is gone
+  through entry by entry, as in Redis. **`XDELEX … ACKED` deletes an entry
+  of a stream with no consumer groups**, as Redis 8.10 does: nothing refers
+  to it. It answered 2, so that once the last group was destroyed nothing
+  could be deleted with `ACKED`.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

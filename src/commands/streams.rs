@@ -670,7 +670,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
         parts[id_index] = id_str_out.clone().into_bytes();
         if approx.is_some() {
-            stream_extra::exact_trim_args(&mut parts, 2, id_index, &inner);
+            stream_extra::exact_trim_args(&mut parts, 2, id_index, &inner, trim_refs);
         }
         effect(parts);
     }
@@ -1195,7 +1195,7 @@ pub fn xtrim(ctx: &mut Ctx) -> Vec<u8> {
                     if removed > 0 {
                         let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
                         let end = parts.len();
-                        stream_extra::exact_trim_args(&mut parts, 2, end, &inner);
+                        stream_extra::exact_trim_args(&mut parts, 2, end, &inner, refs);
                         effect(parts);
                     }
                     removed
@@ -3188,8 +3188,8 @@ fn notify_xread_waiters(ctx: &Ctx, key: &str) {
 // Per ID:
 //    1  → deleted
 //   -1  → no such entry in the stream
-//    2  → not deleted: still referenced (ACKED), or there are no consumer
-//         groups for it to have been acknowledged by
+//    2  → not deleted: still referenced (ACKED). With no consumer groups
+//         nothing refers to it, and ACKED deletes it (Redis 8.10).
 
 pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
@@ -3230,8 +3230,8 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
                 }
                 return resp_integer(-1);
             }
-            let acked = refs != TrimRefs::Acked || !inner.groups.is_empty();
-            if acked && stream_extra::delete_entry(&mut inner, id, refs) {
+            // With no groups, nothing refers to it (Redis 8.10).
+            if stream_extra::delete_entry(&mut inner, id, refs) {
                 resp_integer(1)
             } else {
                 resp_integer(2)
