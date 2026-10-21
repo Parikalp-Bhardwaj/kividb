@@ -103,6 +103,11 @@ written against an earlier KiviDB may notice them.
   could be deleted with `ACKED`.
   `XACKDEL` on a group that does not exist answers -1 for each ID, as for
   a key that does not exist, as Redis 8.10 does; it was a `NOGROUP` error.
+- `MEMORY USAGE` of a string is what Redis 8 reports for one: its object's
+  header, key and value, rounded up to the allocator's size class. It was
+  a share of the key table's entries plus the value, which for small
+  strings came out above the most Redis's suite allows (64 bytes for a
+  1-byte key and value; it said 73).
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

@@ -50,6 +50,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// The size the allocator gives a request of `n` bytes, in jemalloc's
+/// classes (Redis's): 8, then steps of 16 to 128, then four to each
+/// doubling.
+fn size_class(n: usize) -> usize {
+    if n <= 8 {
+        return 8;
+    }
+    if n <= 128 {
+        return n.div_ceil(16) * 16;
+    }
+    let step = 1usize << ((usize::BITS - (n - 1).leading_zeros() - 1) - 2);
+    n.div_ceil(step) * step
+}
+
 fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
     if cmd.len() < 3 {
@@ -92,8 +106,11 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let key_overhead = 64 + if key.len() > 24 { key.len() } else { 0 };
 
     let bytes: usize = match value {
-        // Its bytes, and the count and length in front of them.
-        KiviDBValue::String(b) => key_overhead + b.heap_size(),
+        // As Redis 8 counts a string: one object holding its header, the
+        // key and the value, as the allocator rounds it. Redis's suite
+        // holds it to that (at least the three, at most twice them or 64),
+        // which a share of the table's entries does not fit.
+        KiviDBValue::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
 
         KiviDBValue::List(arc) => {
             let inner = arc.read();
@@ -557,4 +574,18 @@ fn memory_malloc_stats() -> Vec<u8> {
     // On Linux you'd call malloc_info() — complex and rarely needed.
     // Return minimal valid XML matching the format clients expect.
     resp_bulk_str("<malloc version=\"1\"><heap nr=\"0\"/><total/></malloc>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_class;
+
+    #[test]
+    fn size_classes_are_jemallocs() {
+        let classes: Vec<usize> = [1, 8, 9, 17, 128, 129, 160, 161, 256, 257, 1000, 4097]
+            .iter()
+            .map(|&n| size_class(n))
+            .collect();
+        assert_eq!(classes, [8, 8, 16, 32, 128, 160, 160, 192, 256, 320, 1024, 5120]);
+    }
 }
