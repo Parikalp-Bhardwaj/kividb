@@ -12,6 +12,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    if matches!(name, "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT") {
+        match canonical_field_args(&ctx.cmd, FieldArgs::Expire) {
+            Ok(Some(ordered)) => ctx.cmd = ordered,
+            Ok(None) => {}
+            Err(e) => return Some(e),
+        }
+    }
     let cmd = &ctx.cmd;
 
     match name {
@@ -1799,8 +1806,10 @@ enum HgetexAction {
 }
 
 fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
-    if let Some(moved) = options_before_fields(&ctx.cmd, 1) {
-        ctx.cmd = moved;
+    match canonical_field_args(&ctx.cmd, FieldArgs::GetEx) {
+        Ok(Some(ordered)) => ctx.cmd = ordered,
+        Ok(None) => {}
+        Err(e) => return Some(e),
     }
     // Per-field nils are nested inside the reply array — see HMGET.
     let resp = effective_resp_for_reply(ctx);
@@ -2080,29 +2089,176 @@ enum HsetexTtl {
     KeepOrSet(Instant),
 }
 
-/// Redis 8.10 takes the options of HSETEX and HGETEX on either side of the
-/// `FIELDS numfields ...` block (`HSETEX h FIELDS 1 f v EX 60`). The
-/// parsers here read them before it: so the ones after it are moved there.
-/// The block is skipped by its count, as Redis skips it, so a field or a
-/// value that reads like an option is not taken for one. `None` when there
-/// is nothing to move, or no block to find.
-fn options_before_fields<'a>(cmd: &[&'a [u8]], per_field: usize) -> Option<Vec<&'a [u8]>> {
-    let at = (2..cmd.len()).find(|&i| cmd[i].eq_ignore_ascii_case(b"FIELDS"))?;
-    let count: usize = parse_utf8(cmd.get(at + 1)?)?.parse().ok()?;
-    let end = count.checked_mul(per_field)?.checked_add(at + 2)?;
-    if end >= cmd.len() {
-        return None;
+/// Which of the hash field commands whose arguments Redis 8.10 takes in any
+/// order around their `FIELDS numfields ...` block.
+#[derive(Clone, Copy, PartialEq)]
+enum FieldArgs {
+    /// HSETEX: `[FNX|FXX] [EX|PX|EXAT|PXAT n|KEEPTTL]`, field-value pairs.
+    SetEx,
+    /// HGETEX: `[EX|PX|EXAT|PXAT n|PERSIST]`, fields.
+    GetEx,
+    /// HEXPIRE and its kind: the time at 2, then `[NX|XX|GT|LT]`, fields.
+    Expire,
+}
+
+/// The arguments of a [`FieldArgs`] command checked as Redis 8.10 checks
+/// them (`parseHashFieldExpireArgs`, `parseHashCommandArgs`), with its
+/// errors, and put in the order the handlers here read them: the options,
+/// then `FIELDS`. The block is skipped by its count, as Redis skips it, so a
+/// field or value that reads like an option (`EX`, `FIELDS`) is not taken
+/// for one. `Ok(None)`: nothing to reorder.
+fn canonical_field_args<'a>(
+    cmd: &[&'a [u8]],
+    kind: FieldArgs,
+) -> Result<Option<Vec<&'a [u8]>>, Vec<u8>> {
+    let name = String::from_utf8_lossy(cmd[0]).to_ascii_lowercase();
+    let arity = || {
+        resp_error(&format!(
+            "ERR wrong number of arguments for '{name}' command"
+        ))
+    };
+    let per_field = if kind == FieldArgs::SetEx { 2 } else { 1 };
+    let first = if kind == FieldArgs::Expire {
+        // The time comes first, and is read before anything else.
+        if cmd.len() < 3 {
+            return Err(arity());
+        }
+        if parse_utf8(cmd[2])
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_none()
+        {
+            return Err(resp_error("ERR value is not an integer or out of range"));
+        }
+        3
+    } else {
+        2
+    };
+    let one_ttl = match kind {
+        FieldArgs::SetEx => {
+            "ERR Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified"
+        }
+        _ => "ERR Only one of EX, PX, EXAT, PXAT or PERSIST arguments can be specified",
+    };
+    let mut fields: Option<(usize, usize)> = None;
+    let mut options: Vec<&'a [u8]> = Vec::new();
+    let (mut ttl, mut condition, mut flags) = (false, false, 0u32);
+    let mut i = first;
+    while i < cmd.len() {
+        let word = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
+        match (kind, word.as_str()) {
+            (_, "FIELDS") => {
+                if fields.is_some() {
+                    return Err(resp_error("ERR FIELDS keyword specified multiple times"));
+                }
+                let count = if kind == FieldArgs::Expire {
+                    if i + 2 >= cmd.len() {
+                        return Err(resp_error(
+                            "ERR FIELDS requires at least numfields and one field argument",
+                        ));
+                    }
+                    parse_utf8(cmd[i + 1])
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .filter(|n| (1..=i32::MAX as i64).contains(n))
+                        .ok_or_else(|| {
+                            resp_error("ERR Parameter `numFields` should be greater than 0")
+                        })?
+                } else {
+                    let Some(raw) = cmd.get(i + 1) else {
+                        return Err(arity());
+                    };
+                    parse_utf8(raw)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .filter(|n| (1..=i32::MAX as i64).contains(n))
+                        .ok_or_else(|| resp_error("ERR invalid number of fields"))?
+                } as usize;
+                let end = i + 2 + count * per_field;
+                if end > cmd.len() {
+                    return Err(resp_error("ERR wrong number of arguments"));
+                }
+                fields = Some((i, end));
+                i = end;
+                continue;
+            }
+            (FieldArgs::SetEx | FieldArgs::GetEx, "EX" | "PX" | "EXAT" | "PXAT") => {
+                if ttl {
+                    return Err(resp_error(one_ttl));
+                }
+                if i + 1 >= cmd.len() {
+                    return Err(resp_error("ERR missing expire time"));
+                }
+                ttl = true;
+                options.extend_from_slice(&cmd[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            (FieldArgs::SetEx, "KEEPTTL") | (FieldArgs::GetEx, "PERSIST") => {
+                if ttl {
+                    return Err(resp_error(one_ttl));
+                }
+                ttl = true;
+            }
+            (FieldArgs::SetEx, "FNX" | "FXX") => {
+                if condition {
+                    return Err(resp_error(
+                        "ERR Only one of FXX or FNX arguments can be specified",
+                    ));
+                }
+                condition = true;
+            }
+            (FieldArgs::Expire, "NX" | "XX" | "GT" | "LT") => {
+                flags |= match word.as_str() {
+                    "NX" => 1,
+                    "XX" => 2,
+                    "GT" => 4,
+                    _ => 8,
+                };
+                // One is passed on; more than one is an error below.
+                if options.is_empty() {
+                    options.push(cmd[i]);
+                }
+            }
+            _ => {
+                return Err(resp_error(&format!(
+                    "ERR unknown argument: {}",
+                    String::from_utf8_lossy(cmd[i])
+                )));
+            }
+        }
+        if !matches!(word.as_str(), "NX" | "XX" | "GT" | "LT") {
+            options.push(cmd[i]);
+        }
+        i += 1;
     }
-    let mut moved = Vec::with_capacity(cmd.len());
-    moved.extend_from_slice(&cmd[..at]);
-    moved.extend_from_slice(&cmd[end..]);
-    moved.extend_from_slice(&cmd[at..end]);
-    Some(moved)
+    let Some((at, end)) = fields else {
+        return Err(resp_error("ERR missing FIELDS argument"));
+    };
+    if flags.count_ones() > 1 {
+        return Err(resp_error("ERR Multiple condition flags specified"));
+    }
+    let mut ordered = Vec::with_capacity(cmd.len());
+    ordered.extend_from_slice(&cmd[..first]);
+    ordered.extend_from_slice(&options);
+    ordered.extend_from_slice(&cmd[at..end]);
+    Ok(
+        (ordered.len() != cmd.len() || ordered.iter().zip(cmd).any(|(a, b)| !std::ptr::eq(*a, *b)))
+            .then_some(ordered),
+    )
 }
 
 fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
-    if let Some(moved) = options_before_fields(&ctx.cmd, 2) {
-        ctx.cmd = moved;
+    // The older form, the TTL in seconds straight after the key, is still
+    // taken here, and read by the parser below as it was.
+    let legacy = ctx
+        .cmd
+        .get(2)
+        .and_then(|a| parse_utf8(a))
+        .is_some_and(|s| s.parse::<i64>().is_ok());
+    if !legacy {
+        match canonical_field_args(&ctx.cmd, FieldArgs::SetEx) {
+            Ok(Some(ordered)) => ctx.cmd = ordered,
+            Ok(None) => {}
+            Err(e) => return Some(e),
+        }
     }
     let cmd = &ctx.cmd;
     if cmd.len() < 6 {
