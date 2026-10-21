@@ -47,15 +47,51 @@ impl IdmpArg<'_> {
 /// A 128-bit digest of an entry's fields and values, in order. Each string is
 /// length-prefixed so `("ab","c")` and `("a","bc")` cannot collide by
 /// concatenation.
+/// Redis 8.10's `createIdempotencyHash`: each field-value pair hashed with
+/// XXH3-128 (field, its length, value), the pair hashes combined by sum and
+/// xor so their order does not matter. The same content gives the ID Redis
+/// gives it.
 fn content_iid(fields: &[Field]) -> Arc<[u8]> {
-    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let (mut sum_lo, mut sum_hi, mut xor_lo, mut xor_hi) = (0u64, 0u64, 0u64, 0u64);
     for (field, value) in fields {
-        for part in [field, value] {
-            hasher.update(&(part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(field);
+        hasher.update(&(field.len() as i64).to_le_bytes());
+        hasher.update(value);
+        let pair = hasher.digest128();
+        let (lo, hi) = (pair as u64, (pair >> 64) as u64);
+        sum_lo = sum_lo.wrapping_add(lo);
+        sum_hi = sum_hi.wrapping_add(hi);
+        xor_lo ^= lo;
+        xor_hi ^= hi;
     }
-    Arc::from(&hasher.digest128().to_le_bytes()[..])
+    let lo = sum_lo ^ xor_hi.rotate_left(1);
+    let hi = sum_hi ^ xor_lo.rotate_left(1);
+    let mut iid = [0u8; 16];
+    iid[..8].copy_from_slice(&lo.to_le_bytes());
+    iid[8..].copy_from_slice(&hi.to_le_bytes());
+    Arc::from(&iid[..])
+}
+
+/// `stream-idmp-duration` and `stream-idmp-maxsize` as `CONFIG SET` left
+/// them; 0 until it has, and then the configured value holds.
+pub(crate) static IDMP_DEFAULT_DURATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static IDMP_DEFAULT_MAXSIZE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The server's IDMP defaults: what `CONFIG SET` set, or else the config.
+pub(crate) fn idmp_defaults(config: &crate::config::Config) -> (u64, u64) {
+    let get = |set: &std::sync::atomic::AtomicU64, configured: u64| match set
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        0 => configured,
+        n => n,
+    };
+    (
+        get(&IDMP_DEFAULT_DURATION, config.stream_idmp_duration),
+        get(&IDMP_DEFAULT_MAXSIZE, config.stream_idmp_maxsize),
+    )
 }
 
 /// Effective retention settings for `stream`: its own `XCFGSET` values where
@@ -152,11 +188,34 @@ pub(super) fn idmp_record(
 }
 
 /// `(producers tracked, idempotent IDs tracked)` for `XINFO STREAM`.
-pub(super) fn idmp_tracked(stream: &StreamInner) -> (usize, usize) {
+/// Producers and idempotent IDs `XINFO STREAM` reports as tracked: those
+/// still within the retention period. Redis drops the others in the
+/// background; here they go at the next lookup, and are not counted
+/// meanwhile.
+pub(super) fn idmp_tracked(stream: &StreamInner, defaults: (u64, u64), now: u64) -> (usize, usize) {
+    let (duration, _) = idmp_limits(stream, defaults.0, defaults.1);
+    let horizon = now.saturating_sub(duration.saturating_mul(1000));
+    let live =
+        |p: &crate::types::ProducerIdmp| p.order.iter().filter(|r| r.added_ms >= horizon).count();
+    let counts: Vec<usize> = stream.idmp.producers.values().map(live).collect();
     (
-        stream.idmp.producers.len(),
-        stream.idmp.producers.values().map(|p| p.order.len()).sum(),
+        counts.iter().filter(|n| **n > 0).count(),
+        counts.iter().sum(),
     )
+}
+
+/// The value of an `XCFGSET` option, as Redis's `getLongLongFromObject`
+/// reads it: no sign but `-`, no leading zeros, no spaces.
+pub(super) fn strict_integer(raw: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// The retention settings `XINFO STREAM` reports.
@@ -814,7 +873,7 @@ mod tests {
         assert_eq!(idmp_lookup(&mut s, b"q", b"1", 2000, DEFAULTS), None);
         assert_eq!(s.idmp.iids_added, 1);
         assert_eq!(s.idmp.iids_duplicates, 1);
-        assert_eq!(idmp_tracked(&s), (1, 1));
+        assert_eq!(idmp_tracked(&s, (86_400, 100), 2000), (1, 1));
     }
 
     #[test]
@@ -825,7 +884,7 @@ mod tests {
         assert!(idmp_lookup(&mut s, b"p", b"1", 10_999, DEFAULTS).is_some());
         assert!(idmp_lookup(&mut s, b"p", b"1", 11_001, DEFAULTS).is_none());
         // The producer's map went with its last ID.
-        assert_eq!(idmp_tracked(&s), (0, 0));
+        assert_eq!(idmp_tracked(&s, (10, 100), 11_001), (0, 0));
     }
 
     #[test]
@@ -839,11 +898,11 @@ mod tests {
         assert!(idmp_lookup(&mut s, b"p", b"1", 1000, DEFAULTS).is_none());
         assert!(idmp_lookup(&mut s, b"p", b"2", 1000, DEFAULTS).is_some());
         assert!(idmp_lookup(&mut s, b"p", b"3", 1000, DEFAULTS).is_some());
-        assert_eq!(idmp_tracked(&s), (1, 2));
+        assert_eq!(idmp_tracked(&s, (86_400, 100), 1000), (1, 2));
     }
 
     #[test]
-    fn content_ids_distinguish_messages_and_ignore_nothing() {
+    fn content_ids_distinguish_messages_but_not_their_order() {
         let f = |pairs: &[(&str, &str)]| -> Vec<Field> {
             pairs
                 .iter()
@@ -855,8 +914,8 @@ mod tests {
         assert_ne!(auto.iid(&f(&[("a", "1")])), auto.iid(&f(&[("a", "2")])));
         // Field boundaries are part of the content.
         assert_ne!(auto.iid(&f(&[("ab", "c")])), auto.iid(&f(&[("a", "bc")])));
-        // Order is too.
-        assert_ne!(
+        // Order is not, as in Redis 8.10.
+        assert_eq!(
             auto.iid(&f(&[("a", "1"), ("b", "2")])),
             auto.iid(&f(&[("b", "2"), ("a", "1")]))
         );

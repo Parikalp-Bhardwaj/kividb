@@ -918,11 +918,11 @@ fn xadd_idempotent_production() {
     assert_eq!(info.field("pids-tracked").i(), 0);
     assert_eq!(
         c.cmd(&["XCFGSET", "id:s", "IDMP-DURATION", "0"]).s(),
-        "ERR invalid duration"
+        "ERR IDMP-DURATION must be between 1 and 86400 seconds"
     );
     assert_eq!(
         c.cmd(&["XCFGSET", "id:s", "IDMP-MAXSIZE", "10001"]).s(),
-        "ERR invalid maxsize"
+        "ERR IDMP-MAXSIZE must be between 1 and 10000 entries"
     );
     assert_eq!(
         c.cmd(&["XCFGSET", "id:nope", "IDMP-MAXSIZE", "10"]).s(),
