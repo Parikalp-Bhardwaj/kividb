@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redis 8.10 additions:** the keyspace event classes `o` (a key's value
+  overwritten), `c` (its type changed) and `a` (array commands, part of
+  `A`); `XIDMPRECORD`; per-client `tot-net-in`, `tot-net-out`, `tot-cmds`,
+  `read-events` and pipeline-length counters, and `omem-shared` /
+  `omem-unshared`, in `CLIENT LIST` and `CLIENT INFO`; `expired_keys_active`
+  in `INFO stats`; the `expire-cycle` latency event; `nacked-count` in
+  `XINFO STREAM FULL`. `CONFIG SET stream-idmp-duration` and
+  `stream-idmp-maxsize` now take effect at run time (they were accepted and
+  ignored).
+
 - **VECTOR fields take `TYPE FLOAT64`, `FLOAT16` and `BFLOAT16`.** Only
   FLOAT32 was accepted. Hash blobs and query vectors are read in the field's
   type, as in Redis, and `FT.INFO` reports it as `data_type`. An unknown
@@ -19,7 +29,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   field as FLOAT32: it refuses the field's query vectors and does not index
   new or rebuilt documents.
 
+### Changed
+
+These follow Redis 8.10, the release KiviDB reports itself as; a client
+written against an earlier KiviDB may notice them.
+
+- `MSETEX` replies `1`, or `0` when an `NX`/`XX` condition stops it, instead
+  of `OK` and nil.
+- `ARSCAN` and `ARGREP … WITHVALUES` reply with `[index, value]` pairs
+  instead of a flat list.
+- `XINFO STREAM FULL` calls a group's and a consumer's pending entries
+  `pending` (it was `pel`).
+- `INCREX` is propagated as one `SET` of the result (`KEEPTTL`, `PXAT`, or
+  plain for `PERSIST`), or `DEL`/`UNLINK` when the new TTL has already
+  passed, and its keyspace event is `incrby` / `incrbyfloat`. SET, SETEX
+  and PSETEX with a TTL announce `set` then `expire` (SETEX and PSETEX used
+  to announce `setex` / `psetex`); RESTORE announces `restore`.
+- `XADD … IDMPAUTO` hashes the fields as Redis does, in any order, so an
+  entry's idempotent ID is the one Redis gives it. IDs recorded by an
+  earlier release do not match new ones for the rest of their retention.
+- Arguments that used to be ignored or read loosely are refused with
+  Redis's errors: unknown `XREADGROUP` options and malformed IDs, a second
+  `IDMP`/`IDMPAUTO` on `XADD`, `XCFGSET` without a parameter or with a
+  value that is not an integer, a `DELEX` condition on a value that is not
+  a string, a `SET`/`DELEX` digest that is not 16 characters, a negative
+  `LIMIT` offset on `ZRANGEBYSCORE`/`ZRANGEBYLEX` (now an empty reply), and
+  the hash field-expiry commands' `FIELDS` block. Many error messages are
+  now Redis 8.10's wording (`INCREX`, `LMOVEM`, `SDIFFCARD`, `ARGET`,
+  `ARGREP`, `XCFGSET`, the slowlog settings).
+
 ### Fixed
+
+- **Redis 8.10 compatibility** (#66 and the work after it). CI now runs
+  Redis 8.10.2's test suite (#64): it went from 2079 passed, 76 failed and
+  7 units that hung or stopped early, to 2400 passed and 70 failed with 4,
+  most of the failures left in units that now run to the end. Among the
+  fixes: `INCREX` options, errors and float overflow; `XREADGROUP` option
+  checks; `HSETEX` and `HGETEX` options after the `FIELDS` block; `GETRANGE`
+  with both ends negative; `LMOVEM`'s option order; the slowlog INFO times
+  to two places and the slowlog settings' minimums; `COMMAND
+  GETKEYSANDFLAGS` for `MSETEX` and for `SET` with a condition; `XINFO`
+  counting only idempotent IDs still within their retention, and `XCFGSET`
+  keeping them when a value is set again unchanged.
 
 - **`FUNCTION RESTORE` accepts payloads produced by Redis 7.4 and 8.10**
   (#45). It previously refused them with `ERR DUMP payload version or checksum

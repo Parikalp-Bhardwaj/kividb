@@ -496,7 +496,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
                 };
                 return resp_error(&format!("ERR {which} requires a non-empty producer ID"));
             }
-            Some(IdmpArg::Explicit { iid, .. }) if iid.is_empty() => {
+            Some(IdmpArg::Explicit { iid: [], .. }) => {
                 return resp_error("ERR IDMP requires a non-empty idempotent ID");
             }
             _ => {}
