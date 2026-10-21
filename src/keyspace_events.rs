@@ -254,9 +254,12 @@ pub fn notify(
     }
 }
 
+/// A channel and what is published on it.
+type Held = Vec<(String, Arc<[u8]>)>;
+
 thread_local! {
     /// Events a command announced while they were held back (see [`hold`]).
-    static HELD: std::cell::RefCell<Option<Vec<(String, Arc<[u8]>)>>> =
+    static HELD: std::cell::RefCell<Option<Held>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -283,11 +286,11 @@ pub fn hold() {
 
 /// The held events, and holding no longer: announce what goes first, then
 /// [`replay`] these.
-pub fn release() -> Vec<(String, Arc<[u8]>)> {
+pub fn release() -> Held {
     HELD.take().unwrap_or_default()
 }
 
-pub fn replay(pubsub: &crate::pubsub::PubSubHub, held: Vec<(String, Arc<[u8]>)>) {
+pub fn replay(pubsub: &crate::pubsub::PubSubHub, held: Held) {
     for (channel, payload) in held {
         pubsub.publish(&channel, payload);
     }
