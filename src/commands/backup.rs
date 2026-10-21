@@ -548,6 +548,20 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     })
 }
 
+/// `backup-sealed-ttl` as `CONFIG SET` left it, or as configured.
+static SEALED_TTL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub(crate) fn sealed_ttl(config: &crate::config::Config) -> u64 {
+    match SEALED_TTL.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => config.backup_sealed_ttl,
+        set => set,
+    }
+}
+
+pub(crate) fn set_sealed_ttl(seconds: u64) {
+    SEALED_TTL.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,18 +587,4 @@ mod tests {
         assert_ne!(incr_partial(dir, 1), dir.join(incr_name(1)));
         assert_eq!(Phase::Incrementing.name(), "incrementing");
     }
-}
-
-/// `backup-sealed-ttl` as `CONFIG SET` left it, or as configured.
-static SEALED_TTL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-pub(crate) fn sealed_ttl(config: &crate::config::Config) -> u64 {
-    match SEALED_TTL.load(std::sync::atomic::Ordering::Relaxed) {
-        u64::MAX => config.backup_sealed_ttl,
-        set => set,
-    }
-}
-
-pub(crate) fn set_sealed_ttl(seconds: u64) {
-    SEALED_TTL.store(seconds, std::sync::atomic::Ordering::Relaxed);
 }
