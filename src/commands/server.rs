@@ -146,7 +146,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ("backupdirname", ctx.config.backupdirname.clone()),
         (
             "backup-sealed-ttl",
-            ctx.config.backup_sealed_ttl.to_string(),
+            crate::commands::backup::sealed_ttl(ctx.config).to_string(),
         ),
         ("preload-file", ctx.config.preload_file.clone()),
         (
@@ -171,6 +171,32 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
 }
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
+
+/// A setting's own name, for one Redis also takes under an older one.
+fn config_name(name: &str) -> &str {
+    match name {
+        "cluster-slave-no-failover" => "cluster-replica-no-failover",
+        "slave-lazy-flush" => "replica-lazy-flush",
+        "slave-serve-stale-data" => "replica-serve-stale-data",
+        "slave-read-only" => "replica-read-only",
+        "slave-ignore-maxmemory" => "replica-ignore-maxmemory",
+        "slave-announce-ip" => "replica-announce-ip",
+        "cluster-slave-validity-factor" => "cluster-replica-validity-factor",
+        "list-max-ziplist-size" => "list-max-listpack-size",
+        "slave-priority" => "replica-priority",
+        "slave-announce-port" => "replica-announce-port",
+        "repl-ping-slave-period" => "repl-ping-replica-period",
+        "min-slaves-to-write" => "min-replicas-to-write",
+        "min-slaves-max-lag" => "min-replicas-max-lag",
+        "lua-time-limit" => "busy-reply-threshold",
+        "hash-max-ziplist-entries" => "hash-max-listpack-entries",
+        "zset-max-ziplist-entries" => "zset-max-listpack-entries",
+        "hash-max-ziplist-value" => "hash-max-listpack-value",
+        "zset-max-ziplist-value" => "zset-max-listpack-value",
+        "slaveof" => "replicaof",
+        other => other,
+    }
+}
 
 /// `CONFIG SET` of one setting.
 fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
@@ -636,6 +662,19 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     )),
                 }
             }
+            // Seconds; 0, the default, is off.
+            "backup-sealed-ttl" => match value.parse::<i64>() {
+                Ok(n) if n >= 0 => {
+                    crate::commands::backup::set_sealed_ttl(n as u64);
+                    Some(resp_simple("OK"))
+                }
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -3436,10 +3475,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // not to be moved back, so it is moved only once the
                     // others are set.
                     settings.sort_by_key(|(name, _)| name == "port");
-                    if let Some((_, (twice, _))) = settings
-                        .iter()
-                        .enumerate()
-                        .find(|(i, (name, _))| settings[..*i].iter().any(|(seen, _)| seen == name))
+                    if let Some((_, (twice, _))) =
+                        settings.iter().enumerate().find(|(i, (name, _))| {
+                            settings[..*i]
+                                .iter()
+                                .any(|(seen, _)| config_name(seen) == config_name(name))
+                        })
                     {
                         return Some(resp_error(&format!(
                             "ERR CONFIG SET failed (possibly related to argument '{twice}') -                              duplicate parameter"

@@ -2069,8 +2069,18 @@ fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
                 // Wire format: compressed_len, original_len, compressed_bytes
                 let (clen, _) = rdb_read_length(r)?;
                 let (olen, _) = rdb_read_length(r)?;
-                let mut compressed = vec![0u8; clen as usize];
-                r.read_exact(&mut compressed)?;
+                // The lengths are the payload's word: a length near 2^64
+                // made room for that many bytes at once, and the process
+                // aborted (a `RESTORE`, a replica's full sync). LZF cannot
+                // grow its input much over 88 times (264 bytes from a 3-byte
+                // back reference); a larger claim is not LZF.
+                let compressed = read_exactly(r, usize::try_from(clen).map_err(|_| too_long())?)?;
+                if olen > clen.saturating_mul(256) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LZF original length out of range",
+                    ));
+                }
                 return lzf::decompress(&compressed, olen as usize).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "LZF decompression failed")
                 });
@@ -2084,9 +2094,12 @@ fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
         }
     }
 
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
+    // Room for the bytes as they arrive, not for whatever length is claimed.
+    read_exactly(r, usize::try_from(len).map_err(|_| too_long())?)
+}
+
+fn too_long() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "RDB string length out of range")
 }
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
@@ -3602,20 +3615,45 @@ const REDIS_DUMP_VERSION_MAX: u16 = 15;
 ///
 /// The checksum is verified. It used to be stripped unread, so a payload
 /// corrupted in transit — or simply wrong — was handed to the decoder as-is.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn restore_payload(payload: &[u8]) -> Option<KiviDBValue> {
+    restore_payload_checked(payload).ok()
+}
+
+/// Why a `RESTORE` payload was refused, in Redis's words.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreError {
+    /// The trailer is not one this server reads.
+    VersionOrChecksum,
+    /// The trailer is, and what it seals is not a value.
+    BadData,
+}
+
+impl RestoreError {
+    pub fn message(&self) -> &'static str {
+        match self {
+            RestoreError::VersionOrChecksum => "ERR DUMP payload version or checksum are wrong",
+            RestoreError::BadData => "ERR Bad data format",
+        }
+    }
+}
+
+pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreError> {
     if payload.len() < 10 {
-        return None;
+        return Err(RestoreError::VersionOrChecksum);
     }
     let (data, trailer) = payload.split_at(payload.len() - 10);
     if trailer[..2] == DUMP_VERSION && crc64_digest(data).to_le_bytes() == trailer[2..] {
-        return restore_kividb_payload(data);
+        return restore_kividb_payload(data).ok_or(RestoreError::BadData);
     }
     let (versioned, crc) = payload.split_at(payload.len() - 8);
     let version = u16::from_le_bytes([trailer[0], trailer[1]]);
-    if version <= REDIS_DUMP_VERSION_MAX && redis_crc64(versioned).to_le_bytes() == crc {
-        return restore_redis_payload(data);
+    // A zero checksum is none, as Redis writes with checksums off.
+    let sealed = crc == [0u8; 8] || redis_crc64(versioned).to_le_bytes() == crc;
+    if version <= REDIS_DUMP_VERSION_MAX && sealed {
+        return restore_redis_payload(data).ok_or(RestoreError::BadData);
     }
-    None
+    Err(RestoreError::VersionOrChecksum)
 }
 
 /// Redis's CRC64, which seals the `DUMP` payloads Redis writes (`crc64.c`:
