@@ -537,6 +537,15 @@ impl Subscriptions {
                 return format!("-ERR wrong number of arguments for '{word}' command\r\n")
                     .into_bytes();
             }
+            // A subscription is memory, and Redis 8.10 refuses a new one past
+            // `maxmemory` as it refuses a write. Only under `noeviction`:
+            // under an evicting policy the next write makes room, and these
+            // commands do not go through the eviction a write does.
+            if crate::commands::handler::check_memory_limit()
+                && crate::eviction::policy() == crate::eviction::Policy::NoEviction
+            {
+                return b"-OOM command not allowed when used memory > 'maxmemory'.\r\n".to_vec();
+            }
             // Before the hub knows: whatever is published from here on waits
             // for these replies to be written.
             self.me.hold.store(true, Ordering::Release);

@@ -2472,7 +2472,10 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let db = *ctx.selected_db;
     let all_fields = || pairs.iter().map(|(f, _)| f.as_bytes());
     if matches!(ttl, HsetexTtl::Past) {
-        // Set and expired in one step: what observers see is the deletion.
+        // Set and expired in one step: the set, then the deletion, as Redis
+        // 8.10 announces them.
+        notify(ctx.pubsub, db, KS_HASH, "hset", &key);
+        notify_subkeys(ctx.pubsub, db, "hset", &key, all_fields());
         notify(ctx.pubsub, db, KS_HASH, "hdel", &key);
         notify_subkeys(ctx.pubsub, db, "hdel", &key, all_fields());
     } else {
