@@ -454,10 +454,12 @@ class TestXAckDel:
         result = r.execute_command("XACKDEL", "nosuch", "grp", "1-0", "2-0")
         assert result == [-1, -1]
 
-    def test_no_such_group_errors(self, r):
+    def test_no_such_group_returns_all_minus_one(self, r):
+        # As for a missing key (Redis 8.10).
         r.xadd("jobs", {"t": "x"}, id="1-0")
-        with pytest.raises(redis.ResponseError, match="NOGROUP"):
-            r.execute_command("XACKDEL", "jobs", "badgroup", "1-0")
+        result = r.execute_command("XACKDEL", "jobs", "badgroup", "1-0", "2-0")
+        assert result == [-1, -1]
+        assert r.xlen("jobs") == 1
 
     def test_wrong_type_errors(self, r):
         r.set("notastream", "value")

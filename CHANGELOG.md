@@ -101,6 +101,8 @@ written against an earlier KiviDB may notice them.
   of a stream with no consumer groups**, as Redis 8.10 does: nothing refers
   to it. It answered 2, so that once the last group was destroyed nothing
   could be deleted with `ACKED`.
+  `XACKDEL` on a group that does not exist answers -1 for each ID, as for
+  a key that does not exist, as Redis 8.10 does; it was a `NOGROUP` error.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

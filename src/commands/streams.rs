@@ -3291,8 +3291,9 @@ pub fn xackdel(ctx: &mut Ctx) -> Vec<u8> {
 
     // One write lock covers the acknowledgement and the deletion.
     let mut inner = stream.write();
+    // No such group: -1 for every ID, as for no such key (Redis 8.10).
     if !inner.groups.contains_key(&group_name) {
-        return resp_error("NOGROUP No such consumer group");
+        return resp_array(ids.iter().map(|_| resp_integer(-1)).collect());
     }
 
     let replies = ids

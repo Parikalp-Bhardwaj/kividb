@@ -2475,7 +2475,7 @@ fn test_xackdel_missing_key() {
     assert_eq!(arr[1].as_int(), -1);
 }
 
-// No-such group → NOGROUP error
+// No such group → -1 for every ID, as for no such key (Redis 8.10)
 #[test]
 fn test_xackdel_no_such_group() {
     let port = free_port();
@@ -2483,16 +2483,10 @@ fn test_xackdel_no_such_group() {
     let mut c = Conn::connect(port);
 
     c.cmds(&["XADD", "s", "1-0", "f", "v"]);
-    let r = c.cmds(&["XACKDEL", "s", "nosuchgroup", "1-0"]);
-    assert!(r.is_error());
-    let msg = match &r {
-        RespValue::Error(e) => e.as_str(),
-        _ => "",
-    };
-    assert!(
-        msg.contains("NOGROUP"),
-        "expected NOGROUP error, got: {msg}"
-    );
+    let r = c.cmds(&["XACKDEL", "s", "nosuchgroup", "IDS", "2", "1-0", "2-0"]);
+    let ids: Vec<i64> = r.as_array().iter().map(RespValue::as_int).collect();
+    assert_eq!(ids, [-1, -1]);
+    assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 1);
 }
 
 // Arity check
