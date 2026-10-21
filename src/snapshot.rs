@@ -3648,6 +3648,36 @@ fn restore_redis_payload(data: &[u8]) -> Option<KiviDBValue> {
     rest.is_empty().then_some(value)
 }
 
+/// Library sources from a Redis `FUNCTION DUMP` payload.
+///
+/// Redis writes one `RDB_OPCODE_FUNCTION2` byte and one RDB string per
+/// library, then the same version-and-CRC trailer as a `DUMP` payload.
+#[cfg(feature = "lua")]
+pub(crate) fn redis_function_dump_sources(payload: &[u8]) -> Option<Vec<String>> {
+    const RDB_OPCODE_FUNCTION2: u8 = 0xf5;
+
+    if payload.len() < 10 {
+        return None;
+    }
+    let (data, trailer) = payload.split_at(payload.len() - 10);
+    let (versioned, crc) = payload.split_at(payload.len() - 8);
+    let version = u16::from_le_bytes([trailer[0], trailer[1]]);
+    if version > REDIS_DUMP_VERSION_MAX || redis_crc64(versioned).to_le_bytes() != crc {
+        return None;
+    }
+
+    let mut rest = data;
+    let mut sources = Vec::new();
+    while let Some((&opcode, after_opcode)) = rest.split_first() {
+        if opcode != RDB_OPCODE_FUNCTION2 {
+            return None;
+        }
+        rest = after_opcode;
+        sources.push(String::from_utf8(rdb_read_string(&mut rest).ok()?).ok()?);
+    }
+    (!sources.is_empty()).then_some(sources)
+}
+
 /// A value as KiviDB's own `DUMP` serialises it.
 fn restore_kividb_payload(data: &[u8]) -> Option<KiviDBValue> {
     if data.starts_with(KDB_MAGIC) {

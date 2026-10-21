@@ -1882,6 +1882,15 @@ impl ClusterState {
         if !self.enabled {
             return;
         }
+        // Serialize with heartbeat merges and temporarily ban the old peers.
+        // An in-flight heartbeat may already have passed its membership check;
+        // without this guard it can repopulate slots after the reset returns.
+        let mut forgotten = self.forgotten.write();
+        let me = self.myself();
+        let until = now_ms() + FORGET_BAN_MS;
+        for id in self.nodes.read().keys().copied().filter(|id| *id != me) {
+            forgotten.insert(id, until);
+        }
         // Clear all slot ownership.
         {
             let mut slots = self.slots.write();
@@ -1923,8 +1932,6 @@ impl ClusterState {
         self.current_epoch.store(0, Ordering::SeqCst);
         self.last_vote_epoch.store(0, Ordering::SeqCst);
         self.last_vote_for.lock().clear();
-        self.forgotten.write().clear();
-
         let new_id = generate_node_id();
         {
             let mut nodes = self.nodes.write();

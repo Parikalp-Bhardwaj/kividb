@@ -21,6 +21,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`FUNCTION RESTORE` accepts payloads produced by Redis 7.4 and 8.10**
+  (#45). It previously refused them with `ERR DUMP payload version or checksum
+  are wrong`; Redis function-library payloads now restore atomically while
+  KiviDB's own format continues to work.
 - **A HyperLogLog keeps its cached count where Redis keeps it** (#28). The
   count was never cached: every `PFCOUNT` counted all 16,384 registers again,
   and bytes 8-15 of the value did not say what Redis's say. Now `PFCOUNT`

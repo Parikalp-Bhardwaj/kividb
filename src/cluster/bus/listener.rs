@@ -411,7 +411,14 @@ fn apply_heartbeat(
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
 ) {
-    if state.is_forgotten(&sender_id) {
+    // Hold this read guard through the whole merge. RESET takes the write side
+    // before clearing topology, so a heartbeat admitted before the reset must
+    // finish before the reset returns and cannot restore the old cluster after.
+    let forgotten = state.forgotten.read();
+    if forgotten
+        .get(&sender_id)
+        .is_some_and(|until| *until > now_ms())
+    {
         return;
     }
     // The sender's view of *itself* never includes "I have failed".
@@ -436,7 +443,7 @@ fn apply_heartbeat(
     state.maybe_clear_fail_on_contact(sender_id);
 
     for g in gossip {
-        merge_gossip_entry(state, sender_id, g);
+        merge_gossip_entry(state, sender_id, g, &forgotten);
     }
     // A replica announces no slots; claims only ever come from masters.
     if sender_flags.contains(NodeFlags::MASTER) {
@@ -532,12 +539,17 @@ fn upsert_node(
     }
 }
 
-fn merge_gossip_entry(state: &ClusterState, sender_id: NodeId, g: GossipEntry) {
+fn merge_gossip_entry(
+    state: &ClusterState,
+    sender_id: NodeId,
+    g: GossipEntry,
+    forgotten: &ahash::AHashMap<NodeId, u64>,
+) {
     if g.id == state.myself() {
         return;
     }
     // Gossip is how a removed node would otherwise come straight back.
-    if state.is_forgotten(&g.id) {
+    if forgotten.get(&g.id).is_some_and(|until| *until > now_ms()) {
         return;
     }
 
@@ -749,6 +761,37 @@ mod tests {
         // An explicit MEET is the operator changing their mind.
         process_message(&cs, meet(gone), peer());
         assert!(cs.nodes.read().contains_key(&gone));
+    }
+
+    /// A heartbeat can pass the membership check just before RESET HARD and
+    /// reach the merge step just after it. The old cluster must stay gone.
+    #[test]
+    fn hard_reset_rejects_an_in_flight_heartbeat_from_the_old_cluster() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let old_peer = generate_node_id();
+        process_message(&cs, meet(old_peer), peer());
+
+        cs.hard_reset();
+        apply_heartbeat(
+            &cs,
+            old_peer,
+            "10.0.0.9".into(),
+            7000,
+            17000,
+            1,
+            NodeFlags::MASTER,
+            None,
+            String::new(),
+            vec![],
+            &[SlotClaim {
+                start: 0,
+                end: 8191,
+                epoch: 1,
+            }],
+        );
+
+        assert!(!cs.nodes.read().contains_key(&old_peer));
+        assert_eq!(cs.assigned_slot_count(), 0);
     }
 
     /// One node's opinion that another has failed is a report, not a verdict.

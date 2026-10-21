@@ -9,13 +9,13 @@ use crate::resp::write::{
     resp_error, resp_integer, resp_map, resp_null_bulk, resp_null_resp3, resp_set_resp3,
     resp_simple, resp_verbatim_resp3,
 };
-use crate::snapshot::crc64_digest;
+use crate::snapshot::{crc64_digest, redis_function_dump_sources};
 use mlua::prelude::*;
 use mlua::{HookTriggers, VmState};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -4168,7 +4168,7 @@ fn function_dump_payload() -> Vec<u8> {
     buf
 }
 
-fn decode_function_dump_payload(data: &[u8]) -> Result<Vec<FunctionLibrary>, ()> {
+fn decode_kividb_function_dump_payload(data: &[u8]) -> Result<Vec<FunctionLibrary>, ()> {
     if data.len() < FUNCTION_DUMP_MAGIC.len() + 4 + 4 + 8 {
         return Err(());
     }
@@ -4214,6 +4214,34 @@ fn decode_function_dump_payload(data: &[u8]) -> Result<Vec<FunctionLibrary>, ()>
         return Err(());
     }
     Ok(out)
+}
+
+/// Decode KiviDB's historical private format or Redis's RDB-based format.
+/// The returned names identify Redis libraries whose function-name metadata
+/// must be learned by running their source.
+fn decode_function_dump_payload(
+    data: &[u8],
+) -> Result<(Vec<FunctionLibrary>, HashSet<String>), ()> {
+    if data.starts_with(FUNCTION_DUMP_MAGIC) {
+        return Ok((decode_kividb_function_dump_payload(data)?, HashSet::new()));
+    }
+
+    let mut libraries = Vec::new();
+    let mut infer_functions = HashSet::new();
+    for body in redis_function_dump_sources(data).ok_or(())? {
+        let (engine, name) = parse_shebang(&body).map_err(|_| ())?;
+        if !infer_functions.insert(name.clone()) {
+            return Err(());
+        }
+        libraries.push(FunctionLibrary {
+            name,
+            engine,
+            body,
+            functions: Vec::new(),
+            registered: Vec::new(),
+        });
+    }
+    Ok((libraries, infer_functions))
 }
 
 fn compute_merged_store(
@@ -4288,18 +4316,29 @@ fn persist_merged_and_sync_maps(merged: HashMap<String, FunctionLibrary>) {
     rebuild_fn_name_map_from_store();
 }
 
-fn load_merged_into_vm(merged: &mut HashMap<String, FunctionLibrary>) -> Result<(), String> {
+fn load_merged_into_vm(
+    merged: &mut HashMap<String, FunctionLibrary>,
+    infer_functions: &HashSet<String>,
+) -> Result<(), String> {
     let libs = sorted_function_libs(merged);
     let loaded = try_with_lua(|lua| -> Result<Vec<(String, Vec<Registered>)>, String> {
         let mut loaded = Vec::new();
+        let mut owners: HashMap<String, String> = HashMap::new();
         for lib in &libs {
             let registered = load_library_code(lua, &lib.body, None)?;
             let names: Vec<String> = registered.iter().map(|f| f.name.clone()).collect();
-            if !same_fn_set(&names, &lib.functions) {
+            if !infer_functions.contains(&lib.name) && !same_fn_set(&names, &lib.functions) {
                 discard_registered(lua, &registered);
                 return Err(
                     "ERR restored library metadata does not match registered functions".into(),
                 );
+            }
+            if let Some(name) = names
+                .iter()
+                .find(|name| owners.insert((*name).clone(), lib.name.clone()).is_some())
+            {
+                discard_registered(lua, &registered);
+                return Err(format!("ERR Function {name} already exists"));
             }
             commit_registered(lua, &registered, &[]).map_err(|e| {
                 format!("ERR Error registering functions: {}", lua_error_message(&e))
@@ -4315,10 +4354,20 @@ fn load_merged_into_vm(merged: &mut HashMap<String, FunctionLibrary>) -> Result<
                     .into(),
             );
         }
-        Ok(loaded) => loaded?,
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(error)) => {
+            // The store was not changed. Drop any functions committed before
+            // a later library failed; the next call rebuilds the VM from it.
+            let _ = lua_vm_reset_for_admin();
+            return Err(error);
+        }
     };
     for (name, registered) in loaded {
         if let Some(lib) = merged.values_mut().find(|lib| lib.name == name) {
+            lib.functions = registered
+                .iter()
+                .map(|function| function.name.clone())
+                .collect();
             lib.registered = registered;
         }
     }
@@ -4361,7 +4410,7 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         FunctionRestorePolicy::Append
     };
 
-    let incoming = match decode_function_dump_payload(cmd[2]) {
+    let (incoming, infer_functions) = match decode_function_dump_payload(cmd[2]) {
         Ok(v) => v,
         Err(()) => return resp_error("DUMP payload version or checksum are wrong"),
     };
@@ -4377,7 +4426,7 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         );
     }
 
-    match load_merged_into_vm(&mut merged) {
+    match load_merged_into_vm(&mut merged, &infer_functions) {
         Ok(()) => {}
         Err(e) => return resp_error(&e),
     }

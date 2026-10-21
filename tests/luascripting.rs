@@ -463,6 +463,118 @@ fn test_function_load_and_fcall() {
 }
 
 #[test]
+fn redis_function_dump_payloads_restore_and_run() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (version, payload) in [
+        (
+            "7.4",
+            &include_bytes!("fixtures/redis-7.4-function-dump.bin")[..],
+        ),
+        (
+            "8.10",
+            &include_bytes!("fixtures/redis-8.10-function-dump.bin")[..],
+        ),
+    ] {
+        let restored = c.cmd(&[b"FUNCTION", b"RESTORE", payload, b"FLUSH"]);
+        assert_eq!(restored.as_str(), "OK", "Redis {version} payload");
+        assert_eq!(c.cmds(&["FCALL", "hello", "0"]).as_str(), "world");
+    }
+}
+
+#[test]
+fn a_redis_function_dump_with_two_libraries_restores_both() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let payload = &include_bytes!("fixtures/redis-7.4-two-library-function-dump.bin")[..];
+
+    assert_eq!(
+        c.cmd(&[b"FUNCTION", b"RESTORE", payload, b"FLUSH"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["FCALL", "first", "0"]).as_str(), "one");
+    assert_eq!(c.cmds(&["FCALL", "second", "0"]).as_str(), "two");
+}
+
+#[test]
+fn a_bad_redis_function_dump_payload_leaves_existing_functions_alone() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=existing\nredis.register_function('old', function() return 'here' end)",
+    ]);
+    let mut payload = include_bytes!("fixtures/redis-7.4-function-dump.bin").to_vec();
+    payload[10] ^= 1;
+
+    assert_eq!(
+        c.cmd(&[b"FUNCTION", b"RESTORE", &payload, b"FLUSH"])
+            .as_error(),
+        "DUMP payload version or checksum are wrong"
+    );
+    assert_eq!(c.cmds(&["FCALL", "old", "0"]).as_str(), "here");
+}
+
+#[test]
+fn kividb_function_dump_payload_still_round_trips() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=ownformat\nredis.register_function('own', function() return 'yes' end)",
+    ]);
+    let payload = match c.cmds(&["FUNCTION", "DUMP"]) {
+        RespValue::Bulk(payload) => payload,
+        other => panic!("not a dump payload: {other:?}"),
+    };
+    assert_eq!(
+        c.cmd(&[b"FUNCTION", b"RESTORE", &payload, b"FLUSH"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["FCALL", "own", "0"]).as_str(), "yes");
+}
+
+#[test]
+fn redis_function_restore_refuses_an_existing_function_name_atomically() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=existing\nredis.register_function('hello', function() return 'old' end)",
+    ]);
+    let payload = &include_bytes!("fixtures/redis-7.4-function-dump.bin")[..];
+    let restored = c.cmd(&[b"FUNCTION", b"RESTORE", payload]);
+    assert!(
+        restored
+            .as_error()
+            .contains("Function hello already exists")
+    );
+    assert_eq!(c.cmds(&["FCALL", "hello", "0"]).as_str(), "old");
+}
+
+#[test]
 fn test_function_load_replace() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
     let port = free_port();
