@@ -113,6 +113,10 @@ written against an earlier KiviDB may notice them.
   ASCII sparkline of four rows labelled with how long ago each sample was.
   It was a line of Unicode block characters. (The all-time high is the
   highest of the samples kept.)
+- **A `BCAST` tracking client is told only of the keys its user may read**,
+  by the user it is authenticated as now, as Redis 8.10 does. It was told
+  of every key its prefixes matched, keys its user had no access to
+  included.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

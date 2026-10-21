@@ -689,7 +689,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
-    crate::tracking::register_for(&store, &tracking_table, &client_registry);
+    crate::tracking::register_for(&store, &tracking_table, &client_registry, &acl_store);
 
     log_info!("Shards per DB  : {}", store::num_shards());
     log_info!("I/O model      : io_uring");
@@ -1420,7 +1420,7 @@ async fn async_main_tokio(
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let monitor_registry = crate::monitor::new_monitor_registry();
     let tracking_table = crate::tracking::new_tracking_table();
-    crate::tracking::register_for(&store, &tracking_table, &client_registry);
+    crate::tracking::register_for(&store, &tracking_table, &client_registry, &acl_store);
     let cluster_state = std::sync::Arc::new(load_cluster_state(&config));
 
     // HNSW compaction worker — must live before replication (replica applier sends here).
