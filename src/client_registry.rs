@@ -668,8 +668,12 @@ impl ClientRegistryInner {
         id: u64,
         unblock: Option<oneshot::Sender<crate::commands::blocking::Unblock>>,
     ) {
+        let blocked = unblock.is_some();
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.unblock_tx = unblock;
+        }
+        if blocked {
+            crate::pause::went_on(id);
         }
     }
 

@@ -89,7 +89,11 @@ written against an earlier KiviDB may notice them.
   answering for it. Loading many functions no longer lets the Lua heap run
   a third over what they hold: the collector is stepped as they load, as in
   Redis. An `HSETEX` with a time already past announces `hset` and then
-  `hdel`; it announced only `hdel`.
+  `hdel`; it announced only `hdel`. **The clients a `CLIENT PAUSE` held go
+  on before anything else once `CLIENT UNPAUSE` ends it**, as in Redis: a
+  `CLIENT UNBLOCK` sent straight after found the `BLPOP` the pause had held
+  not yet blocked, and answered 0. They also go on at once; they looked
+  again only every millisecond.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

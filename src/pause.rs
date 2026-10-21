@@ -1,9 +1,28 @@
 // src/pause.rs
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 /// Global pause expiry in Unix milliseconds.
 /// 0 = not paused. Positive = writes are paused until this timestamp.
+/// [`ENDING`]: ended, and the clients it held are still being let go.
 pub static PAUSE_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+/// `PAUSE_UNTIL_MS` from `CLIENT UNPAUSE` until the last client the pause
+/// held has gone on. Nothing is paused, but every other command waits for
+/// them (see [`gate`]): in Redis the clients a pause held run before the
+/// next command is read, so a `CLIENT UNBLOCK` sent straight after
+/// `CLIENT UNPAUSE` finds the `BLPOP` the pause held blocked on its key.
+const ENDING: i64 = -1;
+
+/// Clients held by the pause now, and the ones an ended pause let go
+/// whose command has not yet run or blocked ([`LETTING_GO`]).
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// The ids of the clients an ended pause let go, until their command has
+/// run or blocked.
+static LETTING_GO: parking_lot::Mutex<Vec<u64>> = parking_lot::const_mutex(Vec::new());
+
+/// How many there are in [`LETTING_GO`]: one load for a client that blocks.
+static LETTING_GO_LEN: AtomicUsize = AtomicUsize::new(0);
 
 // 0 = ALL (default), 1 = WRITE only
 static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
@@ -39,7 +58,7 @@ fn now_ms() -> i64 {
 /// that write (`Some(true)`) or all of them (`Some(false)`).
 pub fn active() -> Option<bool> {
     let until = PAUSE_UNTIL_MS.load(Ordering::Relaxed);
-    if until == 0 {
+    if until <= 0 {
         return None;
     }
     if now_ms() >= until {
@@ -87,9 +106,110 @@ pub fn set_pause(duration_ms: i64, write_only: bool) {
 
 pub fn clear_pause() {
     PAUSE_MODE_WRITE_ONLY.store(false, Ordering::Relaxed);
-    PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+    let held = HELD.load(Ordering::SeqCst) > 0;
+    PAUSE_UNTIL_MS.store(if held { ENDING } else { 0 }, Ordering::SeqCst);
+    // The last of them may have gone between the two.
+    if held && HELD.load(Ordering::SeqCst) == 0 {
+        let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
     HANDOFF.store(false, Ordering::Release);
+    CHANGED.notify_waiters();
 }
+
+/// Woken when a pause is ended, and when the last client it held goes on.
+static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// What client `id`'s command does when `PAUSE_UNTIL_MS` is not 0, before
+/// it runs: wait for the clients an ended pause held to go on (at most
+/// 100 ms: they are a step from it), then wait while `cmd` is held (see
+/// [`holds`]). What it returns is to be kept until the command has run.
+pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> Option<Ran> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
+        if std::time::Instant::now() >= deadline {
+            // Not to wait on them again: whatever kept them, nothing is
+            // paused.
+            let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
+            break;
+        }
+        wait_for_change(|| PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING).await;
+    }
+    if !holds(cmd, queued) {
+        return None;
+    }
+    let held = Held::new();
+    HELD.fetch_add(1, Ordering::SeqCst);
+    // Counted off however the wait ends, the connection going with it.
+    let counted = Counted;
+    while holds(cmd, queued) {
+        wait_for_change(|| holds(cmd, queued)).await;
+    }
+    drop(held);
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
+        // Ended: it counts until its command has run or blocked.
+        std::mem::forget(counted);
+        LETTING_GO.lock().push(id);
+        LETTING_GO_LEN.fetch_add(1, Ordering::SeqCst);
+        return Some(Ran(id));
+    }
+    None
+}
+
+struct Counted;
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        let_go();
+    }
+}
+
+/// Until [`CHANGED`] or a millisecond, whichever is first, if `still` holds
+/// once the wait is set up. The millisecond is for a pause that runs out.
+async fn wait_for_change(still: impl Fn() -> bool) {
+    let changed = CHANGED.notified();
+    tokio::pin!(changed);
+    changed.as_mut().enable();
+    if still() {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), changed).await;
+    }
+}
+
+/// One client fewer held: the last one ends an ending pause.
+fn let_go() {
+    if HELD.fetch_sub(1, Ordering::SeqCst) == 1
+        && PAUSE_UNTIL_MS
+            .compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        CHANGED.notify_waiters();
+    }
+}
+
+/// Client `id` has begun to wait in a blocking command, or its command has
+/// run: if an ended pause let it go, it has gone on. (Whatever the pause is
+/// now: another may have begun since.)
+pub fn went_on(id: u64) {
+    if LETTING_GO_LEN.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let mut letting_go = LETTING_GO.lock();
+    if let Some(at) = letting_go.iter().position(|&other| other == id) {
+        letting_go.swap_remove(at);
+        LETTING_GO_LEN.fetch_sub(1, Ordering::SeqCst);
+        drop(letting_go);
+        let_go();
+    }
+}
+
+/// Kept while the command an ended pause let go runs (see [`gate`]).
+pub struct Ran(u64);
+
+impl Drop for Ran {
+    fn drop(&mut self) {
+        went_on(self.0);
+    }
+}
+
 
 /// Pause writes for a handoff (see `HANDOFF`). The caller takes its cut
 /// through the write stream *after* this returns; `clear_pause` ends it.
