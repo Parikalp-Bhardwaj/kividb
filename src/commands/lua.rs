@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Scripts by SHA1. A source is shared with whoever runs it: scripts are a
 /// few kilobytes each, and one was copied whole for every call.
@@ -438,6 +438,23 @@ fn lua_error_message(error: &LuaError) -> String {
         .to_string()
 }
 
+/// A step of the collector every [`GC_LOADS`] loads, as Redis's `luaGC`
+/// takes one. A load leaves the chunk it ran behind, and the collector left
+/// to itself lets a run of loads pile that up: 50,000 small functions held
+/// 18.7 MB, of which 14.3 MB was live (what a full collection leaves).
+/// Redis steps 50 KB, but a step of Lua 5.4's is of a debt in allocation,
+/// not 5.1's: 50 KB left 16.3 MB, [`GC_STEP_KB`] leaves 14.4 MB.
+fn gc_after_load(lua: &Lua) {
+    static LOADS: AtomicU32 = AtomicU32::new(0);
+    if LOADS.fetch_add(1, Ordering::Relaxed) + 1 >= GC_LOADS {
+        LOADS.store(0, Ordering::Relaxed);
+        let _ = lua.gc_step_kbytes(GC_STEP_KB);
+    }
+}
+
+const GC_LOADS: u32 = 50;
+const GC_STEP_KB: i32 = 1000;
+
 /// Run a library as `FUNCTION LOAD` runs it, and return what it registered.
 /// The functions are not callable yet: [`commit_registered`] makes them so,
 /// [`discard_registered`] forgets them.
@@ -516,6 +533,21 @@ fn commit_registered(lua: &Lua, registered: &[Registered], replaced: &[String]) 
         }
     }
     Ok(())
+}
+
+/// The `err` of `redis.error_reply(s)`, as Redis's `luaPushErrorBuff` makes
+/// it: `-CODE msg` and `CODE msg` keep their code, a message with no space
+/// in it (so no code) is given `ERR`, and line breaks at the ends go.
+fn error_reply_message(s: &str) -> String {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    // Empty must still classify as an ERR reply (Tcl `errorrstat ERR`).
+    if s.is_empty() {
+        return "ERR".to_string();
+    }
+    match s.split_once(' ') {
+        Some((code, msg)) => format!("{code} {}", msg.trim_matches(['\r', '\n'])),
+        None => format!("ERR {}", s.trim_matches(['\r', '\n'])),
+    }
 }
 
 fn sha1_hex(source: &str) -> String {
@@ -1379,9 +1411,7 @@ fn new_lua_vm() -> Lua {
     let error_reply = lua
         .create_function(|lua, s: String| {
             let t = lua.create_table()?;
-            // Empty string must still classify as an ERR reply (Tcl `errorrstat ERR`).
-            let msg = if s.is_empty() { "ERR".to_string() } else { s };
-            t.set("err", msg)?;
+            t.set("err", error_reply_message(&s))?;
             Ok(LuaValue::Table(t))
         })
         .unwrap();
@@ -1532,6 +1562,12 @@ fn new_lua_vm() -> Lua {
             if !crate::commands::server::is_registered_command(&cmd_upper) {
                 return Err(LuaError::RuntimeError(
                     "ERR Invalid command passed to redis.acl_check_cmd()".into(),
+                ));
+            }
+            let words: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            if crate::commands::arity::check(&cmd_upper, &words).is_some() {
+                return Err(LuaError::RuntimeError(
+                    "ERR Wrong number of args for redis.acl_check_cmd()".into(),
                 ));
             }
 
@@ -1744,6 +1780,16 @@ end
     // Lua 5.1 compat: `unpack` was a global; in 5.2+ it moved to `table.unpack`.
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
+
+    // Scripts are called under an error handler, as Redis calls them under
+    // `__redis__err__handler`.
+    let handler = lua.create_function(script_error_handler).unwrap();
+    let runner: LuaFunction = lua
+        .load(SCRIPT_RUNNER)
+        .set_name("=kividb_runner")
+        .call(handler)
+        .unwrap();
+    lua.set_app_data(ScriptRunner(runner));
 
     // Final setup: cjson globals, os sandbox, readonly proxies for API tables, pre-declared
     // globals, and globals protection. Must run LAST.
@@ -3184,7 +3230,7 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
 
     match try_with_lua(|lua| eval_script(lua, ctx_ptr, &source, keys, argv, read_only)) {
         Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => script_error_to_resp(&e),
+        Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
         Err(LuaVmBusy) => resp_error(
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         ),
@@ -3246,6 +3292,57 @@ fn redis_simple_error_has_category_prefix(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c == '_' || c == '-')
 }
 
+/// Calls a script's function with its arguments under
+/// [`script_error_handler`].
+const SCRIPT_RUNNER: &str = r#"
+local handler = ...
+local xpcall, error = xpcall, error
+return function(f, ...)
+    local ok, result = xpcall(f, handler, ...)
+    if ok then
+        return result
+    end
+    error(result, 0)
+end
+"#;
+
+/// What [`script_error_handler`] puts before a table's `err`, then the line
+/// and a `\u{1}`. Not NUL: mlua reads an error's message as a C string.
+const TABLE_ERROR_MARK: &str = "\u{1}kividb-error\u{1}";
+
+struct ScriptRunner(LuaFunction);
+
+/// Without this a table given to `error()` (`error({err = ...})`,
+/// `error(redis.error_reply(...))`) comes back as `table: 0x…`: mlua makes
+/// a string of any error that is not one. Such a table becomes its `err`
+/// (`ERR unknown error` without one) and the line it was raised on, behind
+/// [`TABLE_ERROR_MARK`], with line breaks made spaces as Redis's reply has
+/// them. Every other error goes on as it was.
+fn script_error_handler(lua: &Lua, err: LuaValue) -> LuaResult<LuaValue> {
+    let LuaValue::Table(table) = &err else {
+        return Ok(err);
+    };
+    let msg = match table.raw_get::<LuaValue>("err")? {
+        LuaValue::String(s) => s.to_string_lossy(),
+        LuaValue::Integer(n) => n.to_string(),
+        LuaValue::Number(n) => n.to_string(),
+        _ => "ERR unknown error".to_string(),
+    };
+    // The frame that raised it: past this handler and `error` itself.
+    let line = (1..=3)
+        .filter_map(|level| lua.inspect_stack(level))
+        .find(|frame| frame.source().what != "C")
+        .map_or(1, |frame| frame.curr_line());
+    let msg = msg.replace(['\r', '\n'], " ");
+    Ok(LuaValue::String(
+        lua.create_string(format!("{TABLE_ERROR_MARK}{line}\u{1}{msg}"))?,
+    ))
+}
+
+fn script_runner(lua: &Lua) -> Option<LuaFunction> {
+    lua.app_data_ref::<ScriptRunner>().map(|r| r.0.clone())
+}
+
 /// Shape Lua `error()` / runtime abort strings into Redis-style `user_script:… script:` messages.
 fn redis_lua_runtime_abort_shape(stripped: &str) -> String {
     let t = stripped.trim();
@@ -3289,7 +3386,12 @@ fn redis_lua_runtime_abort_shape(stripped: &str) -> String {
     format!("user_script:1: {} script: ", t)
 }
 
-fn script_error_to_resp(cleaned: &str) -> Vec<u8> {
+/// `name` is the script's SHA1, or the function's name.
+fn script_error_to_resp(cleaned: &str, name: &str) -> Vec<u8> {
+    if let Some(rest) = cleaned.strip_prefix(TABLE_ERROR_MARK) {
+        let (line, msg) = rest.split_once('\u{1}').unwrap_or(("1", rest));
+        return resp_error(&format!("{msg} script: {name}, on @user_script:{line}."));
+    }
     let stripped = strip_lua_chunk_prefix(cleaned.trim());
     let shaped = redis_lua_runtime_abort_shape(stripped);
     // Match Redis wire errors: `-OOM …`, `-READONLY …`, or `-ERR …`. Do not turn `OOM …` into
@@ -3303,6 +3405,10 @@ fn script_error_to_resp(cleaned: &str) -> Vec<u8> {
     // Tcl `assert_match … script: *` expects a literal space after `script:` before the glob tail.
     if body.contains("user_script:") && body.ends_with("script:") {
         body.push(' ');
+    }
+    if body.ends_with("script: ") {
+        body.push_str(name);
+        body.push_str(", on @user_script:1.");
     }
     // Avoid double-counting INFO errorstats: `redis.call` errors already hit `resp_error`, then
     // Lua re-wraps them here. Pure Lua/user_script errors must still increment stats once.
@@ -3329,6 +3435,12 @@ fn clean_lua_error(e: &LuaError) -> String {
         _ => e.to_string(),
     };
     let s = raw.strip_prefix("runtime error: ").unwrap_or(raw.as_str());
+    // A table's `err` (see `SCRIPT_RUNNER`): already one line, up to the
+    // traceback mlua adds.
+    if let Some(at) = s.find(TABLE_ERROR_MARK) {
+        let marked = &s[at..];
+        return marked[..marked.find('\n').unwrap_or(marked.len())].to_string();
+    }
     // Truncate at the first newline so RESP framing is never broken by multi-line tracebacks.
     let one_line = if let Some(pos) = s.find('\n') {
         s[..pos].to_string()
@@ -3504,7 +3616,10 @@ fn eval_script(
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
 
-    let result = match compiled_script(lua, source, lua_body).and_then(|f| f.call::<LuaValue>(())) {
+    let result = match compiled_script(lua, source, lua_body).and_then(|f| match script_runner(lua) {
+        Some(runner) => runner.call::<LuaValue>(f),
+        None => f.call::<LuaValue>(()),
+    }) {
         Ok(v) => v,
         Err(e) => {
             *ctx.selected_db = saved_db;
@@ -3622,7 +3737,12 @@ fn eval_function_call(
 
     let keys_t: LuaTable = lua.globals().get("KEYS").map_err(|e| e.to_string())?;
     let argv_t: LuaTable = lua.globals().get("ARGV").map_err(|e| e.to_string())?;
-    let result = match func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t))) {
+    let args = (LuaValue::Table(keys_t), LuaValue::Table(argv_t));
+    let called = match script_runner(lua) {
+        Some(runner) => runner.call::<LuaValue>((func, args.0, args.1)),
+        None => func.call::<LuaValue>(args),
+    };
+    let result = match called {
         Ok(v) => v,
         Err(e) => {
             *ctx.selected_db = saved_db;
@@ -3799,7 +3919,7 @@ fn fcall(ctx: &mut Ctx, read_only: bool) -> Vec<u8> {
 
     match try_with_lua(|lua| fcall_inner(lua, ctx_ptr, fn_name, keys, argv, read_only)) {
         Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => script_error_to_resp(&e),
+        Ok(Err(e)) => script_error_to_resp(&e, fn_name),
         Err(LuaVmBusy) => resp_error(
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         ),
@@ -3877,6 +3997,7 @@ fn function_load(ctx: &mut Ctx) -> Vec<u8> {
             .collect();
         commit_registered(lua, &registered, &gone)
             .map_err(|e| format!("ERR Error registering functions: {}", lua_error_message(&e)))?;
+        gc_after_load(lua);
         Ok(registered)
     });
     let registered = match loaded {

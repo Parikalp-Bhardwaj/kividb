@@ -31,6 +31,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A script's error ends as Redis's does**, naming the script and the
+  place: `... script: <sha1>, on @user_script:1.` (the function's name for
+  `FCALL`). `redis.error_reply` gives a message without a code the code
+  `ERR` (`redis.error_reply('X')` is `-ERR X`), as Redis does. A new
+  `SUBSCRIBE`, `PSUBSCRIBE` or `SSUBSCRIBE` past `maxmemory` under
+  `noeviction` is refused with `OOM`, as Redis 8.10 refuses it.
+
 - `HEXPIRE`, `HPEXPIRE` and the `EX`/`PX` of `HGETEX` and `HSETEX` take a
   time of 0 as now, as Redis 8.10 does: the fields go at once (`HEXPIRE`
   replies 2 for each). Only a negative time is refused, `invalid expire
@@ -72,6 +79,17 @@ written against an earlier KiviDB may notice them.
   `ARGREP`, `XCFGSET`, the slowlog settings).
 
 ### Fixed
+
+- **`error()` given a table is reported by its `err`.**
+  `error({err = 'ERR ...'})` and `error(redis.error_reply(...))` replied
+  `ERR user_script:1: table: 0x... script:`; they reply with the message,
+  line breaks in it made spaces, and `error({})` with `ERR unknown error`.
+  `redis.acl_check_cmd` refuses a command with the wrong number of
+  arguments (`Wrong number of args for redis.acl_check_cmd()`) instead of
+  answering for it. Loading many functions no longer lets the Lua heap run
+  a third over what they hold: the collector is stepped as they load, as in
+  Redis. An `HSETEX` with a time already past announces `hset` and then
+  `hdel`; it announced only `hdel`.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other
