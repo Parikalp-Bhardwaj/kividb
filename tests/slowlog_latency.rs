@@ -1193,9 +1193,10 @@ fn test_latency_graph_returns_string_for_known_event() {
     );
 }
 
-// The graph string contains at least one sparkline Unicode block character.
+// The graph is Redis's: a header with the high and the low, a rule, and an
+// ASCII sparkline.
 #[test]
-fn test_latency_graph_contains_sparkline_chars() {
+fn test_latency_graph_is_redis_s_ascii_graph() {
     let port = free_port();
     start_server_log_all(port);
     let mut c = Conn::connect(port);
@@ -1215,11 +1216,15 @@ fn test_latency_graph_contains_sparkline_chars() {
     let graph = c.cmd(&["LATENCY", "GRAPH", &event_name]);
     let text = graph.as_str();
 
-    let sparkline_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
     assert!(
-        sparkline_chars.iter().any(|ch| text.contains(*ch)),
-        "LATENCY GRAPH output should contain sparkline block characters, got: {text:?}"
+        header.starts_with(&format!("{event_name} - high ")) && header.contains(" ms, low "),
+        "LATENCY GRAPH header: {text:?}"
     );
+    assert_eq!(lines.next(), Some("-".repeat(80).as_str()), "{text:?}");
+    assert!(text.is_ascii(), "{text:?}");
+    assert!(text.contains(['_', 'o', '#', '|']), "{text:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

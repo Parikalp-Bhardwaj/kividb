@@ -108,6 +108,11 @@ written against an earlier KiviDB may notice them.
   a share of the key table's entries plus the value, which for small
   strings came out above the most Redis's suite allows (64 bytes for a
   1-byte key and value; it said 73).
+- `LATENCY GRAPH` draws Redis's graph: a header with the high and the low
+  (`<event> - high N ms, low N ms (all time high N ms)`), a rule, and an
+  ASCII sparkline of four rows labelled with how long ago each sample was.
+  It was a line of Unicode block characters. (The all-time high is the
+  highest of the samples kept.)
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other
