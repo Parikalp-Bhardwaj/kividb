@@ -31,6 +31,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `HEXPIRE`, `HPEXPIRE` and the `EX`/`PX` of `HGETEX` and `HSETEX` take a
+  time of 0 as now, as Redis 8.10 does: the fields go at once (`HEXPIRE`
+  replies 2 for each). Only a negative time is refused, `invalid expire
+  time, must be >= 0`. A time of 0 used to be an error.
+- `RESTORE` tells its two errors apart as Redis does: `DUMP payload version
+  or checksum are wrong` for the trailer, and `Bad data format` for a
+  payload sealed right that holds no value it can read. A zero checksum is
+  taken as none, as Redis writes with checksums off.
+- `overwritten` and `type_changed` are announced before the command's own
+  event for the commands that replace a value whole (SET, the `*STORE`s,
+  SORT … STORE, BITOP …), and after it for RENAME, COPY and RESTORE, in
+  Redis's order.
+
 These follow Redis 8.10, the release KiviDB reports itself as; a client
 written against an earlier KiviDB may notice them.
 
@@ -59,6 +72,15 @@ written against an earlier KiviDB may notice them.
   `ARGREP`, `XCFGSET`, the slowlog settings).
 
 ### Fixed
+
+- **`CONFIG SET` of a setting under both its names is a duplicate**
+  (`busy-reply-threshold` and `lua-time-limit`, and the other
+  `slave`/`replica` and `ziplist`/`listpack` pairs), and
+  **`backup-sealed-ttl` takes effect at run time** (it was accepted and not
+  applied). The `overwritten`/`type_changed` bookkeeping added in #66 no
+  longer costs every command: it was 16 instructions a command with the
+  events off, the default (measured with callgrind); now it is one branch on
+  a write.
 
 - **Redis 8.10 compatibility** (#66 and the work after it). CI now runs
   Redis 8.10.2's test suite (#64): it went from 2079 passed, 76 failed and
@@ -202,6 +224,14 @@ written against an earlier KiviDB may notice them.
   raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
 
 ### Security
+
+- **A `RESTORE` could crash the server.** A payload whose string claimed a
+  length near 2^64 made the RDB reader allocate that much at once, and the
+  process aborted. The payload's checksum did not stop it: anyone can compute
+  one for their own payload. A crafted RDB from a primary in a full sync
+  could do the same. Strings are now read as the bytes arrive, an LZF
+  string's claimed size is bounded by what LZF can produce, and such a
+  payload is refused with `ERR Bad data format`. Affects 1.1.0 and earlier.
 
 - **The Docker image is distroless.** Its runtime base is
   `gcr.io/distroless/cc-debian12` (glibc, libgcc, CA certificates, time
