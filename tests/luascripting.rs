@@ -1368,3 +1368,26 @@ fn test_function_loads_are_collected() {
     // Redis 8.10's suite allows 14,500,000 for this.
     assert!(bytes < 14_500_000, "{bytes}");
 }
+
+/// What a script runs counts as its client's (`tot-cmds`), as in Redis:
+/// `EVAL` and its `redis.call('ping')` are two.
+#[test]
+fn test_a_script_s_commands_count_as_its_client_s() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let tot_cmds = |info: &RespValue| -> i64 {
+        info.as_str()
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("tot-cmds="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let before = tot_cmds(&c.cmds(&["CLIENT", "INFO"]));
+    c.cmds(&["EVAL", "redis.call('ping')", "0"]);
+    let after = tot_cmds(&c.cmds(&["CLIENT", "INFO"]));
+    // The first CLIENT INFO, EVAL and PING; not the second CLIENT INFO.
+    assert_eq!(after - before, 3);
+}

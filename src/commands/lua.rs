@@ -608,6 +608,26 @@ struct ScriptEval {
 
 thread_local! {
     static SCRIPT_EVAL: RefCell<Option<ScriptEval>> = const { RefCell::new(None) };
+    /// `redis.call`s and `redis.pcall`s made on this thread, ever: what a
+    /// script ran is the difference (see [`count_script_commands`]).
+    static SCRIPT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Run a script for `ctx`'s client, and count the commands it ran as the
+/// client's, as Redis counts them (`CLIENT INFO`'s `tot-cmds`): once, when it
+/// is over, and only if it ran any.
+fn count_script_commands(
+    registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    run: impl FnOnce() -> Vec<u8>,
+) -> Vec<u8> {
+    let before = SCRIPT_CALLS.get();
+    let reply = run();
+    let ran = SCRIPT_CALLS.get().wrapping_sub(before);
+    if ran > 0 {
+        registry.add_commands(client_id, ran);
+    }
+    reply
 }
 
 /// When present, `redis.setresp` overrides [`crate::commands::handler::effective_resp_for_reply`].
@@ -2876,6 +2896,7 @@ unsafe extern "C-unwind" fn redis_pcall(state: *mut mlua::ffi::lua_State) -> std
 /// called, which is the only thing here that raises, there is nothing.
 unsafe fn bridge(state: *mut mlua::ffi::lua_State, rest: &std::ffi::CStr) -> std::ffi::c_int {
     use mlua::ffi;
+    SCRIPT_CALLS.set(SCRIPT_CALLS.get().wrapping_add(1));
     // A panic must not travel through Lua's frames.
     let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         run_and_push(state)
@@ -3228,13 +3249,17 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
 
     let ctx_ptr: *mut Ctx = ctx;
 
-    match try_with_lua(|lua| eval_script(lua, ctx_ptr, &source, keys, argv, read_only)) {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
-        Err(LuaVmBusy) => resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        ),
-    }
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    count_script_commands(registry, client_id, || {
+        match try_with_lua(|lua| eval_script(lua, ctx_ptr, &source, keys, argv, read_only)) {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
+            Err(LuaVmBusy) => resp_error(
+                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+            ),
+        }
+    })
 }
 
 fn strip_after_line_colon(s: &str) -> Option<&str> {
@@ -3917,13 +3942,17 @@ fn fcall(ctx: &mut Ctx, read_only: bool) -> Vec<u8> {
 
     let ctx_ptr: *mut Ctx = ctx;
 
-    match try_with_lua(|lua| fcall_inner(lua, ctx_ptr, fn_name, keys, argv, read_only)) {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => script_error_to_resp(&e, fn_name),
-        Err(LuaVmBusy) => resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        ),
-    }
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    count_script_commands(registry, client_id, || {
+        match try_with_lua(|lua| fcall_inner(lua, ctx_ptr, fn_name, keys, argv, read_only)) {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => script_error_to_resp(&e, fn_name),
+            Err(LuaVmBusy) => resp_error(
+                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+            ),
+        }
+    })
 }
 
 fn function_load(ctx: &mut Ctx) -> Vec<u8> {

@@ -61,9 +61,9 @@ pub struct Activity {
     closing_after_reply: std::sync::atomic::AtomicBool,
     /// Redis 8.10's per-client counters for `CLIENT LIST`: bytes read and
     /// written, commands run, reads, and commands per read (sum and count).
-    /// Written only by the connection's own loop, so each is a load and a
-    /// store, no locked instruction.
-    io: [AtomicU64; 6],
+    /// Written only by the connection's own loop (or the script it is
+    /// waiting on), so each is a load and a store, no locked instruction.
+    io: [AtomicU64; 7],
 }
 
 const IO_NET_IN: usize = 0;
@@ -72,6 +72,12 @@ const IO_CMDS: usize = 2;
 const IO_READS: usize = 3;
 const IO_PIPE_SUM: usize = 4;
 const IO_PIPE_CNT: usize = 5;
+/// 1 from when a command starts until its read's replies are written. As
+/// in Redis, a command counts once it has run: a `CLIENT INFO` does not count
+/// itself, and a `BLPOP` that is blocked counts when it is answered. It is
+/// in `IO_CMDS` from the start (one store more a command than that alone),
+/// and `tot-cmds` is `IO_CMDS` less this.
+const IO_RUNNING: usize = 6;
 
 /// A connection's current RESP query buffer, published without taking the
 /// registry lock. `free` is the spare capacity at the end of the backing Vec.
@@ -397,6 +403,7 @@ impl Activity {
     #[inline]
     pub fn note_flush(&self, out: usize, commands_before: u64) {
         self.bump(IO_NET_OUT, out as u64);
+        self.io[IO_RUNNING].store(0, Ordering::Relaxed);
         let ran = self.commands_run().wrapping_sub(commands_before);
         if ran > 0 {
             self.bump(IO_PIPE_SUM, ran);
@@ -408,9 +415,16 @@ impl Activity {
         self.io[which].load(Ordering::Relaxed)
     }
 
+    /// Commands a script it ran ran (`redis.call`): Redis counts them as
+    /// the client's.
+    pub fn add_commands(&self, n: u64) {
+        self.bump(IO_CMDS, n);
+    }
+
     #[inline]
     pub fn record(&self, cmd: &[&[u8]], db: usize) {
         self.bump(IO_CMDS, 1);
+        self.io[IO_RUNNING].store(1, Ordering::Relaxed);
         self.db.store(db, Ordering::Relaxed);
         let name = pack(cmd[0], &self.name);
         // An argument too long to be the name of a subcommand is a key, or
@@ -601,7 +615,9 @@ impl ClientInfo {
             self.lib_ver,
             self.activity.io(IO_NET_IN),
             self.activity.io(IO_NET_OUT),
-            self.activity.io(IO_CMDS),
+            self.activity
+                .io(IO_CMDS)
+                .saturating_sub(self.activity.io(IO_RUNNING)),
             self.activity.io(IO_READS),
             self.activity.io(IO_PIPE_SUM),
             self.activity.io(IO_PIPE_CNT),
@@ -690,6 +706,14 @@ impl ClientRegistryInner {
     pub fn register_push_tx(&self, id: u64, tx: mpsc::Sender<Vec<u8>>) {
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.push_tx = Some(tx);
+        }
+    }
+
+    /// `n` commands run by a script client `id` ran: see
+    /// [`Activity::add_commands`].
+    pub fn add_commands(&self, id: u64, n: u64) {
+        if let Some(info) = self.clients.read().get(&id) {
+            info.activity.add_commands(n);
         }
     }
 

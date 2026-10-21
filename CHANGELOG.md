@@ -117,6 +117,11 @@ written against an earlier KiviDB may notice them.
   by the user it is authenticated as now, as Redis 8.10 does. It was told
   of every key its prefixes matched, keys its user had no access to
   included.
+- `CLIENT INFO`/`CLIENT LIST`'s `tot-cmds` counts a command once it has
+  run, as Redis does: a `CLIENT INFO` does not count itself, and a blocked
+  `BLPOP` counts once, when it is answered (it counted when it began, and
+  again when it was answered). The commands a script runs (`redis.call`)
+  count as its client's.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

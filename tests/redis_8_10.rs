@@ -3447,3 +3447,39 @@ fn client_info_counts_a_connections_traffic() {
     );
     assert!(field(&after, "tot-net-out") - field(&before, "tot-net-out") > 300);
 }
+
+/// `tot-cmds` counts a command once it has run, as Redis does: a `CLIENT
+/// INFO` does not count itself, and a blocked `BLPOP` counts when it is
+/// answered, not while it waits (8.10's unit/introspection).
+#[test]
+fn client_info_counts_a_command_once_it_has_run() {
+    let mut c = conn();
+    let tot_cmds = |list: &str, id: i64| -> i64 {
+        list.lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap_or_else(|| panic!("client {id} in {list}"))
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("tot-cmds="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut rd = conn();
+    let id = rd.cmd(&["CLIENT", "ID"]).i();
+    c.cmd(&["DEL", "tot_cmds_list"]);
+    let before = tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id);
+    rd.send(&["BLPOP", "tot_cmds_list", "0"]);
+    wait_until("the BLPOP to block", || {
+        c.cmd(&["CLIENT", "LIST"])
+            .s()
+            .lines()
+            .any(|l| l.starts_with(&format!("id={id} ")) && l.contains(" cmd=blpop "))
+    });
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id), before);
+    c.cmd(&["LPUSH", "tot_cmds_list", "a"]);
+    rd.read();
+    wait_until("the BLPOP to count", || {
+        tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id) == before + 1
+    });
+}

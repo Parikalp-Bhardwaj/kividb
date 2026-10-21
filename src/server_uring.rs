@@ -887,8 +887,12 @@ pub async fn handle_client(
                 quit_requested = true;
                 break;
             }
-            // For `CLIENT LIST`'s `cmd=` and `db=`.
-            activity.record(&cmd, selected_db);
+            // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
+            // for a blocked command dispatched once more with what it waited
+            // for: it is one command.
+            if !blocking_slot.resuming() {
+                activity.record(&cmd, selected_db);
+            }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             reply_gate.settle(&mut out_buf);
