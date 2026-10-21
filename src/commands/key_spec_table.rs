@@ -1,4 +1,4 @@
-// Generated from Redis 8.0.0 `src/commands/*.json` (the `key_specs` of each
+// Generated from Redis 8.10.2 `src/commands/*.json` (the `key_specs` of each
 // command) by `gen_keyspecs.py`. Not edited by hand.
 
 use super::key_specs::{Begin, Find, Spec};
@@ -8,6 +8,60 @@ use super::key_specs::{Begin, Find, Spec};
 pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("APPEND", false, &[
         Spec { flags: "RW insert", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARCOUNT", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARDEL", false, &[
+        Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARDELRANGE", false, &[
+        Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARGET", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARGETRANGE", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARGREP", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARINFO", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARINSERT", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARLASTITEMS", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARLEN", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARMGET", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARMSET", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARNEXT", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("AROP", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARRING", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARSCAN", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARSEEK", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("ARSET", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("BITCOUNT", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
@@ -26,6 +80,10 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("BLMOVE", false, &[
+        Spec { flags: "RW access delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+        Spec { flags: "RW insert", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
+    ]),
+    ("BLMOVEM", false, &[
         Spec { flags: "RW access delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
         Spec { flags: "RW insert", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
     ]),
@@ -63,6 +121,12 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ]),
     ("DEL", false, &[
         Spec { flags: "RM delete", begin: Begin::Index(1), find: Find::Range(-1, 1, 0) },
+    ]),
+    ("DELEX", false, &[
+        Spec { flags: "RW delete variable_flags", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("DIGEST", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("DUMP", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
@@ -177,6 +241,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("HGETEX", false, &[
         Spec { flags: "RW access update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
+    ("HIMPORT|SET", false, &[
+        Spec { flags: "OW update", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
+    ]),
     ("HINCRBY", false, &[
         Spec { flags: "RW access update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
@@ -243,6 +310,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("INCRBYFLOAT", false, &[
         Spec { flags: "RW access update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
+    ("INCREX", false, &[
+        Spec { flags: "RW access update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
     ("LCS", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(1, 1, 0) },
     ]),
@@ -256,6 +326,10 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
         Spec { flags: "RO", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("LMOVE", false, &[
+        Spec { flags: "RW access delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+        Spec { flags: "RW insert", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
+    ]),
+    ("LMOVEM", false, &[
         Spec { flags: "RW access delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
         Spec { flags: "RW insert", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
     ]),
@@ -294,13 +368,16 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ]),
     ("MIGRATE", false, &[
         Spec { flags: "RW access delete", begin: Begin::Index(3), find: Find::Range(0, 1, 0) },
-        Spec { flags: "RW access delete incomplete", begin: Begin::Keyword("KEYS", -2), find: Find::Range(-1, 1, 0) },
+        Spec { flags: "RW access delete", begin: Begin::Keyword("KEYS", -2), find: Find::Range(-1, 1, 0) },
     ]),
     ("MOVE", false, &[
         Spec { flags: "RW access update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("MSET", false, &[
         Spec { flags: "OW update", begin: Begin::Index(1), find: Find::Range(-1, 2, 0) },
+    ]),
+    ("MSETEX", false, &[
+        Spec { flags: "OW update", begin: Begin::Index(1), find: Find::KeyNum(0, 1, 2) },
     ]),
     ("MSETNX", false, &[
         Spec { flags: "OW insert", begin: Begin::Index(1), find: Find::Range(-1, 2, 0) },
@@ -384,12 +461,12 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("SDIFF", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(-1, 1, 0) },
     ]),
+    ("SDIFFCARD", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::KeyNum(0, 1, 1) },
+    ]),
     ("SDIFFSTORE", false, &[
         Spec { flags: "OW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
         Spec { flags: "RO access", begin: Begin::Index(2), find: Find::Range(-1, 1, 0) },
-    ]),
-    ("MSETEX", false, &[
-        Spec { flags: "OW update", begin: Begin::Index(1), find: Find::KeyNum(0, 1, 2) },
     ]),
     ("SET", false, &[
         Spec { flags: "RW access update variable_flags", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
@@ -465,6 +542,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("SUNION", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(-1, 1, 0) },
     ]),
+    ("SUNIONCARD", false, &[
+        Spec { flags: "RO access", begin: Begin::Index(1), find: Find::KeyNum(0, 1, 1) },
+    ]),
     ("SUNIONSTORE", false, &[
         Spec { flags: "OW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
         Spec { flags: "RO access", begin: Begin::Index(2), find: Find::Range(-1, 1, 0) },
@@ -490,16 +570,25 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("XACK", false, &[
         Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
+    ("XACKDEL", false, &[
+        Spec { flags: "RW update delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
     ("XADD", false, &[
         Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XAUTOCLAIM", false, &[
         Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
+    ("XCFGSET", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
     ("XCLAIM", false, &[
         Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XDEL", false, &[
+        Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("XDELEX", false, &[
         Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XGROUP|CREATE", false, &[
@@ -517,6 +606,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("XGROUP|SETID", false, &[
         Spec { flags: "RW update", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
     ]),
+    ("XIDMPRECORD", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
     ("XINFO|CONSUMERS", false, &[
         Spec { flags: "RO access", begin: Begin::Index(2), find: Find::Range(0, 1, 0) },
     ]),
@@ -528,6 +620,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ]),
     ("XLEN", false, &[
         Spec { flags: "RO", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
+    ("XNACK", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XPENDING", false, &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
@@ -545,9 +640,6 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
         Spec { flags: "RO access", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XSETID", false, &[
-        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
-    ]),
-    ("XIDMPRECORD", false, &[
         Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
     ("XTRIM", false, &[

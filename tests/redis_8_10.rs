@@ -3483,3 +3483,35 @@ fn client_info_counts_a_command_once_it_has_run() {
         tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id) == before + 1
     });
 }
+
+/// `COMMAND GETKEYSANDFLAGS` knows the commands Redis 8.10 added (the key
+/// specs are made from 8.10.2's), as unit/introspection-2 checks.
+#[test]
+fn getkeysandflags_knows_the_8_10_commands() {
+    let mut c = conn();
+    let flags = |c: &mut Conn, args: &[&str]| -> Vec<(String, String)> {
+        let mut full = vec!["COMMAND", "GETKEYSANDFLAGS"];
+        full.extend_from_slice(args);
+        c.cmd(&full)
+            .arr()
+            .iter()
+            .map(|key| {
+                let pair = key.arr();
+                (pair[0].s().to_string(), pair[1].strings().join(" "))
+            })
+            .collect()
+    };
+    let one = |key: &str, flags: &str| vec![(key.to_string(), flags.to_string())];
+    assert_eq!(flags(&mut c, &["delex", "k1"]), one("k1", "RM delete"));
+    assert_eq!(flags(&mut c, &["delex", "k1", "ifeq", "v1"]), one("k1", "RW delete"));
+    assert_eq!(flags(&mut c, &["set", "k1", "v1", "IFEQ", "v1"]), one("k1", "RW update"));
+    assert_eq!(
+        flags(&mut c, &["msetex", "2", "k1", "v1", "k2", "v2", "ex", "10"]),
+        [("k1".to_string(), "OW update".to_string()), ("k2".to_string(), "OW update".to_string())]
+    );
+    for args in [&["digest", "k1"][..], &["increx", "k1"], &["sdiffcard", "1", "k1"], &["arlen", "k1"]] {
+        let got = flags(&mut c, args);
+        assert_eq!(got.len(), 1, "{args:?}: {got:?}");
+        assert_eq!(got[0].0, "k1", "{args:?}");
+    }
+}

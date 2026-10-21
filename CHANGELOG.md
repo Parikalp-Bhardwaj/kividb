@@ -122,6 +122,12 @@ written against an earlier KiviDB may notice them.
   `BLPOP` counts once, when it is answered (it counted when it began, and
   again when it was answered). The commands a script runs (`redis.call`)
   count as its client's.
+- **`COMMAND GETKEYS` and `GETKEYSANDFLAGS` know the commands Redis 8.10
+  added** (`DELEX`, `DIGEST`, `INCREX`, `LMOVEM`, `SDIFFCARD`, the array
+  commands and the stream ones): the key specs are now made from Redis
+  8.10.2's command descriptions, not 8.0.0's, by `scripts/gen_keyspecs.py`.
+  `DELEX key` is `RM delete`, and with a condition `RW delete`, as in
+  Redis. `GETKEYSANDFLAGS delex k1` was `Invalid arguments specified`.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other
