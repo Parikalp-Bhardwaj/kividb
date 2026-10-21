@@ -152,10 +152,7 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR key must be valid UTF-8");
     };
     let (producer, iid) = (cmd[2], cmd[3]);
-    let defaults = (
-        ctx.config.stream_idmp_duration,
-        ctx.config.stream_idmp_maxsize,
-    );
+    let defaults = stream_extra::idmp_defaults(ctx.config);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let stream = match read_lock!(shard).get(key) {
         Some(KiviDBValue::Stream(s)) => Arc::clone(s),
@@ -322,6 +319,8 @@ fn format_entry(id: &StreamId, entry: &StreamEntry) -> Vec<u8> {
 /// of this scan would silently corrupt the replication stream instead of failing
 /// a test. See `xadd_id_index_matches_executor` in `script_feed`.
 pub(crate) struct XaddOptions<'a> {
+    /// IDMP or IDMPAUTO given more than once.
+    pub idmp_twice: bool,
     pub id_index: usize,
     pub nomkstream: bool,
     pub maxlen: Option<u64>,
@@ -343,6 +342,7 @@ pub(crate) fn parse_xadd_options<'a>(cmd: &[&'a [u8]]) -> XaddOptions<'a> {
     let mut minid: Option<StreamId> = None;
     let mut trim_refs = TrimRefs::default();
     let mut idmp: Option<IdmpArg<'a>> = None;
+    let mut idmp_twice = false;
     let mut approx = false;
     let mut limit: Option<i64> = None;
 
@@ -360,6 +360,9 @@ pub(crate) fn parse_xadd_options<'a>(cmd: &[&'a [u8]]) -> XaddOptions<'a> {
                 i += 1;
             }
             "IDMP" if i + 2 < cmd.len() => {
+                if idmp.is_some() {
+                    idmp_twice = true;
+                }
                 idmp = Some(IdmpArg::Explicit {
                     producer: cmd[i + 1],
                     iid: cmd[i + 2],
@@ -367,6 +370,9 @@ pub(crate) fn parse_xadd_options<'a>(cmd: &[&'a [u8]]) -> XaddOptions<'a> {
                 i += 3;
             }
             "IDMPAUTO" if i + 1 < cmd.len() => {
+                if idmp.is_some() {
+                    idmp_twice = true;
+                }
                 idmp = Some(IdmpArg::Auto {
                     producer: cmd[i + 1],
                 });
@@ -415,6 +421,7 @@ pub(crate) fn parse_xadd_options<'a>(cmd: &[&'a [u8]]) -> XaddOptions<'a> {
 
     XaddOptions {
         id_index: i,
+        idmp_twice,
         nomkstream,
         maxlen,
         minid,
@@ -460,6 +467,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
         let XaddOptions {
             id_index,
+            idmp_twice,
             nomkstream,
             maxlen,
             minid,
@@ -474,11 +482,39 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         };
         let mut i = id_index;
 
+        if idmp_twice {
+            return resp_error("ERR syntax error, IDMP/IDMPAUTO specified multiple times");
+        }
+        match &idmp {
+            Some(IdmpArg::Explicit { producer, .. } | IdmpArg::Auto { producer })
+                if producer.is_empty() =>
+            {
+                let which = if matches!(idmp, Some(IdmpArg::Auto { .. })) {
+                    "IDMPAUTO"
+                } else {
+                    "IDMP"
+                };
+                return resp_error(&format!("ERR {which} requires a non-empty producer ID"));
+            }
+            Some(IdmpArg::Explicit { iid, .. }) if iid.is_empty() => {
+                return resp_error("ERR IDMP requires a non-empty idempotent ID");
+            }
+            _ => {}
+        }
         let id_str = match cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
             Some(s) => s.to_string(),
             None => return resp_error("ERR syntax error: missing ID"),
         };
         i += 1;
+        // The ID is read before the fields are counted, as in Redis.
+        let id_ok = id_str == "*"
+            || StreamId::parse(&id_str).is_some()
+            || id_str
+                .strip_suffix("-*")
+                .is_some_and(|ms| ms.parse::<u64>().is_ok());
+        if !id_ok {
+            return resp_error("ERR Invalid stream ID specified as stream command argument");
+        }
 
         if (cmd.len() - i) < 2 || !(cmd.len() - i).is_multiple_of(2) {
             return resp_error("ERR wrong number of arguments: field-value pairs required");
@@ -507,9 +543,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         // another node already resolved to a concrete ID: a replica (or the
         // AOF) applying its master's stream, or a slot being migrated here.
         if id_str != "*" && !ctx.apply_replication && !ctx.bypass_cluster_check {
-            return resp_error(
-                "ERR IDMP and IDMPAUTO can only be used with an auto-generated ID (*)",
-            );
+            return resp_error("ERR IDMP/IDMPAUTO can be used only with auto-generated IDs");
         }
     }
     // What this command adds — possibly nothing — and how much a `~` trimmed
@@ -559,10 +593,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut inner = stream.write();
     let now = now_ms();
-    let idmp_defaults = (
-        ctx.config.stream_idmp_duration,
-        ctx.config.stream_idmp_maxsize,
-    );
+    let idmp_defaults = stream_extra::idmp_defaults(ctx.config);
 
     // A retry of a message this producer already delivered: reply with the
     // entry it produced the first time and add nothing. A replica does not
@@ -2765,10 +2796,7 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
                     }
                     _ => return resp_error("ERR syntax error"),
                 };
-                let idmp_defaults = (
-                    ctx.config.stream_idmp_duration,
-                    ctx.config.stream_idmp_maxsize,
-                );
+                let idmp_defaults = stream_extra::idmp_defaults(ctx.config);
                 return xinfo_stream_full(resp, &inner, count, idmp_defaults);
             }
             let first_entry = inner
@@ -2784,14 +2812,13 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
                 .map(|(id, e)| format_entry(id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 
-            let (idmp_duration, idmp_maxsize) = stream_extra::idmp_settings(
+            let (idmp_duration, idmp_maxsize) =
+                stream_extra::idmp_settings(&inner, stream_extra::idmp_defaults(ctx.config));
+            let (pids_tracked, iids_tracked) = stream_extra::idmp_tracked(
                 &inner,
-                (
-                    ctx.config.stream_idmp_duration,
-                    ctx.config.stream_idmp_maxsize,
-                ),
+                stream_extra::idmp_defaults(ctx.config),
+                now_ms(),
             );
-            let (pids_tracked, iids_tracked) = stream_extra::idmp_tracked(&inner);
 
             resp_map_for(
                 resp,
@@ -2975,7 +3002,7 @@ fn xinfo_stream_full(
         })
         .collect();
     let (idmp_duration, idmp_maxsize) = stream_extra::idmp_settings(inner, idmp_defaults);
-    let (pids_tracked, iids_tracked) = stream_extra::idmp_tracked(inner);
+    let (pids_tracked, iids_tracked) = stream_extra::idmp_tracked(inner, idmp_defaults, now_ms());
     let nodes = stream_extra::node_count(inner);
     resp_map_for(
         resp,
@@ -3323,7 +3350,7 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
 
     // XCFGSET key field value [field value ...]
-    if cmd.len() < 4 || !(cmd.len() - 2).is_multiple_of(2) {
+    if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'xcfgset' command");
     }
 
@@ -3362,14 +3389,18 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     let mut i = 2usize;
-    while i + 1 < cmd.len() {
+    while i < cmd.len() {
         let field = match parse_utf8(cmd[i]) {
             Some(f) => f.to_ascii_uppercase(),
-            None => return resp_error("ERR field name must be valid UTF-8"),
+            None => return resp_error("ERR syntax error"),
         };
-        let value = match parse_utf8(cmd[i + 1]) {
+        // Every parameter takes a value; one without is a syntax error.
+        let Some(raw) = cmd.get(i + 1) else {
+            return resp_error("ERR syntax error");
+        };
+        let value = match parse_utf8(raw) {
             Some(v) => v.to_string(),
-            None => return resp_error("ERR field value must be valid UTF-8"),
+            None => return resp_error("ERR value is not an integer or out of range"),
         };
 
         match field.as_str() {
@@ -3381,18 +3412,35 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
                 // 0 means "remove the policy" — stored as None
                 patch.max_entries = Some(if n == 0 { None } else { Some(n) });
             }
-            "IDMP-DURATION" => match value.parse::<u64>() {
-                Ok(n) if stream_extra::IDMP_DURATION_RANGE.contains(&n) => {
-                    patch.idmp_duration = Some(n);
+            "IDMP-DURATION" | "IDMP-MAXSIZE" => {
+                let (slot, range, unit) = if field == "IDMP-DURATION" {
+                    (
+                        &mut patch.idmp_duration,
+                        stream_extra::IDMP_DURATION_RANGE,
+                        "seconds",
+                    )
+                } else {
+                    (
+                        &mut patch.idmp_maxsize,
+                        stream_extra::IDMP_MAXSIZE_RANGE,
+                        "entries",
+                    )
+                };
+                if slot.is_some() {
+                    return resp_error(&format!("ERR {field} specified multiple times"));
                 }
-                _ => return resp_error("ERR invalid duration"),
-            },
-            "IDMP-MAXSIZE" => match value.parse::<u64>() {
-                Ok(n) if stream_extra::IDMP_MAXSIZE_RANGE.contains(&n) => {
-                    patch.idmp_maxsize = Some(n);
+                let Some(n) = stream_extra::strict_integer(raw) else {
+                    return resp_error("ERR value is not an integer or out of range");
+                };
+                if !(*range.start() as i64..=*range.end() as i64).contains(&n) {
+                    return resp_error(&format!(
+                        "ERR {field} must be between {} and {} {unit}",
+                        range.start(),
+                        range.end()
+                    ));
                 }
-                _ => return resp_error("ERR invalid maxsize"),
-            },
+                *slot = Some(n as u64);
+            }
             "MAX-DELETED-ENTRY-ID" => match StreamId::parse(&value) {
                 Some(id) => patch.max_deleted_id = Some(id),
                 None => {
@@ -3401,12 +3449,18 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
                     );
                 }
             },
-            other => {
-                return resp_error(&format!("ERR unknown field '{other}' for XCFGSET"));
-            }
+            _ => return resp_error("ERR syntax error"),
         }
         i += 2;
     }
+    if patch.max_entries.is_none()
+        && patch.max_deleted_id.is_none()
+        && patch.idmp_duration.is_none()
+        && patch.idmp_maxsize.is_none()
+    {
+        return resp_error("ERR At least one parameter must be specified");
+    }
+    let defaults = stream_extra::idmp_defaults(ctx.config);
 
     // Apply the patch atomically under a single write lock.
     let mut inner = stream_arc.write();
@@ -3433,14 +3487,19 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
-    if patch.idmp_duration.is_some() || patch.idmp_maxsize.is_some() {
-        if let Some(duration) = patch.idmp_duration {
-            inner.idmp.duration_secs = Some(duration);
-        }
-        if let Some(maxsize) = patch.idmp_maxsize {
-            inner.idmp.maxsize = Some(maxsize);
-        }
-        // The remembered IDs were kept under the old settings; start over.
+    // A value other than the one in force clears the remembered IDs, which
+    // were kept under it; the same value keeps them, so that several
+    // producers may each set it before they start (Redis 8.10).
+    let mut changed = false;
+    if let Some(duration) = patch.idmp_duration {
+        changed |= inner.idmp.duration_secs.unwrap_or(defaults.0) != duration;
+        inner.idmp.duration_secs = Some(duration);
+    }
+    if let Some(maxsize) = patch.idmp_maxsize {
+        changed |= inner.idmp.maxsize.unwrap_or(defaults.1) != maxsize;
+        inner.idmp.maxsize = Some(maxsize);
+    }
+    if changed {
         inner.idmp.producers.clear();
     }
 

@@ -139,7 +139,9 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "stream-idmp-duration",
-            ctx.config.stream_idmp_duration.to_string(),
+            crate::commands::stream_extra::idmp_defaults(ctx.config)
+                .0
+                .to_string(),
         ),
         ("backupdirname", ctx.config.backupdirname.clone()),
         (
@@ -149,7 +151,9 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ("preload-file", ctx.config.preload_file.clone()),
         (
             "stream-idmp-maxsize",
-            ctx.config.stream_idmp_maxsize.to_string(),
+            crate::commands::stream_extra::idmp_defaults(ctx.config)
+                .1
+                .to_string(),
         ),
         (
             "stream-node-max-entries",
@@ -609,6 +613,29 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument must be between 1 and 65535 inclusive",
                 )),
             },
+            // Redis's ranges: 1 second to a day, 1 to 10000 entries.
+            "stream-idmp-duration" | "stream-idmp-maxsize" => {
+                let (slot, max) = if param == "stream-idmp-duration" {
+                    (
+                        &crate::commands::stream_extra::IDMP_DEFAULT_DURATION,
+                        86_400,
+                    )
+                } else {
+                    (&crate::commands::stream_extra::IDMP_DEFAULT_MAXSIZE, 10_000)
+                };
+                match value.parse::<i64>() {
+                    Ok(n) if (1..=max).contains(&n) => {
+                        slot.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    Ok(_) => Some(resp_error(&format!(
+                        "ERR argument must be between 1 and {max} inclusive"
+                    ))),
+                    Err(_) => Some(resp_error(
+                        "ERR argument couldn't be parsed into an integer",
+                    )),
+                }
+            }
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
