@@ -949,8 +949,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            if secs <= 0 {
-                return Some(resp_error("ERR invalid expire time, must be > 0"));
+            // 0 is now, and the fields go, as in Redis 8.10; only a
+            // negative time is refused.
+            if secs < 0 {
+                return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
@@ -960,7 +962,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let new_exp = Instant::now() + Duration::from_secs(secs as u64);
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, flag, false);
+            let results = apply_field_expire(ctx, &key, &fields, new_exp, flag, secs == 0);
             // results is already a Vec<Vec<u8>> of resp_integer / resp_error.
             // If a single WRONGTYPE error was returned, surface that directly.
             if results.len() == 1 && results[0].starts_with(b"-") {
@@ -985,8 +987,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            if ms <= 0 {
-                return Some(resp_error("ERR invalid expire time, must be > 0"));
+            // 0 is now, and the fields go, as in Redis 8.10; only a
+            // negative time is refused.
+            if ms < 0 {
+                return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
@@ -996,7 +1000,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let new_exp = Instant::now() + Duration::from_millis(ms as u64);
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, flag, false);
+            let results = apply_field_expire(ctx, &key, &fields, new_exp, flag, ms == 0);
             if results.len() == 1 && results[0].starts_with(b"-") {
                 return Some(results.into_iter().next().unwrap());
             }
@@ -1855,16 +1859,13 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     }
                 };
                 let act = match tok.as_str() {
-                    "EX" => {
-                        if n <= 0 {
-                            return Some(resp_error("ERR invalid expire time, must be > 0"));
-                        }
-                        HgetexAction::SetExpiry(Instant::now() + Duration::from_secs(n as u64))
+                    "EX" | "PX" if n < 0 => {
+                        return Some(resp_error("ERR invalid expire time, must be >= 0"));
                     }
+                    // 0 is now: the fields go, as in Redis 8.10.
+                    "EX" | "PX" if n == 0 => HgetexAction::SetExpiryPast,
+                    "EX" => HgetexAction::SetExpiry(Instant::now() + Duration::from_secs(n as u64)),
                     "PX" => {
-                        if n <= 0 {
-                            return Some(resp_error("ERR invalid expire time, must be > 0"));
-                        }
                         HgetexAction::SetExpiry(Instant::now() + Duration::from_millis(n as u64))
                     }
                     "EXAT" => {
@@ -2325,10 +2326,12 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     .unwrap_or_default()
                     .as_millis() as i64;
                 ttl = Some(match tok.as_str() {
+                    "EX" | "PX" if n < 0 => {
+                        return Some(resp_error("ERR invalid expire time, must be >= 0"));
+                    }
+                    // 0 is now: the fields are set and go, as in Redis 8.10.
+                    "EX" | "PX" if n == 0 => HsetexTtl::Past,
                     "EX" | "PX" => {
-                        if n <= 0 {
-                            return Some(resp_error("ERR invalid expire time, must be > 0"));
-                        }
                         let ms = if tok == "EX" {
                             n.saturating_mul(1000)
                         } else {

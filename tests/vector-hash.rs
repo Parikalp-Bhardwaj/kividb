@@ -4359,26 +4359,35 @@ fn test_hexpire_basic_eviction() {
     assert_eq!(c.cmds(&["HGET", "h", "b"]).as_str(), "y");
 }
 
-// HEXPIRE rejects zero or negative TTLs (relative form only)
+// HEXPIRE and HPEXPIRE take 0 as now: the field goes, with 2, as in Redis
+// 8.10. A negative time is refused.
 #[test]
-fn test_hexpire_rejects_nonpositive() {
+fn test_hexpire_zero_is_now_and_negative_is_refused() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    c.cmds(&["HSET", "h", "a", "1"]);
-    assert!(
+    c.cmds(&["HSET", "h", "a", "1", "b", "2"]);
+    assert_eq!(
         c.cmds(&["HEXPIRE", "h", "0", "FIELDS", "1", "a"])
-            .is_error()
+            .as_array()[0]
+            .as_int(),
+        2
     );
-    assert!(
-        c.cmds(&["HEXPIRE", "h", "-5", "FIELDS", "1", "a"])
-            .is_error()
+    assert!(c.cmds(&["HEXISTS", "h", "a"]).as_int() == 0);
+    assert_eq!(
+        c.cmds(&["HPEXPIRE", "h", "0", "FIELDS", "1", "b"])
+            .as_array()[0]
+            .as_int(),
+        2
     );
-    assert!(
-        c.cmds(&["HPEXPIRE", "h", "0", "FIELDS", "1", "a"])
-            .is_error()
-    );
+    c.cmds(&["HSET", "h", "c", "3"]);
+    for args in [["HEXPIRE", "h", "-5"], ["HPEXPIRE", "h", "-5"]] {
+        let mut cmd = args.to_vec();
+        cmd.extend_from_slice(&["FIELDS", "1", "c"]);
+        assert!(c.cmds(&cmd).is_error(), "{args:?}");
+    }
+    assert!(c.cmds(&["HEXISTS", "h", "c"]).as_int() == 1);
 }
 
 // HEXPIRE NX: only sets if no TTL is currently set

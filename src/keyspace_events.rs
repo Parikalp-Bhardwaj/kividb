@@ -246,12 +246,58 @@ pub fn notify(
     }
     if flags & KS_KEYSPACE != 0 {
         let ch = format!("__keyspace@{}__:{}", db, key);
-        pubsub.publish(&ch, Arc::from(event.as_bytes()));
+        publish(pubsub, ch, Arc::from(event.as_bytes()));
     }
     if flags & KS_KEYEVENT != 0 {
         let ch = format!("__keyevent@{}__:{}", db, event);
-        pubsub.publish(&ch, Arc::from(key.as_bytes()));
+        publish(pubsub, ch, Arc::from(key.as_bytes()));
     }
+}
+
+thread_local! {
+    /// Events a command announced while they were held back (see [`hold`]).
+    static HELD: std::cell::RefCell<Option<Vec<(String, Arc<[u8]>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn publish(pubsub: &crate::pubsub::PubSubHub, channel: String, payload: Arc<[u8]>) {
+    let now = HELD.with_borrow_mut(|held| match held {
+        Some(held) => {
+            held.push((channel, payload));
+            None
+        }
+        None => Some((channel, payload)),
+    });
+    if let Some((channel, payload)) = now {
+        pubsub.publish(&channel, payload);
+    }
+}
+
+/// Hold back the events the command now running on this thread announces,
+/// until [`release`]: so that `overwritten` and `type_changed`, which are
+/// only known once it has run, can go before them, as Redis's `setKey`
+/// sends them.
+pub fn hold() {
+    HELD.set(Some(Vec::new()));
+}
+
+/// The held events, and holding no longer: announce what goes first, then
+/// [`replay`] these.
+pub fn release() -> Vec<(String, Arc<[u8]>)> {
+    HELD.take().unwrap_or_default()
+}
+
+pub fn replay(pubsub: &crate::pubsub::PubSubHub, held: Vec<(String, Arc<[u8]>)>) {
+    for (channel, payload) in held {
+        pubsub.publish(&channel, payload);
+    }
+}
+
+/// Whether a command announces `overwritten` before its own events (the
+/// commands that go through Redis's `setKey`) rather than after them
+/// (RENAME, COPY and RESTORE, which announce it themselves at the end).
+pub fn overwritten_goes_first(name: &str) -> bool {
+    !matches!(name, "RENAME" | "RENAMENX" | "COPY" | "RESTORE")
 }
 
 /// `<len>:<subkey>[,<len>:<subkey>...]` — length-prefixed, so a subkey may

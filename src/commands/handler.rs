@@ -879,10 +879,21 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         Vec::new()
     };
 
+    let holding =
+        !before_replace.is_empty() && crate::keyspace_events::overwritten_goes_first(name);
+    if holding {
+        crate::keyspace_events::hold();
+    }
+
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
 
+    let held = if holding {
+        crate::keyspace_events::release()
+    } else {
+        Vec::new()
+    };
     for (db, pos, old) in before_replace {
         let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
             continue;
@@ -911,6 +922,7 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
             }
         }
     }
+    crate::keyspace_events::replay(ctx.pubsub, held);
 
     for pos in absent {
         if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])

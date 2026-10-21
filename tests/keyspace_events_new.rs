@@ -187,6 +187,21 @@ fn overwritten_type_changed_and_array_events() {
     c.ok(&["SET", "marker", "2"]);
     assert_eq!(event(&mut sub), "overwritten marker", "nothing for SET NX");
 
+    // With the command's own events: `overwritten` first for SET (Redis's
+    // setKey), after them for RENAME.
+    c.ok(&["CONFIG", "SET", "notify-keyspace-events", "E$go"]);
+    c.ok(&["SET", "order", "1"]);
+    assert_eq!(event(&mut sub), "set order");
+    c.ok(&["SET", "order", "2"]);
+    assert_eq!(event(&mut sub), "overwritten order");
+    assert_eq!(event(&mut sub), "set order");
+    c.ok(&["SET", "order2", "x"]);
+    assert_eq!(event(&mut sub), "set order2");
+    c.ok(&["RENAME", "order2", "order"]);
+    assert_eq!(event(&mut sub), "rename_from order2");
+    assert_eq!(event(&mut sub), "rename_to order");
+    assert_eq!(event(&mut sub), "overwritten order");
+
     // `a`: array commands, and `del` when one empties the array.
     c.ok(&["CONFIG", "SET", "notify-keyspace-events", "EA"]);
     assert_eq!(c.cmd(&["ARSET", "arr", "0", "a", "b"]), V::Int(2));
