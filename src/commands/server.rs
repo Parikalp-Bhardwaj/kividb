@@ -167,7 +167,62 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),
+        (
+            "array-slice-size",
+            crate::types::ARRAY_SLICE_SIZE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "array-sparse-kmax",
+            crate::types::ARRAY_SPARSE_KMAX
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "array-sparse-kmin",
+            crate::types::ARRAY_SPARSE_KMIN
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
     ]
+}
+
+/// `CONFIG SET` of the array settings, as Redis checks them: the slice size
+/// a power of two from 256 to 65536; `kmax` and `kmin` from 0 to 256, `kmin`
+/// below `kmax` unless `kmax` is 0 (sparse slices off).
+fn config_set_array(param: &str, value: &str) -> Vec<u8> {
+    use crate::types::{ARRAY_SLICE_SIZE, ARRAY_SPARSE_KMAX, ARRAY_SPARSE_KMIN};
+    use std::sync::atomic::Ordering::Relaxed;
+    let failed = |why: &str| {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+        ))
+    };
+    let (min, max) = if param == "array-slice-size" { (256, 65536) } else { (0, 256) };
+    let Some(v) = value.parse::<u32>().ok().filter(|v| (min..=max).contains(v)) else {
+        return failed(&format!("argument must be between {min} and {max} inclusive"));
+    };
+    match param {
+        "array-slice-size" if !v.is_power_of_two() => {
+            return failed("array-slice-size must be a power of two");
+        }
+        "array-slice-size" => ARRAY_SLICE_SIZE.store(v, Relaxed),
+        "array-sparse-kmax" if v != 0 && v <= ARRAY_SPARSE_KMIN.load(Relaxed) => {
+            return failed(
+                "array-sparse-kmax must be greater than array-sparse-kmin when non-zero",
+            );
+        }
+        "array-sparse-kmax" => ARRAY_SPARSE_KMAX.store(v, Relaxed),
+        _ => {
+            let kmax = ARRAY_SPARSE_KMAX.load(Relaxed);
+            if kmax != 0 && v >= kmax {
+                return failed("array-sparse-kmin must be less than array-sparse-kmax");
+            }
+            ARRAY_SPARSE_KMIN.store(v, Relaxed);
+        }
+    }
+    resp_simple("OK")
 }
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
@@ -212,6 +267,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
+                Some(config_set_array(&param, value))
+            }
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES

@@ -716,8 +716,9 @@ fn spec_example_arinfo() {
     for field in [
         "dense-slices",
         "sparse-slices",
-        "avg-slice-size",
-        "avg-fill-rate",
+        "avg-dense-size",
+        "avg-dense-fill",
+        "avg-sparse-size",
     ] {
         assert!(
             full.iter().any(|f| f == field),
@@ -917,4 +918,89 @@ impl RespValue {
             _ => panic!("not an error: {:?}", self),
         }
     }
+}
+
+/// `ARINFO FULL`'s dense and sparse slices, as Redis 8.10 keeps them (its
+/// unit/type/array): a slice is sparse until it would pass 10 elements
+/// (`array-sparse-kmax`), and a dense one becomes sparse again only when a
+/// deletion leaves 5 or fewer (`array-sparse-kmin`); the dense window grows
+/// by powers of two.
+#[test]
+fn arinfo_slices_are_dense_or_sparse_as_redis_keeps_them() {
+    let mut c = conn();
+    let k = "t:arslices";
+    let info = |c: &mut Conn| -> (i64, i64, f64) {
+        let full = c.cmds(&["ARINFO", k, "FULL"]).flat();
+        let get = |name: &str| {
+            let at = full.iter().position(|f| f == name).unwrap();
+            full[at + 1].clone()
+        };
+        (
+            get("dense-slices").parse().unwrap(),
+            get("sparse-slices").parse().unwrap(),
+            get("avg-dense-size").parse().unwrap(),
+        )
+    };
+
+    // Growing to the right: one dense slice, a window of at least 128.
+    c.cmds(&["DEL", k]);
+    for i in 0..100 {
+        c.cmds(&["ARSET", k, &i.to_string(), "v"]);
+    }
+    let (dense, sparse, size) = info(&mut c);
+    assert_eq!((dense, sparse), (1, 0));
+    assert!(size >= 128.0, "{size}");
+
+    // And to the left.
+    c.cmds(&["DEL", k]);
+    c.cmds(&["ARSET", k, "500", "anchor"]);
+    for i in (400..500).rev() {
+        c.cmds(&["ARSET", k, &i.to_string(), "v"]);
+    }
+    let (dense, _, size) = info(&mut c);
+    assert_eq!(dense, 1);
+    assert!(size >= 128.0, "{size}");
+
+    // Ten elements are sparse; the eleventh makes the slice dense.
+    c.cmds(&["DEL", k]);
+    for i in 0..10 {
+        c.cmds(&["ARSET", k, &(i * 3).to_string(), "v"]);
+    }
+    assert_eq!(info(&mut c).0, 0);
+    c.cmds(&["ARSET", k, "100", "v"]);
+    let (dense, sparse, _) = info(&mut c);
+    assert_eq!((dense, sparse), (1, 0));
+
+    // Deleting down to seven keeps it dense; to three, sparse.
+    c.cmds(&["DEL", k]);
+    for i in 0..50 {
+        c.cmds(&["ARSET", k, &i.to_string(), "v"]);
+    }
+    c.cmds(&["ARDELRANGE", k, "7", "49"]);
+    assert_eq!(info(&mut c).0, 1);
+    c.cmds(&["ARDELRANGE", k, "3", "6"]);
+    let (dense, sparse, _) = info(&mut c);
+    assert_eq!((dense, sparse), (0, 1));
+    assert_eq!(c.cmds(&["ARCOUNT", k]).as_int(), 3);
+    c.cmds(&["DEL", k]);
+}
+
+/// `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
+/// the last index is `insert index overflow`, as in Redis.
+#[test]
+fn arlastitems_after_arseek_0_and_insert_overflow() {
+    let mut c = conn();
+    let k = "t:arlast";
+    c.cmds(&["DEL", k]);
+    for i in 0..5 {
+        c.cmds(&["ARINSERT", k, &(i * 10).to_string()]);
+    }
+    assert_eq!(c.cmds(&["ARSEEK", k, "0"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ARLASTITEMS", k, "3"]).flat(), ["20", "30", "40"]);
+    c.cmds(&["DEL", k]);
+    c.cmds(&["ARINSERT", k, "a"]);
+    c.cmds(&["ARSEEK", k, "18446744073709551615"]);
+    let r = c.cmds(&["ARINSERT", k, "b"]);
+    assert!(r.is_error() && format!("{r:?}").contains("insert index overflow"), "{r:?}");
+    c.cmds(&["DEL", k]);
 }

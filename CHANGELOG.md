@@ -136,6 +136,15 @@ written against an earlier KiviDB may notice them.
   8.10.2's command descriptions, not 8.0.0's, by `scripts/gen_keyspecs.py`.
   `DELEX key` is `RM delete`, and with a condition `RW delete`, as in
   Redis. `GETKEYSANDFLAGS delex k1` was `Invalid arguments specified`.
+- **`ARINFO FULL` reports an array's slices as Redis keeps them**: dense or
+  sparse, by Redis's rules (a slice turns dense past `array-sparse-kmax`
+  elements, and sparse again when a deletion leaves `array-sparse-kmin` or
+  fewer), with Redis's fields `avg-dense-size`, `avg-dense-fill` and
+  `avg-sparse-size` in place of `avg-slice-size` and `avg-fill-rate`. It
+  had called a slice dense when it was half full. `array-slice-size`,
+  `array-sparse-kmax` and `array-sparse-kmin` can be set as in Redis.
+  `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
+  the last index is `insert index overflow`, as in Redis.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

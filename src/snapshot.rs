@@ -1484,7 +1484,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         r.read_exact(&mut idx_buf)?;
                         let idx = u64::from_le_bytes(idx_buf);
                         let val = read_bytes(&mut r)?;
-                        arr.entries.insert(idx, Arc::from(val.as_slice()));
+                        arr.set(idx, Arc::from(val.as_slice()));
                     }
                     let mut next_buf = [0u8; 8];
                     r.read_exact(&mut next_buf)?;
@@ -3876,7 +3876,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let idx = u64::from_le_bytes(payload.get(pos..pos + 8)?.try_into().ok()?);
                 pos += 8;
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
-                arr.entries.insert(idx, Arc::from(bytes));
+                arr.set(idx, Arc::from(bytes));
                 pos = next;
             }
             arr.next_insert = u64::from_le_bytes(payload.get(pos..pos + 8)?.try_into().ok()?);
