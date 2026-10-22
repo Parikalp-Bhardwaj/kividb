@@ -800,6 +800,11 @@ async fn run_replication_session(
         };
         drop(rdb_bytes);
 
+        // The master's libraries, in place of this node's, before the dataset
+        // is: a failure here leaves the dataset as it was, and the master's
+        // command stream, which may call them, comes after.
+        crate::snapshot::restore_functions(staged.functions)
+            .map_err(|e| SessionError::Link(format!("full sync: {e}")))?;
         {
             // Stop the world for the swap, the same way a checkpoint does, so a
             // local AOF record cannot straddle it.
@@ -1111,6 +1116,8 @@ struct StagedSync {
     expiry: ExpiryStore,
     index_schemas: Vec<crate::vector::IndexSchema>,
     dictionaries: Vec<(String, Vec<String>)>,
+    /// The master's function libraries, from a KDB image that has any.
+    functions: Option<Vec<u8>>,
     keys: usize,
     keys_with_ttl: usize,
 }
@@ -1125,7 +1132,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let staging_expiry = store::new_expiry_store(databases);
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
-    let (dbs, expiries, index_schemas, dictionaries) = if is_kividb {
+    let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_from(payload).map_err(|e| {
             SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
         })?;
@@ -1134,12 +1141,13 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
             loaded.expiries,
             loaded.index_schemas,
             loaded.dictionaries,
+            loaded.functions,
         )
     } else {
         let (dbs, expiries) = crate::snapshot::load_redis_rdb_from(payload).map_err(|e| {
             SessionError::Link(format!("full-sync payload is not a valid RDB: {e}"))
         })?;
-        (dbs, expiries, Vec::new(), Vec::new())
+        (dbs, expiries, Vec::new(), Vec::new(), None)
     };
 
     let keys = crate::snapshot::restore_into_store(dbs, &staging_store);
@@ -1149,6 +1157,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
         expiry: staging_expiry,
         index_schemas,
         dictionaries,
+        functions,
         keys,
         keys_with_ttl,
     })

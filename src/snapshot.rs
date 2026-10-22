@@ -35,6 +35,10 @@ pub struct LoadedSnapshot {
     /// `dbs` instead of appearing here. Empty maps for an image written before
     /// expiries were persisted.
     pub expiries: Vec<HashMap<String, u64>>,
+    /// The function libraries, as a `FUNCTION DUMP` payload: `None` for an
+    /// image that holds none, or one written before they were kept. Loaded
+    /// with [`restore_functions`].
+    pub functions: Option<Vec<u8>>,
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
@@ -59,6 +63,10 @@ const KDB_SYNONYMS_MAGIC: &[u8; 8] = b"KIVISD1\0";
 /// same reason as the synonyms: the schema section has no room for it, and
 /// an older release that stops before it reads the field as FLOAT32.
 const KDB_VECTOR_TYPES_MAGIC: &[u8; 8] = b"KIVIVT1\0";
+/// The function libraries, as a `FUNCTION DUMP` payload. Last, after the
+/// vector types: an older release reads everything else and stops here, as
+/// it did before libraries were kept.
+const KDB_FUNCTIONS_MAGIC: &[u8; 8] = b"KIVIFN1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -726,7 +734,88 @@ pub fn write_kdb_image(
     }
     write_kdb_index_sections(w, index_store)?;
     write_kdb_expiry_section(w, maps, expiry_store)?;
-    write_kdb_alias_section(w, index_store)
+    write_kdb_alias_section(w, index_store)?;
+    write_kdb_functions_section(w, function_libraries().as_deref())
+}
+
+/// The libraries loaded now, as a `FUNCTION DUMP` payload: `None` when there
+/// is none, or in a build without Lua, which cannot load any.
+fn function_libraries() -> Option<Vec<u8>> {
+    #[cfg(feature = "lua")]
+    let libraries = crate::commands::library_snapshot();
+    #[cfg(not(feature = "lua"))]
+    let libraries = None;
+    libraries
+}
+
+/// The function libraries' section, which closes a KDB image. Absent when
+/// there are none, so such an image is what it was before they were kept.
+fn write_kdb_functions_section(w: &mut impl Write, libraries: Option<&[u8]>) -> io::Result<()> {
+    if let Some(payload) = libraries {
+        w.write_all(KDB_FUNCTIONS_MAGIC)?;
+        write_bytes(w, payload)?;
+    }
+    Ok(())
+}
+
+/// Load the function libraries an image kept ([`LoadedSnapshot::functions`]),
+/// in place of those loaded, as Redis does with the ones in an RDB file: an
+/// image without any leaves none.
+///
+/// A build without Lua cannot load them, and says so: they are not in its
+/// next snapshot.
+pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
+    #[cfg(feature = "lua")]
+    crate::commands::restore_library_snapshot(functions.as_deref()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the snapshot's function libraries cannot be loaded: {e}"),
+        )
+    })?;
+    #[cfg(not(feature = "lua"))]
+    if let Some(payload) = functions {
+        let names = function_library_names(&payload)
+            .map(|names| format!(" {}", names.join(", ")))
+            .unwrap_or_default();
+        log_warn!(
+            "the snapshot's function libraries{names} are not loaded: this build was made \
+             without Lua, and they are not in its next snapshot"
+        );
+    }
+    Ok(())
+}
+
+/// The library names in a `FUNCTION DUMP` payload of KiviDB's own: `KVFN`,
+/// the format version, the number of libraries, then each one's name,
+/// engine, code and function names, length-prefixed, and a checksum. Read
+/// without Lua, so a build without it can say which libraries it leaves out.
+/// `None` for a payload of any other shape.
+#[cfg_attr(feature = "lua", allow(dead_code))]
+fn function_library_names(payload: &[u8]) -> Option<Vec<String>> {
+    fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        let (head, tail) = rest.split_at_checked(n)?;
+        *rest = tail;
+        Some(head)
+    }
+    fn number(rest: &mut &[u8]) -> Option<usize> {
+        Some(u32::from_le_bytes(take(rest, 4)?.try_into().ok()?) as usize)
+    }
+    fn blob<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = number(rest)?;
+        take(rest, len)
+    }
+    let mut rest = payload.strip_prefix(b"KVFN")?;
+    number(&mut rest)?;
+    let mut names = Vec::new();
+    for _ in 0..number(&mut rest)? {
+        names.push(String::from_utf8_lossy(blob(&mut rest)?).into_owned());
+        blob(&mut rest)?;
+        blob(&mut rest)?;
+        for _ in 0..number(&mut rest)? {
+            blob(&mut rest)?;
+        }
+    }
+    (rest.len() == 8).then_some(names)
 }
 
 /// The index alias section: `(alias, index)` pairs.
@@ -1532,6 +1621,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     let mut hnsw_graphs = std::collections::HashMap::new();
     let mut dictionaries = Vec::new();
     let mut expiries: ExpiryMaps = (0..result.len()).map(|_| HashMap::new()).collect();
+    let mut functions = None;
     loop {
         let mut magic = [0u8; 8];
         if r.read_exact(&mut magic).is_err() {
@@ -1543,7 +1633,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                 Err(e) => {
                     log_warn!(
                         "snapshot index section is unreadable ({e}); indexes will be \
-                         rebuilt and any key expiries stored after it are lost"
+                         rebuilt, and any key expiries and function libraries stored \
+                         after it are lost"
                     );
                     break;
                 }
@@ -1554,7 +1645,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                 Err(e) => {
                     log_warn!(
                         "snapshot HNSW section is unreadable ({e}); graphs will be \
-                         rebuilt and any key expiries stored after it are lost"
+                         rebuilt, and any key expiries and function libraries stored \
+                         after it are lost"
                     );
                     break;
                 }
@@ -1584,6 +1676,10 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             dictionaries = read_synonyms_section(&mut r, &mut index_schemas)?;
         } else if &magic == KDB_VECTOR_TYPES_MAGIC {
             read_vector_types_section(&mut r, &mut index_schemas)?;
+        } else if &magic == KDB_FUNCTIONS_MAGIC {
+            // Not best-effort: a node that comes back without its libraries
+            // fails every FCALL.
+            functions = Some(read_bytes(&mut r)?);
         } else {
             break;
         }
@@ -1612,6 +1708,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             dictionaries,
             hnsw_graphs,
             expiries,
+            functions,
         },
         keys_read,
     ))
@@ -3356,6 +3453,8 @@ pub struct FrozenDataset {
     index_section: Vec<u8>,
     alias_section: Vec<u8>,
     expiries: ExpiryMaps,
+    /// The function libraries at the same instant.
+    functions: Option<Vec<u8>>,
 }
 
 /// What one thread of the capture took: strings, and everything else laid out.
@@ -3502,6 +3601,7 @@ fn freeze(
         index_section,
         alias_section,
         expiries,
+        functions: function_libraries(),
     })
 }
 
@@ -3553,7 +3653,8 @@ impl FrozenDataset {
         }
         out.write_all(&self.index_section)?;
         write_kdb_expiry_maps(out, &self.expiries)?;
-        out.write_all(&self.alias_section)
+        out.write_all(&self.alias_section)?;
+        write_kdb_functions_section(out, self.functions.as_deref())
     }
 }
 
@@ -4521,5 +4622,82 @@ mod verify_tests {
         // Verifying keeps nothing, and loading still loads.
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
         assert_eq!(loaded.dbs[0].len(), 500);
+    }
+}
+
+#[cfg(test)]
+mod function_section_tests {
+    use super::*;
+
+    fn image(libraries: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(
+            &mut out,
+            "k",
+            &KiviDBValue::String(SharedBytes::from(&b"v"[..])),
+        )
+        .unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+        write_kdb_functions_section(&mut out, libraries).unwrap();
+        out
+    }
+
+    /// The section brings back the libraries' payload as it was written, and
+    /// an image without it, as every image before it was, has none (#70).
+    #[test]
+    fn the_function_section_round_trips_and_is_optional() {
+        let loaded = load_snapshot_from(&image(Some(b"KVFN payload"))[..]).unwrap();
+        assert_eq!(loaded.functions.as_deref(), Some(&b"KVFN payload"[..]));
+        assert_eq!(loaded.dbs[0].len(), 1);
+        assert_eq!(
+            load_snapshot_from(&image(None)[..]).unwrap().functions,
+            None
+        );
+    }
+
+    /// A torn section fails the load, rather than bring a node up without
+    /// its libraries.
+    #[test]
+    fn a_torn_function_section_fails_the_load() {
+        let full = image(Some(b"KVFN payload"));
+        assert!(load_snapshot_from(&full[..full.len() - 3]).is_err());
+        assert!(verify_snapshot(&full[..full.len() - 3]).is_err());
+    }
+
+    /// What a build without Lua leaves out is named in its warning: the
+    /// libraries in the payload, read without Lua (#70).
+    #[test]
+    fn the_libraries_a_build_without_lua_leaves_out_are_named() {
+        let blob = |p: &mut Vec<u8>, s: &str| {
+            p.extend((s.len() as u32).to_le_bytes());
+            p.extend(s.as_bytes());
+        };
+        let mut payload = b"KVFN".to_vec();
+        payload.extend(1u32.to_le_bytes()); // format version
+        payload.extend(2u32.to_le_bytes()); // libraries
+        for (name, functions) in [("mylib", &["f", "g"][..]), ("other", &[][..])] {
+            blob(&mut payload, name);
+            blob(&mut payload, "LUA");
+            blob(&mut payload, "#!lua name=...");
+            payload.extend((functions.len() as u32).to_le_bytes());
+            for function in functions {
+                blob(&mut payload, function);
+            }
+        }
+        payload.extend([0u8; 8]); // checksum
+        assert_eq!(
+            function_library_names(&payload),
+            Some(vec!["mylib".to_string(), "other".to_string()])
+        );
+        assert_eq!(function_library_names(b"KVFN payload"), None);
+    }
+
+    /// A build without Lua loads such an image, and leaves the libraries out.
+    #[cfg(not(feature = "lua"))]
+    #[test]
+    fn a_build_without_lua_loads_an_image_with_libraries() {
+        assert!(restore_functions(Some(b"KVFN payload".to_vec())).is_ok());
     }
 }
