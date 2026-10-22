@@ -300,9 +300,11 @@ fn function_flush_async_frees_the_functions_vm_in_the_background() {
             V::Bulk(format!("test{i}").into())
         );
     }
+    // Well above an empty VM's; what is collected as they load (the
+    // collector is stepped every 50 loads) is not in it.
     let loaded = c.info("used_memory_vm_functions");
     assert!(
-        loaded > 100_000,
+        loaded > 60_000,
         "the VM holding 200 functions is {loaded} bytes"
     );
 
