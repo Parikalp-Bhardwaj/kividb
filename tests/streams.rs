@@ -3275,6 +3275,22 @@ fn test_renack_goes_to_the_back() {
     }
     assert_eq!(order, ["2-0", "3-0", "1-0"]);
 
+    // XINFO STREAM FULL shows a released entry's delivery time as 0.
+    c.cmds(&["XNACK", "nz:s", "grp", "FAIL", "IDS", "1", "1-0"]);
+    // The pending entry `[id, consumer, delivery time, count]` for 1-0.
+    fn find<'a>(v: &'a RespValue, id: &[u8]) -> Option<&'a [RespValue]> {
+        let RespValue::Array(items) = v else {
+            return None;
+        };
+        if items.len() == 4 && matches!(&items[0], RespValue::Bulk(b) if b == id) {
+            return Some(items);
+        }
+        items.iter().find_map(|item| find(item, id))
+    }
+    let full = c.cmds(&["XINFO", "STREAM", "nz:s", "FULL"]);
+    let entry = find(&full, b"1-0").expect("1-0 pending");
+    assert_eq!(entry[2], RespValue::Int(0), "{entry:?}");
+
     let r = c.cmds(&[
         "XREADGROUP",
         "GROUP",

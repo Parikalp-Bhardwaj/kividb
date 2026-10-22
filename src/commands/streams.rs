@@ -2960,7 +2960,7 @@ fn xinfo_stream_full(
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
                         resp_bulk_str(&p.consumer),
-                        resp_integer(p.delivered_at as i64),
+                        resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
                 })
@@ -2974,7 +2974,7 @@ fn xinfo_stream_full(
                         .map(|(id, p)| {
                             resp_array(vec![
                                 resp_bulk_str(&id.to_string()),
-                                resp_integer(p.delivered_at as i64),
+                                resp_integer(shown_delivery_time(p.delivered_at)),
                                 resp_integer(p.delivery_count as i64),
                             ])
                         })
@@ -3545,6 +3545,16 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
 /// The functional effect — immediate claimability — is preserved via the
 /// delivery-time-0 marker; the relative ordering against other already-idle
 /// entries is not. Documented in `docs/REDIS_8_8_COMMANDS.md`.
+/// A pending entry's delivery time as `XINFO STREAM FULL` shows it: 0 for
+/// one `XNACK` released, as in Redis (see `stream_extra::nack_time`).
+fn shown_delivery_time(delivered_at: u64) -> i64 {
+    if delivered_at < stream_extra::NACKED_BELOW {
+        0
+    } else {
+        delivered_at as i64
+    }
+}
+
 pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     // key group MODE IDS numids id  → 7 minimum
