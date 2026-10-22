@@ -1043,3 +1043,75 @@ fn sigterm_waits_for_the_final_snapshot() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A library loaded with `FUNCTION LOAD` is part of the dataset, which Redis
+/// keeps in its RDB file and AOF. KiviDB's snapshot had no place for one, so
+/// each save dropped every library: `SAVE` and a restart, `SHUTDOWN` with the
+/// AOF on (the log is rebased onto the final snapshot), and a replica's full
+/// sync (#70).
+#[cfg(feature = "lua")]
+#[test]
+fn function_libraries_survive_a_restart_and_reach_a_replica_in_a_full_sync() {
+    const LIBRARY: &str = "#!lua name=mylib\n\
+        redis.register_function{function_name='seven', \
+        callback=function() return 7 end, flags={'no-writes'}}";
+
+    for aof in [false, true] {
+        let mut server = Server::start(if aof { &["--aof"] } else { &[] });
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["FUNCTION", "LOAD", LIBRARY]).s(), "mylib");
+        if !aof {
+            assert!(c.cmd(&["SAVE"]).ok());
+        }
+        drop(c);
+        server.shutdown();
+        server.restart();
+        let mut c = server.conn();
+        assert_eq!(
+            c.cmd(&["FCALL_RO", "seven", "0"]),
+            V::Int(7),
+            "aof={aof}: {}",
+            server.log()
+        );
+        if !aof {
+            // And from the same snapshot given as `--preload-file`.
+            let file = format!("rdb:{}", server.dir.join("dump.kdb").display());
+            let preloaded = Server::start(&["--preload-file", &file]);
+            assert_eq!(
+                preloaded.conn().cmd(&["FCALL_RO", "seven", "0"]),
+                V::Int(7),
+                "{}",
+                preloaded.log()
+            );
+        }
+    }
+
+    // A replica's libraries are its master's after a full sync: the ones it
+    // had are gone, and a master without any leaves it none, as in Redis.
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    assert_eq!(m.cmd(&["FUNCTION", "LOAD", LIBRARY]).s(), "mylib");
+    let replica = Server::start(&[]);
+    let mut r = replica.conn();
+    let own = "#!lua name=own\n\
+        redis.register_function{function_name='eight', \
+        callback=function() return 8 end, flags={'no-writes'}}";
+    assert_eq!(r.cmd(&["FUNCTION", "LOAD", own]).s(), "own");
+    let port = master.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    wait_link_up(&mut r);
+    assert_eq!(
+        r.cmd(&["FCALL_RO", "seven", "0"]),
+        V::Int(7),
+        "{}",
+        replica.log()
+    );
+    assert!(matches!(r.cmd(&["FCALL_RO", "eight", "0"]), V::Err(_)));
+
+    let bare = Server::start(&[]);
+    let port = bare.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    wait_until("the full sync from a master without libraries", || {
+        r.cmd(&["FUNCTION", "LIST"]).arr().is_empty()
+    });
+}

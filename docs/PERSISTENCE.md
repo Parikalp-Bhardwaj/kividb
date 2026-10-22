@@ -203,7 +203,8 @@ The target is loaded *instead of* the working directory's `dump.kdb` and
 server asked to start from a backup does not start empty.
 
 Not in BASE: HNSW graphs (rebuilt in the background after loading). Search
-synonym groups and dictionaries are in it, as they are in every snapshot.
+synonym groups and dictionaries are in it, as they are in every snapshot,
+and so are the function libraries.
 
 ## Snapshot format additions
 
@@ -217,7 +218,8 @@ is still written as before):
 | time series, tag 14 | the series as before, plus its duplicate policy and its compaction rules |
 | alias section (`KIVIAL1\0`) | `FT.ALIASADD` aliases, so that they survive a restart |
 | field options section (`KIVIFO1\0`) | each index's `STOPWORDS` and each field's options (`AS`, `SORTABLE`, `WEIGHT`, `SEPARATOR`, `CASESENSITIVE`, …), as the words `FT.CREATE` takes |
-| synonyms and dictionaries section (`KIVISD1\0`), written last | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |
+| synonyms and dictionaries section (`KIVISD1\0`) | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |
+| function libraries section (`KIVIFN1\0`), written last | every library loaded with `FUNCTION LOAD`, as a `FUNCTION DUMP` payload, so that libraries survive a restart and reach a replica in a full sync. A build without Lua loads the rest of the snapshot and leaves them out |
 
 An older release stops reading at the first section it does not know, so
 these come after everything it does. A snapshot written by this version

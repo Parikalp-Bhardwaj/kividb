@@ -1235,6 +1235,7 @@ pub fn replay_aof(
             dictionaries,
             hnsw_graphs,
             expiries,
+            functions,
         } = loaded;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         stats.preamble_keys = crate::snapshot::restore_into_store(dbs, store) as u64;
@@ -1242,6 +1243,7 @@ pub fn replay_aof(
         // Schemas and graphs travel inside the image, so the replay never has
         // to re-execute an `FT.CREATE` or rebuild a graph it already has.
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
+        crate::snapshot::restore_functions(functions)?;
     }
 
     let env = crate::replication::replica_client::ReplicationApplyEnv::new_inert();
@@ -1381,7 +1383,11 @@ pub fn recover_local(
                     dictionaries,
                     hnsw_graphs,
                     expiries,
+                    functions,
                 } = loaded;
+                if let Err(e) = crate::snapshot::restore_functions(functions) {
+                    fatal_persistence(&format!("dump.kdb cannot be loaded: {e}"));
+                }
                 crate::vector::restore_dictionaries(index_store, dictionaries);
                 if !dbs.is_empty() {
                     let total = crate::snapshot::restore_into_store(dbs, store);
@@ -1574,7 +1580,9 @@ fn preload(
             dictionaries,
             hnsw_graphs,
             expiries,
+            functions,
         } = crate::snapshot::load_snapshot(&base_str)?;
+        crate::snapshot::restore_functions(functions)?;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, expiry_store);

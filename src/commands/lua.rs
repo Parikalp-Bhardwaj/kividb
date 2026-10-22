@@ -4659,29 +4659,50 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         FunctionRestorePolicy::Append
     };
 
-    let (incoming, infer_functions) = match decode_function_dump_payload(cmd[2]) {
-        Ok(v) => v,
-        Err(()) => return resp_error("DUMP payload version or checksum are wrong"),
-    };
-
-    let mut merged = match compute_merged_store(incoming, policy) {
-        Ok(m) => m,
-        Err(e) => return resp_error(&e),
-    };
-
-    if let Err(LuaVmBusy) = lua_vms_renew_for_admin(&[Vm::Functions]) {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+    match restore_function_payload(cmd[2], policy) {
+        Ok(()) => resp_simple("OK"),
+        Err(e) => resp_error(&e),
     }
+}
 
-    match load_merged_into_vm(&mut merged, &infer_functions) {
-        Ok(()) => {}
-        Err(e) => return resp_error(&e),
-    }
-
+/// Load a `FUNCTION DUMP` payload under `policy`, as `FUNCTION RESTORE` does.
+fn restore_function_payload(payload: &[u8], policy: FunctionRestorePolicy) -> Result<(), String> {
+    let (incoming, infer_functions) = decode_function_dump_payload(payload)
+        .map_err(|()| "DUMP payload version or checksum are wrong".to_string())?;
+    let mut merged = compute_merged_store(incoming, policy)?;
+    lua_vms_renew_for_admin(&[Vm::Functions])
+        .map_err(|LuaVmBusy| BUSY_RUNNING_A_SCRIPT.to_string())?;
+    load_merged_into_vm(&mut merged, &infer_functions)?;
     persist_merged_and_sync_maps(merged);
-    resp_simple("OK")
+    Ok(())
+}
+
+/// Every library, as a `FUNCTION DUMP` payload, for a snapshot to keep.
+/// `None` when no library is loaded, so that the snapshot is what it was
+/// before it kept them.
+pub(crate) fn library_snapshot() -> Option<Vec<u8>> {
+    if function_store().read().is_empty() {
+        return None;
+    }
+    Some(function_dump_payload())
+}
+
+const BUSY_RUNNING_A_SCRIPT: &str =
+    "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
+
+/// The libraries a snapshot kept, in place of those loaded, as Redis loads
+/// the ones in an RDB file: a snapshot without any leaves none.
+pub(crate) fn restore_library_snapshot(payload: Option<&[u8]>) -> Result<(), String> {
+    match payload {
+        Some(payload) => restore_function_payload(payload, FunctionRestorePolicy::Flush),
+        None if function_store().read().is_empty() => Ok(()),
+        None => {
+            lua_vms_renew_for_admin(&[Vm::Functions])
+                .map_err(|LuaVmBusy| BUSY_RUNNING_A_SCRIPT.to_string())?;
+            persist_merged_and_sync_maps(HashMap::new());
+            Ok(())
+        }
+    }
 }
 
 fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {

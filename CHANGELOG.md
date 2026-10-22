@@ -196,6 +196,16 @@ written against an earlier KiviDB may notice them.
   events off, the default (measured with callgrind); now it is one branch on
   a write.
 
+- **Function libraries are kept in `dump.kdb`** (#70). The snapshot had no
+  place for them, so whatever wrote one dropped every library loaded with
+  `FUNCTION LOAD`: `SAVE` and a restart, a normal stop with the AOF on
+  (which rebases the log onto the final snapshot), `BGREWRITEAOF`, and a
+  replica's full sync, which left the replica without them until the next
+  `FUNCTION LOAD`. After any of these, `FCALL` returned `ERR Function not
+  found`. Redis keeps them in its RDB file. They are now a last section of
+  the snapshot, loaded at startup, from `--preload-file` and in a full sync,
+  and they are in `BACKUP`'s base. An older release reads such a snapshot
+  without them.
 - **Redis 8.10 compatibility** (#66 and the work after it). CI now runs
   Redis 8.10.2's test suite (#64): it went from 2079 passed, 76 failed and
   7 units that hung or stopped early, to 2400 passed and 70 failed with 4,
