@@ -153,6 +153,13 @@ written against an earlier KiviDB may notice them.
   `array-sparse-kmax` and `array-sparse-kmin` can be set as in Redis.
   `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
   the last index is `insert index overflow`, as in Redis.
+- **`ARRING` follows Redis 8.10**: the ring is the array itself. A size
+  that shrinks it, or grows it after it has wrapped, rebuilds it from the
+  newest item back as far as the first hole, oldest first from index 0,
+  so a grown ring uses its new room. `ARSEEK` only moves the cursor, and
+  `ARLASTITEMS` walks back from it, wrapping, with a nil for a hole.
+  `ARINFO` no longer reports `ring-size`, which Redis does not have, and
+  `OBJECT ENCODING` of an array is `sliced-array`.
 
 - **`CONFIG SET` of a setting under both its names is a duplicate**
   (`busy-reply-threshold` and `lua-time-limit`, and the other

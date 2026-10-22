@@ -102,6 +102,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
             if small { "listpackex" } else { "hashtable" }
         }
         KiviDBValue::Stream(_) => "stream",
+        KiviDBValue::Array(_) => "sliced-array",
         _ => "raw",
     }
 }

@@ -1007,3 +1007,38 @@ fn arlastitems_after_arseek_0_and_insert_overflow() {
     );
     c.cmds(&["DEL", k]);
 }
+
+/// `ARRING` as Redis 8.10 has it: the ring is the array, a size that changes
+/// its shape rebuilds it, keeping the newest items as far as the first hole,
+/// oldest first from 0. `OBJECT ENCODING` is `sliced-array`.
+#[test]
+fn arring_rebuilds_as_redis_does() {
+    let mut c = conn();
+    let k = "t:arring2";
+    let get = |c: &mut Conn, i: u64| c.cmds(&["ARGET", k, &i.to_string()]);
+
+    // Grown after wrapping: compacted first, the new value after the newest.
+    c.cmds(&["DEL", k]);
+    for i in 0..8 {
+        c.cmds(&["ARRING", k, "5", &format!("v{i}")]);
+    }
+    c.cmds(&["ARRING", k, "8", "grown"]);
+    for (i, want) in ["v3", "v4", "v5", "v6", "v7", "grown"].iter().enumerate() {
+        assert_eq!(get(&mut c, i as u64).as_str(), *want, "{i}");
+    }
+    assert_eq!(c.cmds(&["ARNEXT", k]).as_int(), 6);
+
+    // Shrunk: back from the newest, stopping at a hole.
+    c.cmds(&["DEL", k]);
+    for i in 0..5 {
+        c.cmds(&["ARRING", k, "5", &format!("v{i}")]);
+    }
+    c.cmds(&["ARDEL", k, "3"]);
+    c.cmds(&["ARRING", k, "3", "new"]);
+    assert_eq!(c.cmds(&["ARCOUNT", k]).as_int(), 2);
+    assert_eq!(get(&mut c, 0).as_str(), "v4");
+    assert_eq!(get(&mut c, 1).as_str(), "new");
+    assert!(get(&mut c, 2).is_nil());
+    assert_eq!(c.cmds(&["OBJECT", "ENCODING", k]).as_str(), "sliced-array");
+    c.cmds(&["DEL", k]);
+}
