@@ -1698,3 +1698,109 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     assert_eq!(h.fields.get("a").map(|v| &v[..]), Some(&b"b"[..]));
     assert!(h.expiries.contains_key("a"), "the field's TTL was lost");
 }
+
+// Under an LRU policy Redis saves each key's idle time (IDLE) in front of it,
+// and under an LFU policy its access frequency (FREQ), after the key's expiry
+// when it has one. The reader took those opcodes for a key's type, so no
+// such file loaded (#71). These come from Redis 8.10 under allkeys-lru and
+// allkeys-lfu. One key in each was restored with IDLETIME 100000 or FREQ 200,
+// so that the LRU file has an idle time five bytes long. The TTLs are
+// EXPIREAT 4102444800, in 2100, so that they don't run out.
+#[test]
+fn rdb_files_saved_by_redis_8_10_under_lru_and_lfu_policies_load() {
+    let files: [(&str, &[u8], &str); 2] = [
+        (
+            "allkeys-lru",
+            include_bytes!("fixtures/redis-8.10-lru.rdb"),
+            "old",
+        ),
+        (
+            "allkeys-lfu",
+            include_bytes!("fixtures/redis-8.10-lfu.rdb"),
+            "hot",
+        ),
+    ];
+    for (policy, bytes, restored) in files {
+        let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("{policy}: {e}"));
+        let db = &dbs[0];
+        let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = ["h", "s", "ttl", restored];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "{policy}");
+        match &db["s"] {
+            KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"hello", "{policy}"),
+            _ => panic!("{policy} s: wrong type"),
+        }
+        for key in ["ttl", restored] {
+            assert_eq!(
+                expiries[0].get(key),
+                Some(&4_102_444_800_000),
+                "{policy} {key}: the TTL was lost"
+            );
+        }
+        assert!(!expiries[0].contains_key("s"), "{policy}");
+    }
+}
+
+// A Redis cluster node saves the slot of the keys that follow (SLOT_INFO).
+// This file comes from a Redis 8.10 node holding every slot, with 3 keys
+// (#71).
+#[test]
+fn an_rdb_file_from_a_redis_8_10_cluster_node_loads() {
+    let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(
+        &include_bytes!("fixtures/redis-8.10-cluster.rdb")[..],
+    )
+    .unwrap();
+    let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["s", "ttl", "{s}x"]);
+    assert_eq!(expiries[0].get("ttl"), Some(&4_102_444_800_000));
+    assert!(!expiries[0].contains_key("s"));
+}
+
+// IDLE and FREQ can follow either kind of expiry, and a long idle time takes
+// more than one byte. A key whose expiry has passed is still dropped, and an
+// expiry belongs only to the key right after it.
+#[test]
+fn rdb_idle_and_freq_before_keys_with_and_without_an_expiry() {
+    let key = |p: &mut Vec<u8>, name: &[u8]| {
+        p.push(0x00); // string
+        p.extend(rdb_str(name));
+        p.extend(rdb_str(b"v"));
+    };
+    let mut p = Vec::new();
+    p.push(0xF8); // IDLE, 1000 s: a 14-bit length
+    p.extend(rdb_encode_len(1000));
+    key(&mut p, b"a");
+    p.push(0xF9); // FREQ
+    p.push(200);
+    key(&mut p, b"b");
+    p.push(0xFC); // expiry in milliseconds, in 2100
+    p.extend(4_102_444_800_000u64.to_le_bytes());
+    p.push(0xF8); // IDLE, 100000 s: a 32-bit length
+    p.extend(rdb_encode_len(100_000));
+    key(&mut p, b"c");
+    p.push(0xFC); // an expiry long past
+    p.extend(1_000u64.to_le_bytes());
+    p.push(0xF9);
+    p.push(5);
+    key(&mut p, b"gone");
+    p.push(0xFD); // expiry in seconds, in 2100
+    p.extend(4_102_444_800u32.to_le_bytes());
+    p.push(0xF8);
+    p.extend(rdb_encode_len(0));
+    key(&mut p, b"d");
+    key(&mut p, b"e");
+
+    let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["a", "b", "c", "d", "e"]);
+    assert_eq!(expiries[0].get("c"), Some(&4_102_444_800_000));
+    assert_eq!(expiries[0].get("d"), Some(&4_102_444_800_000));
+    for plain in ["a", "b", "e"] {
+        assert!(!expiries[0].contains_key(plain), "{plain}");
+    }
+}

@@ -2149,6 +2149,9 @@ pub fn load_redis_rdb_from(
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
 
     let mut current_db = 0usize;
+    // An expiry belongs to the key after it. Redis may write the key's idle
+    // time or access frequency in between, so it waits here for the key.
+    let mut pending_expiry: Option<u64> = None;
 
     loop {
         let mut type_byte = [0u8];
@@ -2180,48 +2183,57 @@ pub fn load_redis_rdb_from(
                 break;
             }
             0xFC => {
-                // Expire time in milliseconds (u64 LE), followed by type byte + key + value
+                // Expire time in milliseconds (u64 LE), for the next key
                 let mut exp_buf = [0u8; 8];
                 r.read_exact(&mut exp_buf)?;
-                let expiry_ms = u64::from_le_bytes(exp_buf);
-                // Fall through: read the actual type byte next iteration
-                // We do this by reading the type byte and handling inline:
-                let mut actual_type = [0u8];
-                r.read_exact(&mut actual_type)?;
-                let key_bytes = rdb_read_string(&mut r)?;
-                let key = String::from_utf8_lossy(&key_bytes).into_owned();
-                if let Some(val) = rdb_read_value(&mut r, actual_type[0])?
-                    && expiry_ms > now_ms
-                {
-                    expiries[current_db].insert(key.clone(), expiry_ms);
-                    result[current_db].insert(key, val);
-                }
+                pending_expiry = Some(u64::from_le_bytes(exp_buf));
             }
             0xFD => {
-                // Expire time in seconds (u32 LE)
+                // Expire time in seconds (u32 LE), for the next key
                 let mut exp_buf = [0u8; 4];
                 r.read_exact(&mut exp_buf)?;
-                let expiry_ms = u64::from(u32::from_le_bytes(exp_buf)) * 1000;
-                let mut actual_type = [0u8];
-                r.read_exact(&mut actual_type)?;
-                let key_bytes = rdb_read_string(&mut r)?;
-                let key = String::from_utf8_lossy(&key_bytes).into_owned();
-                if let Some(val) = rdb_read_value(&mut r, actual_type[0])?
-                    && expiry_ms > now_ms
-                {
-                    expiries[current_db].insert(key.clone(), expiry_ms);
-                    result[current_db].insert(key, val);
+                pending_expiry = Some(u64::from(u32::from_le_bytes(exp_buf)) * 1000);
+            }
+            0xF8 => {
+                // The next key's idle time in seconds, written under an LRU
+                // policy. Not kept: the key's access record is not set from
+                // a dump yet (#71).
+                let _ = rdb_read_length(&mut r)?;
+            }
+            0xF9 => {
+                // The next key's access frequency, one byte, written under an
+                // LFU policy. Not kept either.
+                let mut freq = [0u8];
+                r.read_exact(&mut freq)?;
+            }
+            0xF4 => {
+                // Slot info, from a cluster node: the slot, its number of
+                // keys and of keys with a TTL. Redis skips it outside cluster
+                // mode, and the keys say which slot they are in anyway.
+                for _ in 0..3 {
+                    let _ = rdb_read_length(&mut r)?;
                 }
             }
             type_id => {
-                // Regular key — type byte already consumed
+                // A key: type byte already consumed
                 let key_bytes = rdb_read_string(&mut r)?;
                 let key = String::from_utf8_lossy(&key_bytes).into_owned();
+                let expiry_ms = pending_expiry.take();
                 if let Some(val) = rdb_read_value(&mut r, type_id)? {
-                    // A plain entry replaces any earlier one for this key,
-                    // including that entry's expiry.
-                    expiries[current_db].remove(&key);
-                    result[current_db].insert(key, val);
+                    match expiry_ms {
+                        // Already past its expiry: dropped.
+                        Some(ms) if ms <= now_ms => {}
+                        Some(ms) => {
+                            expiries[current_db].insert(key.clone(), ms);
+                            result[current_db].insert(key, val);
+                        }
+                        None => {
+                            // A plain entry replaces any earlier one for this
+                            // key, including that entry's expiry.
+                            expiries[current_db].remove(&key);
+                            result[current_db].insert(key, val);
+                        }
+                    }
                 }
             }
         }
