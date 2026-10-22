@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "kividb"
-version = "1.1.0"
+version = "1.1.1-rc1"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
