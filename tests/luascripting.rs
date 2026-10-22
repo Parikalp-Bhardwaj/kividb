@@ -1313,6 +1313,68 @@ fn test_error_with_a_table_is_its_err() {
     assert_eq!(r.as_str(), "ERR caught");
 }
 
+/// `error` and `assert` are Lua's own but for a table they raise (#80):
+/// strings keep the place at the level asked for, `assert` passes its
+/// arguments on, and a table is its `err` from `assert`, and from a function
+/// as from a script.
+#[test]
+fn test_error_and_assert_raise_as_lua_does() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let script = "assert(false)";
+    let sha = c.cmds(&["SCRIPT", "LOAD", script]).as_str().to_string();
+    let r = c.cmds(&["EVAL", script, "0"]);
+    assert_eq!(
+        r.as_error(),
+        format!("ERR user_script:1: assertion failed! script: {sha}, on @user_script:1.")
+    );
+
+    let r = c.cmds(&["EVAL", "return {assert(1, 2, 3)}", "0"]);
+    assert_eq!(
+        r,
+        RespValue::Array(vec![
+            RespValue::Int(1),
+            RespValue::Int(2),
+            RespValue::Int(3)
+        ])
+    );
+
+    let r = c.cmds(&[
+        "EVAL",
+        "local x = 1\nassert(false, {err='ERR asserted'})",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR asserted script: "), "{r:?}");
+    assert!(r.as_error().ends_with(", on @user_script:2."), "{r:?}");
+
+    // Level 2 names the caller's line (the reply always says line 1).
+    let r = c.cmds(&[
+        "EVAL",
+        "local function f() error('deep', 2) end\nlocal ok, e = pcall(function()\n  f()\nend)\nreturn e",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "user_script:3: deep");
+
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(assert, false, {err='ERR kept'}); return e.err",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "ERR kept");
+
+    let lib = "#!lua name=errlib\nredis.register_function('raise', function() error({err='ERR from fn'}) end)";
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", lib]).as_str(), "errlib");
+    let r = c.cmds(&["FCALL", "raise", "0"]);
+    assert!(
+        r.as_error().starts_with("ERR from fn script: raise"),
+        "{r:?}"
+    );
+    assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
+}
+
 /// `redis.error_reply` gives a message without a code the code `ERR`, as
 /// Redis does, and keeps one that has a code.
 #[test]
