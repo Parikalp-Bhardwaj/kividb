@@ -3337,10 +3337,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("used_memory_startup:{startup_memory}\r\n"));
                 out.push_str(&format!("used_memory_dataset:{dataset}\r\n"));
                 out.push_str(&format!("used_memory_dataset_perc:{dataset_perc:.2}%\r\n"));
-                // Redis scripting tests read this via `[s used_memory_lua]` (unit/scripting.tcl).
+                // The VM `EVAL` scripts run in (`[s used_memory_lua]` in
+                // unit/scripting.tcl).
+                #[cfg(feature = "lua")]
+                out.push_str(&format!(
+                    "used_memory_lua:{}\r\n",
+                    crate::commands::lua::eval_vm_bytes()
+                ));
+                #[cfg(not(feature = "lua"))]
                 out.push_str("used_memory_lua:0\r\n");
-                // The VM functions are loaded into (EVAL scripts that run
-                // alone share it).
+                // The VM functions are loaded into.
                 #[cfg(feature = "lua")]
                 out.push_str(&format!(
                     "used_memory_vm_functions:{}\r\n",

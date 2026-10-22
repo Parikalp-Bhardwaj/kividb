@@ -115,7 +115,47 @@ fn fn_name_to_library() -> &'static RwLock<HashMap<String, String>> {
 /// than `lua-time-limit`. (They used to be told `BUSY` at once, so any two
 /// clients using scripts at the same time saw errors.)
 /// Requires mlua `send` so `Lua` is `Send` and can live behind a static `Mutex`.
-static LUA_VM: ParkingMutex<Option<Lua>> = ParkingMutex::new(None);
+///
+/// Two VMs behind the one lock, as Redis has two: one for `EVAL` scripts
+/// and one the function libraries are loaded into. What one holds (`EVAL`'s
+/// compiled scripts, say) is not counted against the other
+/// (`used_memory_lua`, `used_memory_vm_functions`), and flushing one leaves
+/// the other. The lock is still one: scripts and functions take turns.
+static LUA_VM: ParkingMutex<Vms> = ParkingMutex::new(Vms {
+    eval: None,
+    functions: None,
+});
+
+struct Vms {
+    eval: Option<Lua>,
+    functions: Option<Lua>,
+}
+
+impl Vms {
+    fn of(&mut self, vm: Vm) -> &mut Option<Lua> {
+        match vm {
+            Vm::Eval => &mut self.eval,
+            Vm::Functions => &mut self.functions,
+        }
+    }
+}
+
+/// Which of the two VMs (see [`LUA_VM`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Vm {
+    Eval,
+    Functions,
+}
+
+impl Vm {
+    /// Its size when it was last let go, for `INFO`.
+    fn bytes(self) -> &'static AtomicU64 {
+        match self {
+            Vm::Eval => &EVAL_VM_BYTES,
+            Vm::Functions => &FUNCTIONS_VM_BYTES,
+        }
+    }
+}
 thread_local! {
     /// Points at the active [`Lua`] while the global VM mutex is held on this thread.
     static EXEC_LUA: RefCell<Option<std::ptr::NonNull<Lua>>> = const { RefCell::new(None) };
@@ -128,11 +168,18 @@ static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 /// Bytes the shared VM held when it was last let go: `INFO`'s
 /// `used_memory_vm_functions`, read without waiting for a running script.
-static SHARED_VM_BYTES: AtomicU64 = AtomicU64::new(0);
+static FUNCTIONS_VM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// `used_memory_lua`: the `EVAL` VM, as [`FUNCTIONS_VM_BYTES`] is read.
+static EVAL_VM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `used_memory_lua`: the VM `EVAL` scripts run in.
+pub(crate) fn eval_vm_bytes() -> u64 {
+    EVAL_VM_BYTES.load(Ordering::Relaxed)
+}
 
 /// `used_memory_vm_functions`: the VM the functions are loaded into.
 pub(crate) fn functions_vm_bytes() -> u64 {
-    SHARED_VM_BYTES.load(Ordering::Relaxed)
+    FUNCTIONS_VM_BYTES.load(Ordering::Relaxed)
 }
 
 /// Whether the script that holds the VM has been running for longer than
@@ -558,6 +605,8 @@ fn sha1_hex(source: &str) -> String {
 
 thread_local! {
     static LUA: RefCell<Option<Lua>> = const { RefCell::new(None) };
+    /// This thread's own VM for functions, beside [`LUA`] for scripts.
+    static LUA_FUNCTIONS: RefCell<Option<Lua>> = const { RefCell::new(None) };
 }
 
 /// Clears script evaluation context when leaving `EVAL` / `FCALL`.
@@ -667,7 +716,7 @@ pub(crate) fn script_min_replicas_gate(ctx: &Ctx<'_>, cmd0: &[u8]) -> Option<Vec
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LuaVmBusy;
 
-fn try_with_lua<F, R>(f: F) -> Result<R, LuaVmBusy>
+fn try_with_lua<F, R>(vm: Vm, f: F) -> Result<R, LuaVmBusy>
 where
     F: FnOnce(&Lua) -> R,
 {
@@ -692,7 +741,7 @@ where
     // scripts of other threads. The shared VM below is for the scripts that
     // run alone, one at a time, and for functions, which are loaded into it.
     if crate::tag_locks::beside_others() {
-        return Ok(with_this_threads_vm(f));
+        return Ok(with_this_threads_vm(vm, f));
     }
 
     // Wait for the script that is running, if one is: scripts take turns.
@@ -720,7 +769,7 @@ where
     }
     let _outer_depth = OuterDepth;
 
-    let lua = guard.get_or_insert_with(new_lua_vm);
+    let lua = guard.of(vm).get_or_insert_with(new_lua_vm);
     let nn = std::ptr::NonNull::from(&mut *lua);
     EXEC_LUA.with(|c| {
         *c.borrow_mut() = Some(nn);
@@ -740,7 +789,8 @@ where
     let out = f(lua);
     VM_RUN_STARTED.with(|c| c.set(None));
     LAST_VM_RUN_US.with(|c| c.set(started.elapsed().as_micros() as u64));
-    SHARED_VM_BYTES.store(lua.used_memory() as u64, Ordering::Relaxed);
+    vm.bytes()
+        .store(lua.used_memory() as u64, Ordering::Relaxed);
     Ok(out)
 }
 
@@ -753,7 +803,7 @@ static TAG_SCRIPTS_RUNNING: AtomicUsize = AtomicUsize::new(0);
 /// To a script it is the same VM as any other: a script cannot leave
 /// anything behind in one (globals are protected), and what it compiles to
 /// is kept by each VM for itself.
-fn with_this_threads_vm<F, R>(f: F) -> R
+fn with_this_threads_vm<F, R>(vm: Vm, f: F) -> R
 where
     F: FnOnce(&Lua) -> R,
 {
@@ -766,7 +816,11 @@ where
     }
     let _running = Running;
 
-    LUA.with(|mine| {
+    let which = match vm {
+        Vm::Eval => &LUA,
+        Vm::Functions => &LUA_FUNCTIONS,
+    };
+    which.with(|mine| {
         let mut mine = mine.borrow_mut();
         let lua = mine.get_or_insert_with(new_lua_vm);
         // For a script the script calls (`redis.call('EVALSHA', …)`).
@@ -3252,7 +3306,9 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     let registry = ctx.client_registry;
     let client_id = ctx.client_id;
     count_script_commands(registry, client_id, || {
-        match try_with_lua(|lua| eval_script(lua, ctx_ptr, &source, keys, argv, read_only)) {
+        match try_with_lua(Vm::Eval, |lua| {
+            eval_script(lua, ctx_ptr, &source, keys, argv, read_only)
+        }) {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
             Err(LuaVmBusy) => resp_error(
@@ -3946,7 +4002,9 @@ fn fcall(ctx: &mut Ctx, read_only: bool) -> Vec<u8> {
     let registry = ctx.client_registry;
     let client_id = ctx.client_id;
     count_script_commands(registry, client_id, || {
-        match try_with_lua(|lua| fcall_inner(lua, ctx_ptr, fn_name, keys, argv, read_only)) {
+        match try_with_lua(Vm::Functions, |lua| {
+            fcall_inner(lua, ctx_ptr, fn_name, keys, argv, read_only)
+        }) {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => script_error_to_resp(&e, fn_name),
             Err(LuaVmBusy) => resp_error(
@@ -4002,7 +4060,7 @@ fn function_load(ctx: &mut Ctx) -> Vec<u8> {
         None => Vec::new(),
     };
 
-    let loaded = try_with_lua(|lua| -> Result<Vec<Registered>, String> {
+    let loaded = try_with_lua(Vm::Functions, |lua| -> Result<Vec<Registered>, String> {
         let registered =
             load_library_code(lua, &body, Some(std::time::Duration::from_millis(500)))?;
         // A function's name is its own across libraries: one that another
@@ -4165,7 +4223,7 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
     }
     let libraries = std::mem::take(&mut *function_store().write());
     let names = std::mem::take(&mut *fn_name_to_library().write());
-    let vm = match lua_vm_take_for_admin() {
+    let vm = match lua_vm_take_for_admin(Vm::Functions) {
         Ok(vm) => vm,
         Err(LuaVmBusy) => {
             return resp_error(
@@ -4183,19 +4241,19 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
 }
 
 /// Replace the VM only when no script holds it (`LUA_HOLD_DEPTH == 0`).
-fn lua_vm_reset_for_admin() -> Result<(), LuaVmBusy> {
-    lua_vm_take_for_admin().map(drop)
+fn lua_vm_reset_for_admin(vm: Vm) -> Result<(), LuaVmBusy> {
+    lua_vm_take_for_admin(vm).map(drop)
 }
 
 /// Take the VM out, for the next script to make a new one, only when no
 /// script holds it (`LUA_HOLD_DEPTH == 0`).
-fn lua_vm_take_for_admin() -> Result<Option<Lua>, LuaVmBusy> {
+fn lua_vm_take_for_admin(vm: Vm) -> Result<Option<Lua>, LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
     }
-    SHARED_VM_BYTES.store(0, Ordering::Relaxed);
-    Ok(guard.take())
+    vm.bytes().store(0, Ordering::Relaxed);
+    Ok(guard.of(vm).take())
 }
 
 fn function_stats() -> Vec<u8> {
@@ -4472,32 +4530,35 @@ fn load_merged_into_vm(
     infer_functions: &HashSet<String>,
 ) -> Result<(), String> {
     let libs = sorted_function_libs(merged);
-    let loaded = try_with_lua(|lua| -> Result<Vec<(String, Vec<Registered>)>, String> {
-        let mut loaded = Vec::new();
-        let mut owners: HashMap<String, String> = HashMap::new();
-        for lib in &libs {
-            let registered = load_library_code(lua, &lib.body, None)?;
-            let names: Vec<String> = registered.iter().map(|f| f.name.clone()).collect();
-            if !infer_functions.contains(&lib.name) && !same_fn_set(&names, &lib.functions) {
-                discard_registered(lua, &registered);
-                return Err(
-                    "ERR restored library metadata does not match registered functions".into(),
-                );
+    let loaded = try_with_lua(
+        Vm::Functions,
+        |lua| -> Result<Vec<(String, Vec<Registered>)>, String> {
+            let mut loaded = Vec::new();
+            let mut owners: HashMap<String, String> = HashMap::new();
+            for lib in &libs {
+                let registered = load_library_code(lua, &lib.body, None)?;
+                let names: Vec<String> = registered.iter().map(|f| f.name.clone()).collect();
+                if !infer_functions.contains(&lib.name) && !same_fn_set(&names, &lib.functions) {
+                    discard_registered(lua, &registered);
+                    return Err(
+                        "ERR restored library metadata does not match registered functions".into(),
+                    );
+                }
+                if let Some(name) = names
+                    .iter()
+                    .find(|name| owners.insert((*name).clone(), lib.name.clone()).is_some())
+                {
+                    discard_registered(lua, &registered);
+                    return Err(format!("ERR Function {name} already exists"));
+                }
+                commit_registered(lua, &registered, &[]).map_err(|e| {
+                    format!("ERR Error registering functions: {}", lua_error_message(&e))
+                })?;
+                loaded.push((lib.name.clone(), registered));
             }
-            if let Some(name) = names
-                .iter()
-                .find(|name| owners.insert((*name).clone(), lib.name.clone()).is_some())
-            {
-                discard_registered(lua, &registered);
-                return Err(format!("ERR Function {name} already exists"));
-            }
-            commit_registered(lua, &registered, &[]).map_err(|e| {
-                format!("ERR Error registering functions: {}", lua_error_message(&e))
-            })?;
-            loaded.push((lib.name.clone(), registered));
-        }
-        Ok(loaded)
-    });
+            Ok(loaded)
+        },
+    );
     let loaded = match loaded {
         Err(LuaVmBusy) => {
             return Err(
@@ -4509,7 +4570,7 @@ fn load_merged_into_vm(
         Ok(Err(error)) => {
             // The store was not changed. Drop any functions committed before
             // a later library failed; the next call rebuilds the VM from it.
-            let _ = lua_vm_reset_for_admin();
+            let _ = lua_vm_reset_for_admin(Vm::Functions);
             return Err(error);
         }
     };
@@ -4571,7 +4632,7 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return resp_error(&e),
     };
 
-    if let Err(LuaVmBusy) = lua_vm_reset_for_admin() {
+    if let Err(LuaVmBusy) = lua_vm_reset_for_admin(Vm::Functions) {
         return resp_error(
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         );
@@ -4671,10 +4732,16 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
         }
         "FLUSH" => {
             // `SCRIPT FLUSH [ASYNC|SYNC]` — we only support synchronous semantics.
+            // The scripts go, and so does the VM that compiled them, as
+            // Redis resets its scripting VM: what they held is let go.
+            // (A script running now keeps it, and it goes next time.)
             script_store().write().clear();
+            let _ = lua_vm_reset_for_admin(Vm::Eval);
             resp_simple("OK")
         }
-        "RESET" => match lua_vm_reset_for_admin() {
+        "RESET" => match lua_vm_reset_for_admin(Vm::Eval)
+            .and_then(|()| lua_vm_reset_for_admin(Vm::Functions))
+        {
             Ok(()) => resp_simple("OK"),
             Err(LuaVmBusy) => resp_error(
                 "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",

@@ -39,6 +39,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`EVAL` scripts and functions have a Lua VM each**, as in Redis. What
+  scripts hold (their compiled code) is reported as `used_memory_lua`,
+  which was always 0, and no longer counts in `used_memory_vm_functions`.
+  `SCRIPT FLUSH` lets go of the scripts' VM, as Redis's does; `FUNCTION
+  FLUSH` leaves it. The two still share one lock: a script and a function
+  never run at the same time.
+
 - **A script's error ends as Redis's does**, naming the script and the
   place: `... script: <sha1>, on @user_script:1.` (the function's name for
   `FCALL`). `redis.error_reply` gives a message without a code the code

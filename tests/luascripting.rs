@@ -1409,3 +1409,49 @@ fn test_a_script_s_commands_count_as_its_client_s() {
     // The first CLIENT INFO, EVAL and PING; not the second CLIENT INFO.
     assert_eq!(after - before, 3);
 }
+
+/// `EVAL` scripts and functions have a VM each, as in Redis: what scripts
+/// hold is in `used_memory_lua`, not `used_memory_vm_functions`, `SCRIPT
+/// FLUSH` lets it go, and `FUNCTION FLUSH` leaves it.
+#[test]
+fn test_scripts_and_functions_have_a_vm_each() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let info = |c: &mut Conn, field: &str| -> u64 {
+        c.cmds(&["INFO", "memory"])
+            .as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=vms\nredis.register_function('vms', function() return 1 end)",
+    ]);
+    assert_eq!(c.cmds(&["FCALL", "vms", "0"]).as_int(), 1);
+    let functions = info(&mut c, "used_memory_vm_functions");
+    assert!(functions > 0);
+
+    // A thousand scripts, each compiled and kept by the EVAL VM.
+    for i in 0..1000 {
+        c.cmds(&["EVAL", &format!("return {i}"), "0"]);
+    }
+    let scripts = info(&mut c, "used_memory_lua");
+    assert!(scripts > 100_000, "{scripts}");
+    assert_eq!(info(&mut c, "used_memory_vm_functions"), functions);
+
+    // FUNCTION FLUSH leaves the scripts' VM, SCRIPT FLUSH lets it go.
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    assert_eq!(info(&mut c, "used_memory_lua"), scripts);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    assert_eq!(info(&mut c, "used_memory_lua"), 0);
+    assert_eq!(c.cmds(&["EVAL", "return 7", "0"]).as_int(), 7);
+}
