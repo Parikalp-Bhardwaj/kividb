@@ -2249,6 +2249,8 @@ pub fn load_redis_rdb_from(
     // An expiry belongs to the key after it. Redis may write the key's idle
     // time or access frequency in between, so it waits here for the key.
     let mut pending_expiry: Option<u64> = None;
+    // The search module's data is skipped with one warning per file.
+    let mut warned_search = false;
 
     loop {
         let mut type_byte = [0u8];
@@ -2310,6 +2312,20 @@ pub fn load_redis_rdb_from(
                 for _ in 0..3 {
                     let _ = rdb_read_length(&mut r)?;
                 }
+            }
+            0xF7 => rdb_skip_module_aux(&mut r, &mut warned_search)?,
+            // Every other opcode from 0xF0 up is refused by what it is, not
+            // read as a key's type.
+            opcode @ 0xF0..=0xF6 => {
+                return Err(rdb_invalid(match opcode {
+                    0xF2 => "hash templates (opcode 0xF2) are not supported".to_string(),
+                    0xF3 => "module key metadata (opcode 0xF3) is not supported".to_string(),
+                    0xF5 => "function libraries (opcode 0xF5) are not supported yet".to_string(),
+                    0xF6 => "function libraries in Redis 7.0's pre-release format \
+                             (opcode 0xF6) are not supported"
+                        .to_string(),
+                    other => format!("unknown opcode {other:#04x}"),
+                }));
             }
             type_id => {
                 // A key: type byte already consumed
@@ -2962,19 +2978,7 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
             "values of module type {name} are not supported"
         )));
     }
-    let mut strings = Vec::new();
-    loop {
-        match rdb_read_plain_length(r)? {
-            0 => break,
-            1 | 2 => {
-                rdb_read_plain_length(r)?;
-            }
-            3 => r.read_exact(&mut [0u8; 4])?,
-            4 => r.read_exact(&mut [0u8; 8])?,
-            5 => strings.push(rdb_read_string(r)?),
-            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
-        }
-    }
+    let strings = rdb_read_module_strings(r)?;
     let [document] = strings.as_slice() else {
         return Err(rdb_invalid("a RedisJSON value is not one string"));
     };
@@ -2984,6 +2988,57 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
         serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
     };
     Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
+}
+
+/// What a module saved, each piece announced by its kind
+/// (`RDB_MODULE_OPCODE_*`), up to the end marker. Only the strings are kept.
+fn rdb_read_module_strings(r: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
+    let mut strings = Vec::new();
+    loop {
+        match rdb_read_plain_length(r)? {
+            0 => return Ok(strings),
+            1 | 2 => {
+                rdb_read_plain_length(r)?;
+            }
+            3 => r.read_exact(&mut [0u8; 4])?,
+            4 => r.read_exact(&mut [0u8; 8])?,
+            5 => strings.push(rdb_read_string(r)?),
+            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
+        }
+    }
+}
+
+/// A module's own data (`MODULE_AUX`): the module ID, when it was saved
+/// (before or after the keys), then what the module saved.
+///
+/// The search module's, its index definitions (`ft_index0`) and dictionaries
+/// (`scdtype00`), is read past, with a warning the first time it holds any.
+/// KiviDB keeps indexes of its own, and `FT.CREATE` indexes the keys already
+/// there. Any
+/// other module's is refused by its name, as Redis refuses aux data of a
+/// module it has not loaded.
+fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
+    let (name, _) = module_type_name(rdb_read_plain_length(r)?);
+    if name != "ft_index0" && name != "scdtype00" {
+        return Err(rdb_invalid(format!(
+            "data of module type {name} (opcode 0xF7) is not supported"
+        )));
+    }
+    // `when_opcode` is always an unsigned integer's, as in Redis.
+    if rdb_read_plain_length(r)? != 2 {
+        return Err(rdb_invalid("module aux data: bad when_opcode"));
+    }
+    rdb_read_plain_length(r)?;
+    // Redis Stack writes it with nothing in it: a count of 0 and no names.
+    let names = rdb_read_module_strings(r)?;
+    if !names.is_empty() && !*warned {
+        log_warn!(
+            "RDB: the search module's index definitions and dictionaries are not loaded; \
+             run FT.CREATE and FT.DICTADD again to make them"
+        );
+        *warned = true;
+    }
+    Ok(())
 }
 
 /// A CBOR document (RFC 8949) as JSON: what RedisJSON 2.8+ saves. Only what

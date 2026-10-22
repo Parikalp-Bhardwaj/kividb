@@ -1804,3 +1804,111 @@ fn rdb_idle_and_freq_before_keys_with_and_without_an_expiry() {
         assert!(!expiries[0].contains_key(plain), "{plain}");
     }
 }
+
+// A module that keeps data of its own writes it as aux data (MODULE_AUX).
+// The search module does so for its index definitions (ft_index0) and its
+// dictionaries (scdtype00): Redis 8.10 once an index or a dictionary exists,
+// and Redis Stack 7.4 with neither, before and after the keys. KiviDB keeps
+// its own indexes, so that data is skipped with a warning, and the keys load
+// (#71). The first file has an index and a dictionary; the second is Redis
+// Stack 7.4.7's with three plain keys. The TTLs are EXPIREAT 4102444800.
+#[test]
+fn rdb_files_with_the_search_modules_data_load_without_it() {
+    let files: [(&str, &[u8], [&str; 3]); 2] = [
+        (
+            "Redis 8.10 with an index",
+            include_bytes!("fixtures/redis-8.10-search.rdb"),
+            ["doc:1", "s", "ttl"],
+        ),
+        (
+            "Redis Stack 7.4",
+            include_bytes!("fixtures/redis-stack-7.4.rdb"),
+            ["h", "s", "ttl"],
+        ),
+    ];
+    for (label, bytes, expected) in files {
+        let (dbs, expiries) =
+            kividb::snapshot::load_redis_rdb_from(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected, "{label}");
+        assert_eq!(expiries[0].get("ttl"), Some(&4_102_444_800_000), "{label}");
+    }
+}
+
+/// A module ID as Redis writes one: 9 characters of 6 bits, then a 10-bit
+/// encoding version.
+fn module_id(name: &str, version: u64) -> u64 {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    name.bytes().enumerate().fold(version, |id, (i, c)| {
+        let index = CHARS.iter().position(|&x| x == c).unwrap() as u64;
+        id | index << (64 - 6 * (i + 1))
+    })
+}
+
+/// A MODULE_AUX record for `name` with one value of each kind a module can
+/// save, as Redis lays one out.
+fn module_aux(name: &str) -> Vec<u8> {
+    let mut p = vec![0xF7, 0x81]; // MODULE_AUX, then a 64-bit length: the ID
+    p.extend(module_id(name, 1).to_be_bytes());
+    p.extend(rdb_encode_len(2)); // when_opcode: an unsigned integer
+    p.extend(rdb_encode_len(1)); // when: before the keys
+    p.extend(rdb_encode_len(1)); // a signed integer
+    p.extend(rdb_encode_len(300));
+    p.extend(rdb_encode_len(2)); // an unsigned integer
+    p.extend(rdb_encode_len(7));
+    p.extend(rdb_encode_len(3)); // a float
+    p.extend(1.5f32.to_le_bytes());
+    p.extend(rdb_encode_len(4)); // a double
+    p.extend(2.5f64.to_le_bytes());
+    p.extend(rdb_encode_len(5)); // a string
+    p.extend(rdb_str(b"idx"));
+    p.extend(rdb_encode_len(0)); // the end
+    p
+}
+
+// Aux data of the search module is read past, wherever it is; any other
+// module's is refused by its name, as Redis refuses aux data of a module it
+// has not loaded (#71).
+#[test]
+fn rdb_module_aux_data_is_skipped_for_search_and_refused_for_other_modules() {
+    let mut p = module_aux("ft_index0");
+    p.push(0x00);
+    p.extend(rdb_str(b"k"));
+    p.extend(rdb_str(b"v"));
+    p.extend(module_aux("scdtype00"));
+    let (dbs, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    assert_eq!(dbs[0].len(), 1);
+
+    let err = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, module_aux("abcdefghi"))[..])
+        .err()
+        .expect("another module's aux data is refused");
+    assert!(err.to_string().contains("abcdefghi"), "{err}");
+
+    // Redis writes `when` as an unsigned integer; anything else is damage.
+    let mut bad = module_aux("ft_index0");
+    bad[10] = 5;
+    assert!(
+        kividb::snapshot::load_redis_rdb_from(&rdb_file(0, bad)[..]).is_err(),
+        "a bad when_opcode is refused"
+    );
+}
+
+// An opcode the reader does not handle is refused by what it is, not read
+// as a key's type (#71).
+#[test]
+fn rdb_opcodes_kividb_does_not_read_are_refused_by_name() {
+    for (opcode, named) in [
+        (0xF5, "function libraries"),
+        (0xF6, "pre-release"),
+        (0xF3, "key metadata"),
+        (0xF2, "hash templates"),
+        (0xF1, "0xf1"),
+        (0xF0, "0xf0"),
+    ] {
+        let err = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, vec![opcode, 1, 2, 3])[..])
+            .err()
+            .expect("the opcode is refused");
+        assert!(err.to_string().contains(named), "{opcode:#04x}: {err}");
+    }
+}

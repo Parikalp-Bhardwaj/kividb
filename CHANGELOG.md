@@ -326,6 +326,16 @@ written against an earlier KiviDB may notice them.
   `allkeys-lru` is a common setting for a cache. They are now read past, at
   startup, from `--preload-file` and in a full sync. The idle time and
   frequency are not kept yet.
+- **A Redis `dump.rdb` that holds the search module's index definitions or
+  dictionaries loads, as does Redis Stack 7.4's** (#71). The search module saves its index definitions and
+  dictionaries as data of its own (`MODULE_AUX`): Redis 8 once an index or
+  a dictionary exists, and Redis Stack 7.4 always, even with neither. The
+  reader took it for a key, so such a file stopped KiviDB from starting
+  (`unexpected end of file`), or crashed it before #69. It is now read past,
+  with a warning to run `FT.CREATE` and `FT.DICTADD` again when it held
+  any. Another module's
+  data, function libraries, hash templates and module key metadata are
+  refused by name, where they were read as a key.
 - **Nothing expires while writes are paused**, as in Redis (#22). During
   `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
   key whose time has passed stays where it is: a read takes it as gone, but
