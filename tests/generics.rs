@@ -2815,3 +2815,35 @@ fn test_bcast_tells_only_what_the_user_may_read() {
     assert_eq!(invalidated(&mut tc), ["b:3"]);
     assert_eq!(tc.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
 }
+
+/// A write and an `ACL SETUSER` that takes the key away, in one
+/// transaction: the BCAST client is told of the key under the permissions it
+/// had when the key was written, as in Redis 8.10 (unit/tracking).
+#[test]
+fn test_bcast_pending_is_told_before_acl_setuser_changes_the_user() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "setu", "on", ">setpass", "~p:*", "+@all"])
+            .is_ok()
+    );
+    let mut tc = Conn::connect(port);
+    assert!(tc.cmds(&["AUTH", "setu", "setpass"]).is_ok());
+    tc.cmds(&["HELLO", "3"]);
+    assert!(
+        tc.cmds(&["CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "p:"])
+            .is_ok()
+    );
+
+    admin.cmds(&["MULTI"]);
+    admin.cmds(&["SET", "p:x", "1"]);
+    admin.cmds(&["ACL", "SETUSER", "setu", "resetkeys", "~q:*"]);
+    admin.cmds(&["EXEC"]);
+
+    let push = tc.read_value();
+    let parts = push.as_array();
+    assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
+    assert_eq!(parts[1].as_array()[0].as_str(), "p:x");
+}
