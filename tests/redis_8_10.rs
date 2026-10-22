@@ -3504,6 +3504,11 @@ fn getkeysandflags_knows_the_8_10_commands() {
     let one = |key: &str, flags: &str| vec![(key.to_string(), flags.to_string())];
     assert_eq!(flags(&mut c, &["delex", "k1"]), one("k1", "RM delete"));
     assert_eq!(
+        flags(&mut c, &["pfmerge", "dest"]),
+        one("dest", "RW access insert")
+    );
+    assert_eq!(flags(&mut c, &["pfmerge", "dest", "src"]).len(), 2);
+    assert_eq!(
         flags(&mut c, &["delex", "k1", "ifeq", "v1"]),
         one("k1", "RW delete")
     );
