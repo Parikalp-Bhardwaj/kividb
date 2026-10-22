@@ -2992,11 +2992,32 @@ fn test_xnack_errors() {
     let mut c = Conn::connect(port);
     let ids = setup_pending(&mut c, "xn:err", "g", 1);
 
-    // Missing key → 0, not an error.
+    // Missing key → NOGROUP, as for a missing group (Redis 8.10).
+    let r = c.cmds(&["XNACK", "xn:absent", "g", "FAIL", "IDS", "1", &ids[0]]);
+    assert!(format!("{r:?}").contains("NOGROUP"), "{r:?}");
+    // Options before the IDS block as well as after; one it does not know
+    // is named.
     assert_eq!(
-        c.cmds(&["XNACK", "xn:absent", "g", "FAIL", "IDS", "1", &ids[0]])
-            .as_int(),
-        0
+        c.cmds(&[
+            "XNACK",
+            "xn:err",
+            "g",
+            "FAIL",
+            "RETRYCOUNT",
+            "3",
+            "IDS",
+            "1",
+            &ids[0]
+        ])
+        .as_int(),
+        1
+    );
+    let r = c.cmds(&[
+        "XNACK", "xn:err", "g", "FAIL", "BADOPT", "IDS", "1", &ids[0],
+    ]);
+    assert!(
+        format!("{r:?}").contains("Unrecognized XNACK option 'BADOPT'"),
+        "{r:?}"
     );
     // Unknown group is NOGROUP.
     let r = c.cmds(&["XNACK", "xn:err", "nosuch", "FAIL", "IDS", "1", &ids[0]]);
@@ -3118,5 +3139,97 @@ fn test_xtrim_acked_passes_over_what_a_group_still_needs() {
             .map(|e| e.as_array()[0].as_str())
             .collect();
         assert_eq!(ids, ["3-0", "5-0"], "{how}");
+    }
+}
+
+/// Redis 8.10's stream-cgroups checks: ENTRIESREAD past what was added is
+/// capped to it; CLAIM is XREADGROUP's, its time a strict non-negative
+/// integer; an entry XCLAIM FORCE makes starts as one delivery.
+#[test]
+fn test_entriesread_cap_and_claim_arguments() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let entries_read = |c: &mut Conn| -> i64 {
+        let info = c.cmds(&["XINFO", "GROUPS", "cg:s"]);
+        let g = info.as_array()[0].as_array();
+        let at = g
+            .iter()
+            .position(|v| matches!(v, RespValue::Bulk(b) if b == b"entries-read"))
+            .unwrap();
+        g[at + 1].as_int()
+    };
+    c.cmds(&["DEL", "cg:s"]);
+    c.cmds(&["XADD", "cg:s", "*", "f", "v"]);
+    assert!(
+        c.cmds(&["XGROUP", "CREATE", "cg:s", "g", "$", "ENTRIESREAD", "9999"])
+            .is_ok()
+    );
+    assert_eq!(entries_read(&mut c), 1);
+    assert!(
+        c.cmds(&["XGROUP", "SETID", "cg:s", "g", "$", "ENTRIESREAD", "9999"])
+            .is_ok()
+    );
+    assert_eq!(entries_read(&mut c), 1);
+
+    let err = |r: RespValue| format!("{r:?}");
+    assert!(
+        err(c.cmds(&["XREAD", "CLAIM", "10", "STREAMS", "cg:s", "0"]))
+            .contains("The CLAIM option is only supported by XREADGROUP")
+    );
+    assert!(
+        err(c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "CLAIM",
+            "+10",
+            "STREAMS",
+            "cg:s",
+            ">"
+        ]))
+        .contains("min-idle-time is not an integer")
+    );
+    assert!(
+        err(c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "CLAIM",
+            "-1",
+            "STREAMS",
+            "cg:s",
+            ">"
+        ]))
+        .contains("min-idle-time must be a positive integer")
+    );
+
+    c.cmds(&["DEL", "cg:s"]);
+    for id in ["1-0", "2-0", "3-0"] {
+        c.cmds(&["XADD", "cg:s", id, "f", "v"]);
+    }
+    c.cmds(&["XGROUP", "CREATE", "cg:s", "g", "0"]);
+    c.cmds(&[
+        "XCLAIM", "cg:s", "g", "c3", "0", "1-0", "2-0", "FORCE", "JUSTID",
+    ]);
+    let r = c.cmds(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c2",
+        "CLAIM",
+        "0",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "cg:s",
+        ">",
+    ]);
+    let messages = r.as_array()[0].as_array()[1].as_array();
+    assert_eq!(messages.len(), 2);
+    for m in messages {
+        assert_eq!(m.as_array()[3].as_int(), 1, "{m:?}");
     }
 }

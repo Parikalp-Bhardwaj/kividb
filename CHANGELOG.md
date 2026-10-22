@@ -111,6 +111,14 @@ written against an earlier KiviDB may notice them.
   could be deleted with `ACKED`.
   `XACKDEL` on a group that does not exist answers -1 for each ID, as for
   a key that does not exist, as Redis 8.10 does; it was a `NOGROUP` error.
+  `XNACK` takes its options before the `IDS` block as well as after it,
+  names an option it does not know, and answers `NOGROUP` for a key that
+  does not exist (it answered 0), as Redis 8.10 does. `XGROUP CREATE` and
+  `SETID` cap `ENTRIESREAD` at the entries the stream has had added.
+  `XREAD` refuses `CLAIM`, which is `XREADGROUP`'s; `CLAIM`'s time is read
+  as Redis reads an integer (`+10` is not one) and a negative one is
+  refused. An entry `XCLAIM … FORCE` creates starts as one delivery, as
+  in Redis (it started at none).
 - `MEMORY USAGE` of a string is what Redis 8 reports for one: its object's
   header, key and value, rounded up to the allocator's size class. It was
   a share of the key table's entries plus the value, which for small
