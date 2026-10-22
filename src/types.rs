@@ -923,9 +923,15 @@ impl ArrayInner {
         let size = self.slice_size;
         let winsize = (max - min + 1).next_power_of_two().max(AR_SLICE_MIN_ALLOC);
         if winsize >= size {
-            return ArraySliceShape::Dense { offset: 0, winsize: size };
+            return ArraySliceShape::Dense {
+                offset: 0,
+                winsize: size,
+            };
         }
-        ArraySliceShape::Dense { offset: min.min(size - winsize), winsize }
+        ArraySliceShape::Dense {
+            offset: min.min(size - winsize),
+            winsize,
+        }
     }
 
     /// `arSliceDenseGrowIfNeeded`.
@@ -937,13 +943,22 @@ impl ArrayInner {
                 w <<= 1;
             }
             if w >= size {
-                return ArraySliceShape::Dense { offset: 0, winsize: size };
+                return ArraySliceShape::Dense {
+                    offset: 0,
+                    winsize: size,
+                };
             }
-            return ArraySliceShape::Dense { offset: offset.min(size - w), winsize: w };
+            return ArraySliceShape::Dense {
+                offset: offset.min(size - w),
+                winsize: w,
+            };
         }
         if rel < offset {
             let end = offset + winsize;
-            let w = (end - rel).next_power_of_two().max(AR_SLICE_MIN_ALLOC).min(size);
+            let w = (end - rel)
+                .next_power_of_two()
+                .max(AR_SLICE_MIN_ALLOC)
+                .min(size);
             let offset = if w == size { 0 } else { end.saturating_sub(w) };
             return ArraySliceShape::Dense { offset, winsize: w };
         }
@@ -971,12 +986,18 @@ impl ArrayInner {
                 ArraySliceShape::Dense { offset, winsize } => self.grown(offset, winsize, rel),
                 sparse => sparse,
             },
-            ArraySliceShape::Sparse { cap } if slice.count >= cap => {
-                ArraySliceShape::Sparse { cap: (cap * 2).min(kmax) }
-            }
+            ArraySliceShape::Sparse { cap } if slice.count >= cap => ArraySliceShape::Sparse {
+                cap: (cap * 2).min(kmax),
+            },
             sparse => sparse,
         };
-        self.slices.insert(id, ArraySlice { count: slice.count + 1, shape });
+        self.slices.insert(
+            id,
+            ArraySlice {
+                count: slice.count + 1,
+                shape,
+            },
+        );
     }
 
     /// `n` elements have gone from slice `id`: it goes when empty, and a
@@ -1032,7 +1053,10 @@ impl ArrayInner {
                     let shape = self.dense_new(start);
                     self.slices.insert(id, ArraySlice { count: 0, shape });
                 }
-                Some(ArraySlice { count, shape: ArraySliceShape::Sparse { .. } }) => {
+                Some(ArraySlice {
+                    count,
+                    shape: ArraySliceShape::Sparse { .. },
+                }) => {
                     let base = id * size;
                     let existing = self
                         .entries

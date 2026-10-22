@@ -214,7 +214,11 @@ fn by_the_arguments(
         // Without a condition the key is only removed; with one it is read
         // and compared first (Redis 8.10's `delexGetKeys`).
         "DELEX" => {
-            let flags = if cmd.len() > 2 { "RW delete" } else { "RM delete" };
+            let flags = if cmd.len() > 2 {
+                "RW delete"
+            } else {
+                "RM delete"
+            };
             keys.iter_mut().for_each(|key| key.1 = flags);
         }
         "BITFIELD" => {

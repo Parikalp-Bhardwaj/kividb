@@ -1001,6 +1001,9 @@ fn arlastitems_after_arseek_0_and_insert_overflow() {
     c.cmds(&["ARINSERT", k, "a"]);
     c.cmds(&["ARSEEK", k, "18446744073709551615"]);
     let r = c.cmds(&["ARINSERT", k, "b"]);
-    assert!(r.is_error() && format!("{r:?}").contains("insert index overflow"), "{r:?}");
+    assert!(
+        r.is_error() && format!("{r:?}").contains("insert index overflow"),
+        "{r:?}"
+    );
     c.cmds(&["DEL", k]);
 }

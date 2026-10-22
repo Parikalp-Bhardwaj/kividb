@@ -3359,9 +3359,9 @@ fn script_error_handler(lua: &Lua, err: LuaValue) -> LuaResult<LuaValue> {
         .find(|frame| frame.source().what != "C")
         .map_or(1, |frame| frame.curr_line());
     let msg = msg.replace(['\r', '\n'], " ");
-    Ok(LuaValue::String(
-        lua.create_string(format!("{TABLE_ERROR_MARK}{line}\u{1}{msg}"))?,
-    ))
+    Ok(LuaValue::String(lua.create_string(format!(
+        "{TABLE_ERROR_MARK}{line}\u{1}{msg}"
+    ))?))
 }
 
 fn script_runner(lua: &Lua) -> Option<LuaFunction> {
@@ -3641,16 +3641,17 @@ fn eval_script(
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
 
-    let result = match compiled_script(lua, source, lua_body).and_then(|f| match script_runner(lua) {
-        Some(runner) => runner.call::<LuaValue>(f),
-        None => f.call::<LuaValue>(()),
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            *ctx.selected_db = saved_db;
-            return Err(clean_lua_error(&e));
-        }
-    };
+    let result =
+        match compiled_script(lua, source, lua_body).and_then(|f| match script_runner(lua) {
+            Some(runner) => runner.call::<LuaValue>(f),
+            None => f.call::<LuaValue>(()),
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                *ctx.selected_db = saved_db;
+                return Err(clean_lua_error(&e));
+            }
+        };
 
     let resp = match lua_value_to_resp(lua, result) {
         Ok(r) => r,

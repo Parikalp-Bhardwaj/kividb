@@ -3503,13 +3503,27 @@ fn getkeysandflags_knows_the_8_10_commands() {
     };
     let one = |key: &str, flags: &str| vec![(key.to_string(), flags.to_string())];
     assert_eq!(flags(&mut c, &["delex", "k1"]), one("k1", "RM delete"));
-    assert_eq!(flags(&mut c, &["delex", "k1", "ifeq", "v1"]), one("k1", "RW delete"));
-    assert_eq!(flags(&mut c, &["set", "k1", "v1", "IFEQ", "v1"]), one("k1", "RW update"));
+    assert_eq!(
+        flags(&mut c, &["delex", "k1", "ifeq", "v1"]),
+        one("k1", "RW delete")
+    );
+    assert_eq!(
+        flags(&mut c, &["set", "k1", "v1", "IFEQ", "v1"]),
+        one("k1", "RW update")
+    );
     assert_eq!(
         flags(&mut c, &["msetex", "2", "k1", "v1", "k2", "v2", "ex", "10"]),
-        [("k1".to_string(), "OW update".to_string()), ("k2".to_string(), "OW update".to_string())]
+        [
+            ("k1".to_string(), "OW update".to_string()),
+            ("k2".to_string(), "OW update".to_string())
+        ]
     );
-    for args in [&["digest", "k1"][..], &["increx", "k1"], &["sdiffcard", "1", "k1"], &["arlen", "k1"]] {
+    for args in [
+        &["digest", "k1"][..],
+        &["increx", "k1"],
+        &["sdiffcard", "1", "k1"],
+        &["arlen", "k1"],
+    ] {
         let got = flags(&mut c, args);
         assert_eq!(got.len(), 1, "{args:?}: {got:?}");
         assert_eq!(got[0].0, "k1", "{args:?}");
@@ -3533,9 +3547,21 @@ fn info_keysizes_bins_keys_by_length() {
             .to_string()
     };
     // The i'th bin holds 2^i to 2^(i+1) - 1.
-    for (len, bin) in [(1, "1"), (2, "2"), (3, "2"), (4, "4"), (7, "4"), (8, "8"), (10, "8")] {
+    for (len, bin) in [
+        (1, "1"),
+        (2, "2"),
+        (3, "2"),
+        (4, "4"),
+        (7, "4"),
+        (8, "8"),
+        (10, "8"),
+    ] {
         c.cmd(&["SET", "mykey", &"x".repeat(len)]);
-        assert_eq!(line(&mut c, "distrib_strings_sizes"), format!("{bin}=1"), "{len}");
+        assert_eq!(
+            line(&mut c, "distrib_strings_sizes"),
+            format!("{bin}=1"),
+            "{len}"
+        );
     }
     c.cmd(&["SET", "big", &"x".repeat(2048)]);
     c.cmd(&["SET", "empty", ""]);

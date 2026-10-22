@@ -1207,7 +1207,11 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
                 // instead of stepping index by index through a sparse span.
                 // Nothing inserted yet (or `ARSEEK 0`): from the end of the
                 // array, as Redis does.
-                let below = if inner.next_insert == 0 { u64::MAX } else { inner.next_insert };
+                let below = if inner.next_insert == 0 {
+                    u64::MAX
+                } else {
+                    inner.next_insert
+                };
                 for (_, v) in inner.entries.range(..below).rev() {
                     if newest_first.len() as u64 >= count {
                         break;

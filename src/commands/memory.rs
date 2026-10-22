@@ -586,6 +586,9 @@ mod tests {
             .iter()
             .map(|&n| size_class(n))
             .collect();
-        assert_eq!(classes, [8, 8, 16, 32, 128, 160, 160, 192, 256, 320, 1024, 5120]);
+        assert_eq!(
+            classes,
+            [8, 8, 16, 32, 128, 160, 160, 192, 256, 320, 1024, 5120]
+        );
     }
 }

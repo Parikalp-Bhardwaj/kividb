@@ -2783,13 +2783,22 @@ fn test_bcast_tells_only_what_the_user_may_read() {
     let mut tc = Conn::connect(port);
     assert!(tc.cmds(&["AUTH", "usr_a", "passA"]).is_ok());
     tc.cmds(&["HELLO", "3"]);
-    assert!(tc.cmds(&["CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "a:", "PREFIX", "b:"]).is_ok());
+    assert!(
+        tc.cmds(&[
+            "CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "a:", "PREFIX", "b:"
+        ])
+        .is_ok()
+    );
 
     let invalidated = |tc: &mut Conn| -> Vec<String> {
         let push = tc.read_value();
         let parts = push.as_array();
         assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
-        parts[1].as_array().iter().map(|k| k.as_str().to_string()).collect()
+        parts[1]
+            .as_array()
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
     };
 
     admin.cmds(&["SET", "a:1", "v"]);

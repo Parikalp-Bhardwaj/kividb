@@ -199,9 +199,19 @@ fn config_set_array(param: &str, value: &str) -> Vec<u8> {
             "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
         ))
     };
-    let (min, max) = if param == "array-slice-size" { (256, 65536) } else { (0, 256) };
-    let Some(v) = value.parse::<u32>().ok().filter(|v| (min..=max).contains(v)) else {
-        return failed(&format!("argument must be between {min} and {max} inclusive"));
+    let (min, max) = if param == "array-slice-size" {
+        (256, 65536)
+    } else {
+        (0, 256)
+    };
+    let Some(v) = value
+        .parse::<u32>()
+        .ok()
+        .filter(|v| (min..=max).contains(v))
+    else {
+        return failed(&format!(
+            "argument must be between {min} and {max} inclusive"
+        ));
     };
     match param {
         "array-slice-size" if !v.is_power_of_two() => {

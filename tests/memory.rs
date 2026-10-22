@@ -546,7 +546,9 @@ fn test_memory_usage_string_within_redis_bounds() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    let sizes = [1usize, 5, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257];
+    let sizes = [
+        1usize, 5, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    ];
     for k in sizes {
         let key = "k".repeat(k);
         for v in sizes {

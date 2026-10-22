@@ -697,11 +697,12 @@ where
             // Must be done here, not in execute_command, because std::thread::sleep
             // inside a tokio task blocks the worker thread and prevents UNPAUSE
             // from being processed on another connection.
-            let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                crate::pause::gate(&cmd, &tx.queue, client_id).await
-            } else {
-                None
-            };
+            let _ran =
+                if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    crate::pause::gate(&cmd, &tx.queue, client_id).await
+                } else {
+                    None
+                };
             // ══════════════════════════════════════════════════════════════
             // FAST PATH — identical to v0.1.10: parse → execute → append.
             // Zero heap allocations for command name, zero string compares.

@@ -1067,7 +1067,10 @@ mod tests {
         let mut s = stream_with(5);
         s.groups.insert("g".into(), group(4, &[3]));
         let to = TrimTo::MinId(id(6));
-        assert_eq!(trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 0, node: 2 }), 3);
+        assert_eq!(
+            trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 0, node: 2 }),
+            3
+        );
 
         // As far as LIMIT lets it.
         let mut s = stream_with(5);

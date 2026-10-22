@@ -80,7 +80,6 @@ impl Conn {
     fn ok(&mut self, args: &[&str]) {
         assert_eq!(self.cmd(args), V::Simple("OK".into()), "{args:?}");
     }
-
 }
 
 fn port_is_free(port: u16) -> bool {
@@ -128,7 +127,6 @@ fn start_server() -> Conn {
     Conn::connect(port)
 }
 
-
 /// Waits until `INFO` counts `n` blocked clients.
 fn wait_blocked(c: &mut Conn, n: u64) {
     let want = format!("blocked_clients:{n}");
@@ -137,7 +135,11 @@ fn wait_blocked(c: &mut Conn, n: u64) {
         let V::Bulk(info) = c.cmd(&["INFO", "clients"]) else {
             panic!("INFO is a bulk string");
         };
-        if String::from_utf8(info).unwrap().lines().any(|l| l.trim() == want) {
+        if String::from_utf8(info)
+            .unwrap()
+            .lines()
+            .any(|l| l.trim() == want)
+        {
             return;
         }
         assert!(Instant::now() < deadline, "never {want}");

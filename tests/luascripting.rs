@@ -1279,18 +1279,28 @@ fn test_error_with_a_table_is_its_err() {
     );
 
     let r = c.cmds(&["EVAL", "error({err='ERR table error'})", "0"]);
-    assert!(r.as_error().starts_with("ERR table error script: "), "{r:?}");
+    assert!(
+        r.as_error().starts_with("ERR table error script: "),
+        "{r:?}"
+    );
     assert!(r.as_error().ends_with(", on @user_script:1."), "{r:?}");
 
     let r = c.cmds(&["EVAL", "error({})", "0"]);
-    assert!(r.as_error().starts_with("ERR unknown error script: "), "{r:?}");
+    assert!(
+        r.as_error().starts_with("ERR unknown error script: "),
+        "{r:?}"
+    );
 
     // The line it was raised on.
     let r = c.cmds(&["EVAL", "local a = 1\nerror({err='ERR second'})", "0"]);
     assert!(r.as_error().ends_with(", on @user_script:2."), "{r:?}");
 
     // A line break in the message is a space, and cannot start a reply.
-    let r = c.cmds(&["EVAL", "error(redis.error_reply(\"X\\r\\n+INJECTED\"))", "0"]);
+    let r = c.cmds(&[
+        "EVAL",
+        "error(redis.error_reply(\"X\\r\\n+INJECTED\"))",
+        "0",
+    ]);
     assert!(r.as_error().starts_with("ERR X  +INJECTED"), "{r:?}");
     assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
 
@@ -1314,9 +1324,17 @@ fn test_error_reply_without_a_code_is_err() {
 
     let r = c.cmds(&["EVAL", "return redis.error_reply('X')", "0"]);
     assert_eq!(r.as_error(), "ERR X");
-    let r = c.cmds(&["EVAL", "return redis.error_reply('MY_CODE custom msg')", "0"]);
+    let r = c.cmds(&[
+        "EVAL",
+        "return redis.error_reply('MY_CODE custom msg')",
+        "0",
+    ]);
     assert_eq!(r.as_error(), "MY_CODE custom msg");
-    let r = c.cmds(&["EVAL", "return redis.error_reply('-MY_CODE custom msg')", "0"]);
+    let r = c.cmds(&[
+        "EVAL",
+        "return redis.error_reply('-MY_CODE custom msg')",
+        "0",
+    ]);
     assert_eq!(r.as_error(), "MY_CODE custom msg");
 }
 

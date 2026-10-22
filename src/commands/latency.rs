@@ -215,7 +215,14 @@ fn graph(event: &str, samples: &[crate::latency::LatencySample], now: u64) -> St
             out.push('\n');
         }
         let end = (start + COLUMNS).min(values.len());
-        sparkline(&mut out, &values[start..end], &labels[start..end], lo, hi, ROWS);
+        sparkline(
+            &mut out,
+            &values[start..end],
+            &labels[start..end],
+            lo,
+            hi,
+            ROWS,
+        );
     }
     out
 }
@@ -278,9 +285,18 @@ mod graph_tests {
     #[test]
     fn the_graph_is_redis_s() {
         let samples = [
-            LatencySample { timestamp: 110, latency_ms: 10 },
-            LatencySample { timestamp: 130, latency_ms: 300 },
-            LatencySample { timestamp: 150, latency_ms: 150 },
+            LatencySample {
+                timestamp: 110,
+                latency_ms: 10,
+            },
+            LatencySample {
+                timestamp: 130,
+                latency_ms: 300,
+            },
+            LatencySample {
+                timestamp: 150,
+                latency_ms: 150,
+            },
         ];
         let g = graph("expire-cycle", &samples, 160);
         let mut lines = g.lines();
@@ -292,6 +308,9 @@ mod graph_tests {
         // Four rows of the sparkline, a blank line, then the labels read
         // downwards: 50s, 30s and 10s ago.
         let rest: Vec<&str> = lines.collect();
-        assert_eq!(rest, [" # ", " | ", " |#", "_||", "   ", "531", "000", "sss"]);
+        assert_eq!(
+            rest,
+            [" # ", " | ", " |#", "_||", "   ", "531", "000", "sss"]
+        );
     }
 }

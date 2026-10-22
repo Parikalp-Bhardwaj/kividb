@@ -210,7 +210,6 @@ impl Drop for Ran {
     }
 }
 
-
 /// Pause writes for a handoff (see `HANDOFF`). The caller takes its cut
 /// through the write stream *after* this returns; `clear_pause` ends it.
 pub fn set_handoff_pause(duration_ms: i64) {
