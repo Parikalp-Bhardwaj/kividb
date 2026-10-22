@@ -1116,7 +1116,8 @@ struct StagedSync {
     expiry: ExpiryStore,
     index_schemas: Vec<crate::vector::IndexSchema>,
     dictionaries: Vec<(String, Vec<String>)>,
-    /// The master's function libraries, from a KDB image that has any.
+    /// The master's function libraries, from a KDB image or a Redis RDB file
+    /// that has any.
     functions: Option<Vec<u8>>,
     keys: usize,
     keys_with_ttl: usize,
@@ -1144,10 +1145,11 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
             loaded.functions,
         )
     } else {
-        let (dbs, expiries) = crate::snapshot::load_redis_rdb_from(payload).map_err(|e| {
-            SessionError::Link(format!("full-sync payload is not a valid RDB: {e}"))
-        })?;
-        (dbs, expiries, Vec::new(), Vec::new(), None)
+        let (dbs, expiries, functions) =
+            crate::snapshot::load_redis_rdb_from(payload).map_err(|e| {
+                SessionError::Link(format!("full-sync payload is not a valid RDB: {e}"))
+            })?;
+        (dbs, expiries, Vec::new(), Vec::new(), functions)
     };
 
     let keys = crate::snapshot::restore_into_store(dbs, &staging_store);

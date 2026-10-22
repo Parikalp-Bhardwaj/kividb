@@ -1570,7 +1570,7 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
         ("8.10", include_bytes!("fixtures/redis-8.10.rdb")),
     ];
     for (label, bytes) in files {
-        let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(bytes)
+        let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("Redis {label}: {e}"));
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
@@ -1660,7 +1660,7 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
 // once it runs out, as the first capture's one hour did.
 #[test]
 fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
-    let (dbs, _) = kividb::snapshot::load_redis_rdb_from(
+    let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(
         &include_bytes!("fixtures/redis-8.10-streams-json-ttl.rdb")[..],
     )
     .unwrap();
@@ -1721,7 +1721,7 @@ fn rdb_files_saved_by_redis_8_10_under_lru_and_lfu_policies_load() {
         ),
     ];
     for (policy, bytes, restored) in files {
-        let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(bytes)
+        let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("{policy}: {e}"));
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
@@ -1749,7 +1749,7 @@ fn rdb_files_saved_by_redis_8_10_under_lru_and_lfu_policies_load() {
 // (#71).
 #[test]
 fn an_rdb_file_from_a_redis_8_10_cluster_node_loads() {
-    let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(
+    let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(
         &include_bytes!("fixtures/redis-8.10-cluster.rdb")[..],
     )
     .unwrap();
@@ -1794,7 +1794,7 @@ fn rdb_idle_and_freq_before_keys_with_and_without_an_expiry() {
     key(&mut p, b"d");
     key(&mut p, b"e");
 
-    let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["a", "b", "c", "d", "e"]);
@@ -1827,7 +1827,7 @@ fn rdb_files_with_the_search_modules_data_load_without_it() {
         ),
     ];
     for (label, bytes, expected) in files {
-        let (dbs, expiries) =
+        let (dbs, expiries, _) =
             kividb::snapshot::load_redis_rdb_from(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
         let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -1877,7 +1877,7 @@ fn rdb_module_aux_data_is_skipped_for_search_and_refused_for_other_modules() {
     p.extend(rdb_str(b"k"));
     p.extend(rdb_str(b"v"));
     p.extend(module_aux("scdtype00"));
-    let (dbs, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
     assert_eq!(dbs[0].len(), 1);
 
     let err = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, module_aux("abcdefghi"))[..])
@@ -1894,12 +1894,54 @@ fn rdb_module_aux_data_is_skipped_for_search_and_refused_for_other_modules() {
     );
 }
 
+// A Redis dump.rdb keeps function libraries as an opcode and the library's
+// code (FUNCTION2), one per library. The reader hands them on as the
+// FUNCTION DUMP payload Redis itself would give, a version FUNCTION RESTORE
+// takes and a CRC included, for the server to load as FUNCTION RESTORE does
+// (#71).
+// These come from Redis 7.4.11 and 8.10.2, each with two libraries.
+#[test]
+fn rdb_files_with_function_libraries_from_redis_7_4_and_8_10_load() {
+    let files: [(&str, &[u8]); 2] = [
+        ("7.4", include_bytes!("fixtures/redis-7.4-functions.rdb")),
+        ("8.10", include_bytes!("fixtures/redis-8.10-functions.rdb")),
+    ];
+    for (label, bytes) in files {
+        let (dbs, expiries, functions) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("Redis {label}: {e}"));
+        let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["s", "ttl"], "Redis {label}");
+        assert_eq!(
+            expiries[0].get("ttl"),
+            Some(&4_102_444_800_000),
+            "Redis {label}"
+        );
+
+        let payload = functions.unwrap_or_else(|| panic!("Redis {label}: no libraries"));
+        let text = String::from_utf8_lossy(&payload);
+        for library in ["#!lua name=seven", "#!lua name=counter"] {
+            assert!(text.contains(library), "Redis {label}: {library}");
+        }
+        let (versioned, crc) = payload.split_at(payload.len() - 8);
+        assert_eq!(
+            kividb::snapshot::redis_crc64(versioned).to_le_bytes(),
+            crc,
+            "Redis {label}: the payload's CRC"
+        );
+    }
+
+    let (_, _, none) =
+        kividb::snapshot::load_redis_rdb_from(&include_bytes!("fixtures/redis-8.10.rdb")[..])
+            .unwrap();
+    assert!(none.is_none(), "a file without libraries has none");
+}
+
 // An opcode the reader does not handle is refused by what it is, not read
 // as a key's type (#71).
 #[test]
 fn rdb_opcodes_kividb_does_not_read_are_refused_by_name() {
     for (opcode, named) in [
-        (0xF5, "function libraries"),
         (0xF6, "pre-release"),
         (0xF3, "key metadata"),
         (0xF2, "hash templates"),
