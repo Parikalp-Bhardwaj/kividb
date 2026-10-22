@@ -212,10 +212,26 @@ pub(super) fn strict_integer(raw: &[u8]) -> Option<i64> {
     if digits.is_empty()
         || !digits.bytes().all(|b| b.is_ascii_digit())
         || (digits.len() > 1 && digits.starts_with('0'))
+        // `-0` is not how Redis writes zero.
+        || (s.starts_with('-') && digits == "0")
     {
         return None;
     }
     s.parse().ok()
+}
+
+/// A pending entry whose `delivered_at` is below this was released by
+/// `XNACK`, not delivered at that time: no real time in milliseconds is
+/// this small.
+pub(super) const NACKED_BELOW: u64 = 1 << 40;
+
+/// The `delivered_at` an entry `XNACK` releases is given: the next of an
+/// increasing count, so that released entries are claimed in the order they
+/// were released (a re-NACKed one goes to the back, as in Redis's NACK zone),
+/// all before anything that was delivered.
+pub(super) fn nack_time() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % NACKED_BELOW
 }
 
 /// The retention settings `XINFO STREAM` reports.

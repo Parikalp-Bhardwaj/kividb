@@ -2066,7 +2066,7 @@ fn run_xreadgroup_delivery(
                     let Some(pending) = g.pel.get_mut(&id) else {
                         continue;
                     };
-                    let idle = if pending.delivered_at == 0 {
+                    let idle = if pending.delivered_at < stream_extra::NACKED_BELOW {
                         0
                     } else {
                         now.saturating_sub(pending.delivered_at)
@@ -2362,11 +2362,11 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     })
                     .take(count)
                     .map(|(id, p)| {
-                        // `delivered_at == 0` is the XNACK marker for "released,
+                        // `delivered_at` below `NACKED_BELOW` is XNACK's mark for "released,
                         // never re-delivered". Redis reports that as an idle of
                         // -1 rather than "now", which would otherwise read as an
                         // absurd age measured from the epoch.
-                        let idle = if p.delivered_at == 0 {
+                        let idle = if p.delivered_at < stream_extra::NACKED_BELOW {
                             -1
                         } else {
                             now.saturating_sub(p.delivered_at) as i64
@@ -3667,9 +3667,10 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                                 Mode::Fatal => i64::MAX as u64,
                             },
                         };
-                        // Unowned, and immediately claimable.
+                        // Unowned, and immediately claimable, after what
+                        // was released before it.
                         entry.consumer = String::new();
-                        entry.delivered_at = 0;
+                        entry.delivered_at = stream_extra::nack_time();
                         released += 1;
                     }
                     None if force => {
@@ -3687,7 +3688,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                             id.clone(),
                             PelEntry {
                                 consumer: String::new(),
-                                delivered_at: 0,
+                                delivered_at: stream_extra::nack_time(),
                                 delivery_count,
                             },
                         );

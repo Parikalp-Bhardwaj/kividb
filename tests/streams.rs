@@ -3233,3 +3233,61 @@ fn test_entriesread_cap_and_claim_arguments() {
         assert_eq!(m.as_array()[3].as_int(), 1, "{m:?}");
     }
 }
+
+/// Entries XNACK releases are claimed in the order they were released, and
+/// one released again goes to the back, as in Redis 8.10's NACK zone.
+/// `CLAIM -0` is not an integer, as Redis reads one.
+#[test]
+fn test_renack_goes_to_the_back() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["DEL", "nz:s"]);
+    for id in ["1-0", "2-0", "3-0"] {
+        c.cmds(&["XADD", "nz:s", id, "f", "v"]);
+    }
+    c.cmds(&["XGROUP", "CREATE", "nz:s", "grp", "0"]);
+    c.cmds(&["XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "nz:s", ">"]);
+    c.cmds(&[
+        "XNACK", "nz:s", "grp", "FAIL", "IDS", "3", "1-0", "2-0", "3-0",
+    ]);
+    c.cmds(&["XNACK", "nz:s", "grp", "FAIL", "IDS", "1", "1-0"]);
+    let mut order = Vec::new();
+    for _ in 0..3 {
+        let r = c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "grp",
+            "c2",
+            "COUNT",
+            "1",
+            "CLAIM",
+            "0",
+            "STREAMS",
+            "nz:s",
+            ">",
+        ]);
+        order.push(
+            r.as_array()[0].as_array()[1].as_array()[0].as_array()[0]
+                .as_str()
+                .to_string(),
+        );
+    }
+    assert_eq!(order, ["2-0", "3-0", "1-0"]);
+
+    let r = c.cmds(&[
+        "XREADGROUP",
+        "GROUP",
+        "grp",
+        "c2",
+        "CLAIM",
+        "-0",
+        "STREAMS",
+        "nz:s",
+        ">",
+    ]);
+    assert!(
+        format!("{r:?}").contains("min-idle-time is not an integer"),
+        "{r:?}"
+    );
+}

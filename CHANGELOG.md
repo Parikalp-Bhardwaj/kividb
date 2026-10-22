@@ -119,6 +119,9 @@ written against an earlier KiviDB may notice them.
   as Redis reads an integer (`+10` is not one) and a negative one is
   refused. An entry `XCLAIM … FORCE` creates starts as one delivery, as
   in Redis (it started at none).
+  Entries `XNACK` releases are claimed in the order they were released,
+  and one released again goes to the back, as in Redis's NACK zone (they
+  were claimed by ID). `CLAIM -0` is not an integer, as Redis reads one.
 - `MEMORY USAGE` of a string is what Redis 8 reports for one: its object's
   header, key and value, rounded up to the allocator's size class. It was
   a share of the key table's entries plus the value, which for small
