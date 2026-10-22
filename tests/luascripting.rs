@@ -1409,3 +1409,108 @@ fn test_a_script_s_commands_count_as_its_client_s() {
     // The first CLIENT INFO, EVAL and PING; not the second CLIENT INFO.
     assert_eq!(after - before, 3);
 }
+
+/// `EVAL` scripts and functions have a VM each, as in Redis: what scripts
+/// hold is in `used_memory_lua`, not `used_memory_vm_functions`, `SCRIPT
+/// FLUSH` lets it go, and `FUNCTION FLUSH` leaves it.
+#[test]
+fn test_scripts_and_functions_have_a_vm_each() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let info = |c: &mut Conn, field: &str| -> u64 {
+        c.cmds(&["INFO", "memory"])
+            .as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=vms\nredis.register_function('vms', function() return 1 end)",
+    ]);
+    assert_eq!(c.cmds(&["FCALL", "vms", "0"]).as_int(), 1);
+    let functions = info(&mut c, "used_memory_vm_functions");
+    assert!(functions > 0);
+
+    // A thousand scripts, each compiled and kept by the EVAL VM.
+    for i in 0..1000 {
+        c.cmds(&["EVAL", &format!("return {i}"), "0"]);
+    }
+    let scripts = info(&mut c, "used_memory_lua");
+    assert!(scripts > 100_000, "{scripts}");
+    assert_eq!(info(&mut c, "used_memory_vm_functions"), functions);
+
+    // FUNCTION FLUSH leaves the scripts' VM, SCRIPT FLUSH lets it go.
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    assert_eq!(info(&mut c, "used_memory_lua"), scripts);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    // The VM goes; a new one is made when a script next runs.
+    assert_eq!(info(&mut c, "used_memory_lua"), 0);
+    assert_eq!(info(&mut c, "used_memory_vm_eval"), 0);
+    assert_eq!(
+        info(&mut c, "used_memory_vm_total"),
+        info(&mut c, "used_memory_vm_functions")
+    );
+    assert_eq!(c.cmds(&["EVAL", "return 7", "0"]).as_int(), 7);
+    assert!(info(&mut c, "used_memory_scripts_eval") > 0);
+}
+
+/// What one flush does to the other kind (vimoppa's review of #75): a
+/// function still runs after `SCRIPT FLUSH`, a script cached before
+/// `FUNCTION FLUSH` still runs after it, and `SCRIPT RESET` renews both VMs
+/// with everything still working after.
+#[test]
+fn test_each_flush_leaves_the_other_kind_working() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=keep\nredis.register_function('keep', function() return 5 end)",
+    ]);
+    let sha = c.cmds(&["SCRIPT", "LOAD", "return 6"]).as_str().to_string();
+
+    // SCRIPT FLUSH: the function is untouched; the script is gone.
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    assert_eq!(c.cmds(&["FCALL", "keep", "0"]).as_int(), 5);
+    assert!(c.cmds(&["EVALSHA", &sha, "0"]).is_error());
+
+    // FUNCTION FLUSH: a script cached before it still runs.
+    let sha = c.cmds(&["SCRIPT", "LOAD", "return 6"]).as_str().to_string();
+    assert_eq!(c.cmds(&["EVALSHA", &sha, "0"]).as_int(), 6);
+    c.cmds(&["FUNCTION", "FLUSH", "ASYNC"]);
+    assert_eq!(c.cmds(&["EVALSHA", &sha, "0"]).as_int(), 6);
+    assert!(c.cmds(&["FCALL", "keep", "0"]).is_error());
+
+    // SCRIPT RESET renews both VMs in one go; scripts and functions run after.
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=keep\nredis.register_function('keep', function() return 5 end)",
+    ]);
+    assert_eq!(
+        c.cmds(&["SCRIPT", "RESET"]),
+        RespValue::SimpleStr("OK".into())
+    );
+    assert_eq!(c.cmds(&["EVAL", "return 8", "0"]).as_int(), 8);
+    assert_eq!(c.cmds(&["FCALL", "keep", "0"]).as_int(), 5);
+
+    // SCRIPT FLUSH takes SYNC or ASYNC and nothing else.
+    assert_eq!(
+        c.cmds(&["SCRIPT", "FLUSH", "ASYNC"]),
+        RespValue::SimpleStr("OK".into())
+    );
+    assert!(c.cmds(&["SCRIPT", "FLUSH", "NOW"]).is_error());
+}
