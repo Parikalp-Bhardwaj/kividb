@@ -291,6 +291,17 @@ written against an earlier KiviDB may notice them.
   payloads from earlier releases still restore. Values of other modules
   (time series, Bloom filters, vector sets) and Redis 8.10's newest types
   (arrays, template hashes, GCRA) are not read yet, and are refused.
+- **A Redis `dump.rdb` saved under an LRU or LFU policy, or by a cluster
+  node, loads** (#71). Under an LRU policy Redis writes each key's idle time
+  (`IDLE`) in front of it, and under an LFU policy its access frequency
+  (`FREQ`), after the key's expiry when it has one. A cluster node writes the
+  slot of the keys that follow (`SLOT_INFO`). The RDB reader took these for
+  a key's type, so such a file stopped KiviDB from starting with
+  `unsupported RDB type 248` (or `249`, `244`, or `failed to fill whole
+  buffer`), and a replica of such a Redis primary never synced.
+  `allkeys-lru` is a common setting for a cache. They are now read past, at
+  startup, from `--preload-file` and in a full sync. The idle time and
+  frequency are not kept yet.
 - **Nothing expires while writes are paused**, as in Redis (#22). During
   `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
   key whose time has passed stays where it is: a read takes it as gone, but
