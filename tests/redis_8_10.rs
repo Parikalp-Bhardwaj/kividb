@@ -3515,3 +3515,42 @@ fn getkeysandflags_knows_the_8_10_commands() {
         assert_eq!(got[0].0, "k1", "{args:?}");
     }
 }
+
+/// `INFO keysizes` (Redis 8.10): per database and type, how many keys have a
+/// length in each power-of-two bin. Database 13, which no other test here
+/// uses. Not in the default INFO.
+#[test]
+fn info_keysizes_bins_keys_by_length() {
+    let mut c = conn();
+    assert!(c.cmd(&["SELECT", "13"]).ok());
+    c.cmd(&["FLUSHDB"]);
+    let line = |c: &mut Conn, field: &str| -> String {
+        let info = c.cmd(&["INFO", "keysizes"]).s().to_string();
+        assert!(info.starts_with("# Keysizes\r\n"), "{info}");
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("db13_{field}:")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    // The i'th bin holds 2^i to 2^(i+1) - 1.
+    for (len, bin) in [(1, "1"), (2, "2"), (3, "2"), (4, "4"), (7, "4"), (8, "8"), (10, "8")] {
+        c.cmd(&["SET", "mykey", &"x".repeat(len)]);
+        assert_eq!(line(&mut c, "distrib_strings_sizes"), format!("{bin}=1"), "{len}");
+    }
+    c.cmd(&["SET", "big", &"x".repeat(2048)]);
+    c.cmd(&["SET", "empty", ""]);
+    assert_eq!(line(&mut c, "distrib_strings_sizes"), "0=1,8=1,2K=1");
+    c.cmd(&["RPUSH", "l", "1", "2", "3", "4"]);
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["SADD", "s", "a", "b"]);
+    c.cmd(&["ZADD", "z", "1", "a"]);
+    assert_eq!(line(&mut c, "distrib_lists_items"), "4=1");
+    assert_eq!(line(&mut c, "distrib_hashes_items"), "1=1");
+    assert_eq!(line(&mut c, "distrib_sets_items"), "2=1");
+    assert_eq!(line(&mut c, "distrib_zsets_items"), "1=1");
+    c.cmd(&["DEL", "l"]);
+    assert_eq!(line(&mut c, "distrib_lists_items"), "");
+    assert!(!c.cmd(&["INFO"]).s().contains("# Keysizes"));
+    assert!(c.cmd(&["INFO", "everything"]).s().contains("# Keysizes"));
+    c.cmd(&["FLUSHDB"]);
+}

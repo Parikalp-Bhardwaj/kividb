@@ -2328,6 +2328,61 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// `INFO keysizes` for database `db`: for strings, lists, sets, sorted sets
+/// and hashes, how many keys have a length (bytes, or items) in each
+/// power-of-two bin, as Redis 8.10 writes it:
+/// `db0_distrib_lists_items:1=2,4=1` (one to one, two or three; four to
+/// seven). Nothing for a type with no keys.
+fn keysizes(db: usize, shards: &crate::store::Db) -> String {
+    const TYPES: [&str; 5] = [
+        "distrib_strings_sizes",
+        "distrib_lists_items",
+        "distrib_sets_items",
+        "distrib_zsets_items",
+        "distrib_hashes_items",
+    ];
+    // Bin 0 is the empty, bin n holds 2^(n-1) to 2^n - 1.
+    let mut bins = [[0u64; 65]; 5];
+    for shard in shards.iter() {
+        for value in read_lock!(shard).values() {
+            let (kind, len) = match value {
+                crate::types::KiviDBValue::String(b) => (0, b.len()),
+                crate::types::KiviDBValue::List(l) => (1, l.read().len()),
+                crate::types::KiviDBValue::Set(s) => (2, s.read().len()),
+                crate::types::KiviDBValue::SortedSet(z) => (3, z.read().len()),
+                crate::types::KiviDBValue::Hash(h) => (4, h.read().len()),
+                crate::types::KiviDBValue::HashEx(h) => (4, h.read().len()),
+                _ => continue,
+            };
+            let bin = (usize::BITS - len.leading_zeros()) as usize;
+            bins[kind][bin] += 1;
+        }
+    }
+    let mut out = String::new();
+    for (kind, name) in TYPES.iter().enumerate() {
+        let counts: Vec<String> = bins[kind]
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(bin, n)| format!("{}={n}", keysizes_label(bin)))
+            .collect();
+        if !counts.is_empty() {
+            out.push_str(&format!("db{db}_{name}:{}\r\n", counts.join(",")));
+        }
+    }
+    out
+}
+
+/// The label of a `keysizes` bin: its least length, in 1024s past 1023.
+fn keysizes_label(bin: usize) -> String {
+    if bin == 0 {
+        return "0".into();
+    }
+    let least = bin - 1;
+    let suffix = ["", "K", "M", "G", "T", "P", "E"][least / 10];
+    format!("{}{suffix}", 1u64 << (least % 10))
+}
+
 /// Given a command invocation (cmd[0] = command name, cmd[1..] = args),
 /// return RESP-encoded key entries. Each entry is either a bulk string (GETKEYS)
 /// or a 2-element array [key, [flags...]] (GETKEYSANDFLAGS).
@@ -2784,8 +2839,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut out = String::new();
 
+            // `keysizes` is in Redis's default INFO, kept as keys change. Here
+            // it is counted when asked for, a pass over every key: not in the
+            // default, which monitoring asks for every few seconds.
             let want = |s: &str| {
-                all || asked(s) || (default && !matches!(s, "commandstats" | "latencystats"))
+                all || asked(s)
+                    || (default && !matches!(s, "commandstats" | "latencystats" | "keysizes"))
             };
 
             if want("server") {
@@ -2892,6 +2951,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             i, keys, expires, avg_ttl
                         ));
                     }
+                }
+                out.push_str("\r\n");
+            }
+
+            if want("keysizes") {
+                out.push_str("# Keysizes\r\n");
+                for (i, db) in ctx.store.iter().enumerate() {
+                    out.push_str(&keysizes(i, db));
                 }
                 out.push_str("\r\n");
             }

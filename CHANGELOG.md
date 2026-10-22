@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`INFO keysizes`** (Redis 8.10): for each database, how many strings,
+  lists, sets, sorted sets and hashes have a length in each power-of-two
+  bin (`db0_distrib_lists_items:1=2,4=1`). Redis keeps these as keys change
+  and gives them in the default `INFO`; here they are counted when asked
+  for (`INFO keysizes`, `all`, `everything`), a pass over the keys, so they
+  are not in the default `INFO`, which monitoring asks for every few
+  seconds, and cost writes nothing.
+
 - **Redis 8.10 additions:** the keyspace event classes `o` (a key's value
   overwritten), `c` (its type changed) and `a` (array commands, part of
   `A`); `XIDMPRECORD`; per-client `tot-net-in`, `tot-net-out`, `tot-cmds`,
