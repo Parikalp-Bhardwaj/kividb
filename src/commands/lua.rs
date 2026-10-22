@@ -4659,16 +4659,21 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         FunctionRestorePolicy::Append
     };
 
-    match restore_function_payload(cmd[2], policy) {
+    match restore_function_payload(cmd[2], policy, "DUMP payload version or checksum are wrong") {
         Ok(()) => resp_simple("OK"),
         Err(e) => resp_error(&e),
     }
 }
 
 /// Load a `FUNCTION DUMP` payload under `policy`, as `FUNCTION RESTORE` does.
-fn restore_function_payload(payload: &[u8], policy: FunctionRestorePolicy) -> Result<(), String> {
-    let (incoming, infer_functions) = decode_function_dump_payload(payload)
-        .map_err(|()| "DUMP payload version or checksum are wrong".to_string())?;
+/// `unreadable` is the error for a payload that cannot be decoded.
+fn restore_function_payload(
+    payload: &[u8],
+    policy: FunctionRestorePolicy,
+    unreadable: &str,
+) -> Result<(), String> {
+    let (incoming, infer_functions) =
+        decode_function_dump_payload(payload).map_err(|()| unreadable.to_string())?;
     let mut merged = compute_merged_store(incoming, policy)?;
     lua_vms_renew_for_admin(&[Vm::Functions])
         .map_err(|LuaVmBusy| BUSY_RUNNING_A_SCRIPT.to_string())?;
@@ -4694,7 +4699,14 @@ const BUSY_RUNNING_A_SCRIPT: &str =
 /// the ones in an RDB file: a snapshot without any leaves none.
 pub(crate) fn restore_library_snapshot(payload: Option<&[u8]>) -> Result<(), String> {
     match payload {
-        Some(payload) => restore_function_payload(payload, FunctionRestorePolicy::Flush),
+        // The server made this payload itself, so a decoding failure is in
+        // a library's code, not in the version or checksum.
+        Some(payload) => restore_function_payload(
+            payload,
+            FunctionRestorePolicy::Flush,
+            "a library's code cannot be read: it must be UTF-8 and start with \
+             `#!lua name=<library>`, and two libraries cannot share a name",
+        ),
         None if function_store().read().is_empty() => Ok(()),
         None => {
             lua_vms_renew_for_admin(&[Vm::Functions])

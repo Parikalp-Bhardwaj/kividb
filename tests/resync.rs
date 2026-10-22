@@ -1115,3 +1115,44 @@ fn function_libraries_survive_a_restart_and_reach_a_replica_in_a_full_sync() {
         r.cmd(&["FUNCTION", "LIST"]).arr().is_empty()
     });
 }
+
+/// A Redis `dump.rdb` with function libraries: they are loaded at startup
+/// and from `--preload-file`, and the functions run (#71). The file comes
+/// from Redis 8.10.2: library `seven` with a read-only `seven`, and
+/// `counter` with `incr_by_two` and a read-only `peek`.
+#[cfg(feature = "lua")]
+#[test]
+fn function_libraries_load_from_a_redis_dump_rdb() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/redis-8.10-functions.rdb"
+    );
+
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::copy(fixture, dir.join("dump.rdb")).unwrap();
+    let port = free_port();
+    let server = Server {
+        port,
+        child: kividb(&dir, port, &[]),
+        dir,
+        args: Vec::new(),
+    };
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["FCALL_RO", "seven", "0"]),
+        V::Int(7),
+        "{}",
+        server.log()
+    );
+    assert_eq!(c.cmd(&["FCALL", "incr_by_two", "1", "n"]), V::Int(2));
+    assert_eq!(c.cmd(&["FCALL_RO", "peek", "1", "s"]).s(), "hello");
+
+    let preload = format!("rdb:{fixture}");
+    let preloaded = Server::start(&["--preload-file", &preload]);
+    assert_eq!(
+        preloaded.conn().cmd(&["FCALL_RO", "seven", "0"]),
+        V::Int(7),
+        "{}",
+        preloaded.log()
+    );
+}

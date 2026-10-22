@@ -787,9 +787,10 @@ pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
 
 /// The library names in a `FUNCTION DUMP` payload of KiviDB's own: `KVFN`,
 /// the format version, the number of libraries, then each one's name,
-/// engine, code and function names, length-prefixed, and a checksum. Read
-/// without Lua, so a build without it can say which libraries it leaves out.
-/// `None` for a payload of any other shape.
+/// engine, code and function names, length-prefixed, and a checksum. Or in
+/// Redis's, as a `dump.rdb`'s libraries are handed on. Read without Lua, so
+/// a build without it can say which libraries it leaves out. `None` for a
+/// payload of any other shape.
 #[cfg_attr(feature = "lua", allow(dead_code))]
 fn function_library_names(payload: &[u8]) -> Option<Vec<String>> {
     fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -804,7 +805,9 @@ fn function_library_names(payload: &[u8]) -> Option<Vec<String>> {
         let len = number(rest)?;
         take(rest, len)
     }
-    let mut rest = payload.strip_prefix(b"KVFN")?;
+    let Some(mut rest) = payload.strip_prefix(b"KVFN") else {
+        return redis_function_dump_names(payload);
+    };
     number(&mut rest)?;
     let mut names = Vec::new();
     for _ in 0..number(&mut rest)? {
@@ -816,6 +819,24 @@ fn function_library_names(payload: &[u8]) -> Option<Vec<String>> {
         }
     }
     (rest.len() == 8).then_some(names)
+}
+
+/// The library names in a Redis `FUNCTION DUMP` payload: each library's code
+/// starts `#!lua name=...`. The version and CRC at the end are not read.
+#[cfg_attr(feature = "lua", allow(dead_code))]
+fn redis_function_dump_names(payload: &[u8]) -> Option<Vec<String>> {
+    let mut rest = payload.get(..payload.len().checked_sub(10)?)?;
+    let mut names = Vec::new();
+    while let Some((&0xF5, after)) = rest.split_first() {
+        rest = after;
+        let code = rdb_read_string(&mut rest).ok()?;
+        let first_line = code.split(|&b| b == b'\n').next()?;
+        let name = String::from_utf8_lossy(first_line)
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("name=").map(str::to_string))?;
+        names.push(name);
+    }
+    (rest.is_empty() && !names.is_empty()).then_some(names)
 }
 
 /// The index alias section: `(alias, index)` pairs.
@@ -2202,25 +2223,29 @@ fn too_long() -> io::Error {
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
 pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<String, KiviDBValue>>> {
-    load_redis_rdb_with_expiry(path).map(|(dbs, _)| dbs)
+    load_redis_rdb_with_expiry(path).map(|(dbs, _, _)| dbs)
 }
+
+/// What a Redis RDB file holds: its databases, their keys' expiries, and its
+/// function libraries as a Redis `FUNCTION DUMP` payload, if it has any.
+pub type RedisRdb = (
+    Vec<HashMap<String, KiviDBValue>>,
+    ExpiryMaps,
+    Option<Vec<u8>>,
+);
 
 /// Load a Redis RDB file, keeping each key's expiry.
 ///
 /// [`load_redis_rdb`] parsed the expiry opcodes and threw the value away, so
 /// importing a Redis dump — or full-syncing from a Redis master — made every
 /// expiring key permanent. Keys already past their expiry are dropped.
-pub fn load_redis_rdb_with_expiry(
-    path: &str,
-) -> io::Result<(Vec<HashMap<String, KiviDBValue>>, ExpiryMaps)> {
+pub fn load_redis_rdb_with_expiry(path: &str) -> io::Result<RedisRdb> {
     let file = File::open(path)?;
     load_redis_rdb_from(BufReader::new(file))
 }
 
 /// [`load_redis_rdb_with_expiry`] over any byte source.
-pub fn load_redis_rdb_from(
-    r: impl Read,
-) -> io::Result<(Vec<HashMap<String, KiviDBValue>>, ExpiryMaps)> {
+pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut r = r;
     let now_ms = unix_ms_now();
 
@@ -2249,6 +2274,10 @@ pub fn load_redis_rdb_from(
     // An expiry belongs to the key after it. Redis may write the key's idle
     // time or access frequency in between, so it waits here for the key.
     let mut pending_expiry: Option<u64> = None;
+    // The search module's data is skipped with one warning per file.
+    let mut warned_search = false;
+    // Each function library's code, in the order the file has them.
+    let mut libraries = Vec::new();
 
     loop {
         let mut type_byte = [0u8];
@@ -2311,6 +2340,21 @@ pub fn load_redis_rdb_from(
                     let _ = rdb_read_length(&mut r)?;
                 }
             }
+            0xF7 => rdb_skip_module_aux(&mut r, &mut warned_search)?,
+            // A function library (`FUNCTION2`): its code.
+            0xF5 => libraries.push(rdb_read_string(&mut r)?),
+            // Every other opcode from 0xF0 up is refused by what it is, not
+            // read as a key's type.
+            opcode @ 0xF0..=0xF6 => {
+                return Err(rdb_invalid(match opcode {
+                    0xF2 => "hash templates (opcode 0xF2) are not supported".to_string(),
+                    0xF3 => "module key metadata (opcode 0xF3) is not supported".to_string(),
+                    0xF6 => "function libraries in Redis 7.0's pre-release format \
+                             (opcode 0xF6) are not supported"
+                        .to_string(),
+                    other => format!("unknown opcode {other:#04x}"),
+                }));
+            }
             type_id => {
                 // A key: type byte already consumed
                 let key_bytes = rdb_read_string(&mut r)?;
@@ -2336,7 +2380,45 @@ pub fn load_redis_rdb_from(
         }
     }
 
-    Ok((result, expiries))
+    Ok((result, expiries, redis_function_dump(&libraries)))
+}
+
+/// Function libraries' code as Redis's `FUNCTION DUMP` lays it out: the
+/// `FUNCTION2` opcode and an RDB string for each, then an RDB version and a
+/// CRC64. That is what `FUNCTION RESTORE` takes from Redis, so the server
+/// loads a file's libraries the same way. `None` when there are none.
+fn redis_function_dump(libraries: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if libraries.is_empty() {
+        return None;
+    }
+    let mut payload = Vec::new();
+    for code in libraries {
+        payload.push(0xF5);
+        rdb_write_length(&mut payload, code.len());
+        payload.extend_from_slice(code);
+    }
+    payload.extend_from_slice(&REDIS_DUMP_VERSION_MAX.to_le_bytes());
+    let crc = redis_crc64(&payload);
+    payload.extend_from_slice(&crc.to_le_bytes());
+    Some(payload)
+}
+
+/// A length as an RDB writes one (`rdbSaveLen`).
+fn rdb_write_length(out: &mut Vec<u8>, len: usize) {
+    match len {
+        0..=0x3F => out.push(len as u8),
+        0x40..=0x3FFF => out.extend_from_slice(&[0x40 | (len >> 8) as u8, len as u8]),
+        _ => match u32::try_from(len) {
+            Ok(len) => {
+                out.push(0x80);
+                out.extend_from_slice(&len.to_be_bytes());
+            }
+            Err(_) => {
+                out.push(0x81);
+                out.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        },
+    }
 }
 
 fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBValue>> {
@@ -2962,19 +3044,7 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
             "values of module type {name} are not supported"
         )));
     }
-    let mut strings = Vec::new();
-    loop {
-        match rdb_read_plain_length(r)? {
-            0 => break,
-            1 | 2 => {
-                rdb_read_plain_length(r)?;
-            }
-            3 => r.read_exact(&mut [0u8; 4])?,
-            4 => r.read_exact(&mut [0u8; 8])?,
-            5 => strings.push(rdb_read_string(r)?),
-            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
-        }
-    }
+    let strings = rdb_read_module_strings(r)?;
     let [document] = strings.as_slice() else {
         return Err(rdb_invalid("a RedisJSON value is not one string"));
     };
@@ -2984,6 +3054,57 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
         serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
     };
     Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
+}
+
+/// What a module saved, each piece announced by its kind
+/// (`RDB_MODULE_OPCODE_*`), up to the end marker. Only the strings are kept.
+fn rdb_read_module_strings(r: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
+    let mut strings = Vec::new();
+    loop {
+        match rdb_read_plain_length(r)? {
+            0 => return Ok(strings),
+            1 | 2 => {
+                rdb_read_plain_length(r)?;
+            }
+            3 => r.read_exact(&mut [0u8; 4])?,
+            4 => r.read_exact(&mut [0u8; 8])?,
+            5 => strings.push(rdb_read_string(r)?),
+            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
+        }
+    }
+}
+
+/// A module's own data (`MODULE_AUX`): the module ID, when it was saved
+/// (before or after the keys), then what the module saved.
+///
+/// The search module's, its index definitions (`ft_index0`) and dictionaries
+/// (`scdtype00`), is read past, with a warning the first time it holds any.
+/// KiviDB keeps indexes of its own, and `FT.CREATE` indexes the keys already
+/// there. Any
+/// other module's is refused by its name, as Redis refuses aux data of a
+/// module it has not loaded.
+fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
+    let (name, _) = module_type_name(rdb_read_plain_length(r)?);
+    if name != "ft_index0" && name != "scdtype00" {
+        return Err(rdb_invalid(format!(
+            "data of module type {name} (opcode 0xF7) is not supported"
+        )));
+    }
+    // `when_opcode` is always an unsigned integer's, as in Redis.
+    if rdb_read_plain_length(r)? != 2 {
+        return Err(rdb_invalid("module aux data: bad when_opcode"));
+    }
+    rdb_read_plain_length(r)?;
+    // Redis Stack writes it with nothing in it: a count of 0 and no names.
+    let names = rdb_read_module_strings(r)?;
+    if !names.is_empty() && !*warned {
+        log_warn!(
+            "RDB: the search module's index definitions and dictionaries are not loaded; \
+             run FT.CREATE and FT.DICTADD again to make them"
+        );
+        *warned = true;
+    }
+    Ok(())
 }
 
 /// A CBOR document (RFC 8949) as JSON: what RedisJSON 2.8+ saves. Only what
@@ -4692,6 +4813,30 @@ mod function_section_tests {
             Some(vec!["mylib".to_string(), "other".to_string()])
         );
         assert_eq!(function_library_names(b"KVFN payload"), None);
+
+        // Redis's own layout, as a `dump.rdb`'s libraries are handed on: the
+        // names are on each library's first line.
+        let redis = redis_function_dump(&[
+            b"#!lua name=seven\nredis.register_function('seven', ...)".to_vec(),
+            b"#!lua name=counter\n...".to_vec(),
+        ])
+        .unwrap();
+        assert_eq!(
+            function_library_names(&redis),
+            Some(vec!["seven".to_string(), "counter".to_string()])
+        );
+    }
+
+    /// Lengths as `rdbSaveLen` writes them, at each form's edges, read back
+    /// as the reader reads them.
+    #[test]
+    fn rdb_lengths_round_trip_at_each_forms_edges() {
+        for len in [0, 0x3F, 0x40, 0x3FFF, 0x4000, 0xFFFF_FFFF, 0x1_0000_0000] {
+            let mut out = Vec::new();
+            rdb_write_length(&mut out, len);
+            let (read, encoded) = rdb_read_length(&mut &out[..]).unwrap();
+            assert_eq!((read, encoded), (len as u64, false), "{len:#x}");
+        }
     }
 
     /// A build without Lua loads such an image, and leaves the libraries out.

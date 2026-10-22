@@ -1414,7 +1414,10 @@ pub fn recover_local(
     } else if rdb_path.exists() {
         log_info!("Found dump.rdb — loading Redis RDB snapshot");
         match crate::snapshot::load_redis_rdb_with_expiry("dump.rdb") {
-            Ok((dbs, expiries)) if !dbs.is_empty() => {
+            Ok((dbs, expiries, functions)) if !dbs.is_empty() => {
+                if let Err(e) = crate::snapshot::restore_functions(functions) {
+                    fatal_persistence(&format!("dump.rdb cannot be loaded: {e}"));
+                }
                 let total = crate::snapshot::restore_into_store(dbs, store);
                 let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
                 log_info!("Loaded {total} keys from snapshot ({with_ttl} with a TTL)");
@@ -1569,7 +1572,8 @@ fn preload(
         .is_ok_and(|magic| &magic == b"REDIS");
     let mut index_names = Vec::new();
     let keys = if is_redis_rdb {
-        let (dbs, expiries) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
+        let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
+        crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
         keys
