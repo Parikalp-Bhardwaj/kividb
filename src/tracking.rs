@@ -51,6 +51,9 @@ pub struct TrackingTableInner {
     has_pending: std::sync::atomic::AtomicBool,
     /// `tracking-table-max-keys`: zero for no limit.
     max_keys: AtomicUsize,
+    /// The server's users, for what a `BCAST` client may be told of (see
+    /// [`readable`]). Unset, every key is told.
+    acl: std::sync::OnceLock<crate::acl::AclStore>,
 }
 
 impl Default for TrackingTableInner {
@@ -71,6 +74,7 @@ impl TrackingTableInner {
             pending: parking_lot::Mutex::new(Vec::new()),
             has_pending: std::sync::atomic::AtomicBool::new(false),
             max_keys: AtomicUsize::new(1_000_000),
+            acl: std::sync::OnceLock::new(),
         }
     }
 
@@ -394,10 +398,44 @@ pub fn tell_dropped(registry: &Registry, dropped: Vec<Dropped>, current: Option<
 /// Send the `BCAST` clients what has been noted for them.
 pub fn flush_pending(table: &TrackingTableInner, registry: &Registry, current: Option<u64>) {
     for pending in table.take_pending() {
-        let keys: Vec<&str> = pending.keys.iter().map(String::as_str).collect();
+        let keys = readable(table, registry, pending.client, &pending.keys);
+        if keys.is_empty() {
+            continue;
+        }
         // `NOLOOP` was applied when the keys were noted.
         tell(registry, pending.client, Some(&keys), None, current);
     }
+}
+
+/// The keys of `keys` that `client`'s user may read. A `BCAST` client is
+/// told only of those, as in Redis 8.10: of the keys its prefixes match, the
+/// ones its user is let read, by the user it is now. (They are told when the
+/// command that wrote them is over, so a client that authenticates again is
+/// told of what was written before under the user it was.)
+fn readable<'k>(
+    table: &TrackingTableInner,
+    registry: &Registry,
+    client: u64,
+    keys: &'k [String],
+) -> Vec<&'k str> {
+    let all = || keys.iter().map(String::as_str).collect();
+    let Some(acl) = table.acl.get() else {
+        return all();
+    };
+    let Some(name) = registry.get(client).map(|info| info.user) else {
+        return all();
+    };
+    let users = acl.read();
+    let Some(user) = users.get(&name) else {
+        return all();
+    };
+    if user.all_keys() {
+        return all();
+    }
+    keys.iter()
+        .filter(|key| crate::acl::may_read_key(user, key))
+        .map(String::as_str)
+        .collect()
 }
 
 /// The keyspace was flushed: every tracking client is told that everything
@@ -454,7 +492,13 @@ fn store_id(store: &crate::store::Store) -> usize {
 }
 
 /// Make `table` and `registry` the ones that hear of `store`'s keys expiring.
-pub fn register_for(store: &crate::store::Store, table: &TrackingTable, registry: &Registry) {
+pub fn register_for(
+    store: &crate::store::Store,
+    table: &TrackingTable,
+    registry: &Registry,
+    acl: &crate::acl::AclStore,
+) {
+    let _ = table.acl.set(std::sync::Arc::clone(acl));
     let id = store_id(store);
     let mut servers = SERVERS.write();
     servers.retain(|(known, table, _)| *known != id && table.strong_count() > 0);

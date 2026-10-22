@@ -1257,3 +1257,155 @@ fn a_quick_function_that_turns_endless_does_not_stop_the_server() {
     c.cmds(&["CONFIG", "SET", "lua-time-limit", "5000"]);
     c.cmds(&["FUNCTION", "DELETE", "turnslib"]);
 }
+
+// ── error(): tables, the reply's tail, and acl_check_cmd's arity ─────────────
+
+/// As Redis 8.10: `error()` given a table is reported by its `err` (or
+/// `ERR unknown error`), not as `table: 0x…`, and every script error ends
+/// with the script and the place.
+#[test]
+fn test_error_with_a_table_is_its_err() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let script = "error('simple string error')";
+    let sha = c.cmds(&["SCRIPT", "LOAD", script]).as_str().to_string();
+    let r = c.cmds(&["EVAL", script, "0"]);
+    assert_eq!(
+        r.as_error(),
+        format!("ERR user_script:1: simple string error script: {sha}, on @user_script:1.")
+    );
+
+    let r = c.cmds(&["EVAL", "error({err='ERR table error'})", "0"]);
+    assert!(
+        r.as_error().starts_with("ERR table error script: "),
+        "{r:?}"
+    );
+    assert!(r.as_error().ends_with(", on @user_script:1."), "{r:?}");
+
+    let r = c.cmds(&["EVAL", "error({})", "0"]);
+    assert!(
+        r.as_error().starts_with("ERR unknown error script: "),
+        "{r:?}"
+    );
+
+    // The line it was raised on.
+    let r = c.cmds(&["EVAL", "local a = 1\nerror({err='ERR second'})", "0"]);
+    assert!(r.as_error().ends_with(", on @user_script:2."), "{r:?}");
+
+    // A line break in the message is a space, and cannot start a reply.
+    let r = c.cmds(&[
+        "EVAL",
+        "error(redis.error_reply(\"X\\r\\n+INJECTED\"))",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR X  +INJECTED"), "{r:?}");
+    assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
+
+    // pcall still sees the table itself.
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(error, {err='ERR caught'}); return e.err",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "ERR caught");
+}
+
+/// `redis.error_reply` gives a message without a code the code `ERR`, as
+/// Redis does, and keeps one that has a code.
+#[test]
+fn test_error_reply_without_a_code_is_err() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let r = c.cmds(&["EVAL", "return redis.error_reply('X')", "0"]);
+    assert_eq!(r.as_error(), "ERR X");
+    let r = c.cmds(&[
+        "EVAL",
+        "return redis.error_reply('MY_CODE custom msg')",
+        "0",
+    ]);
+    assert_eq!(r.as_error(), "MY_CODE custom msg");
+    let r = c.cmds(&[
+        "EVAL",
+        "return redis.error_reply('-MY_CODE custom msg')",
+        "0",
+    ]);
+    assert_eq!(r.as_error(), "MY_CODE custom msg");
+}
+
+/// `redis.acl_check_cmd` refuses a command with the wrong number of
+/// arguments, as Redis does, instead of answering for it.
+#[test]
+fn test_acl_check_cmd_checks_the_arity() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let r = c.cmds(&["EVAL", "return redis.acl_check_cmd('eval', 'script')", "0"]);
+    assert!(r.as_error().contains("Wrong number of args"), "{r:?}");
+    let r = c.cmds(&["EVAL", "return redis.acl_check_cmd('set', 'x', '1')", "0"]);
+    assert_eq!(r.as_int(), 1);
+}
+
+/// A FUNCTION LOAD leaves the chunk it ran behind as garbage. As in Redis
+/// the collector is stepped as functions are loaded, so loading many keeps
+/// `used_memory_vm_functions` near what they hold.
+#[test]
+fn test_function_loads_are_collected() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["FUNCTION", "FLUSH"]);
+
+    let n = 50_000;
+    for i in 0..n {
+        let body = format!(
+            "#!lua name=gc{i}\nredis.register_function('gc{i}', function(KEYS, ARGV)\n --xxxxxxxxxx\nreturn {i:06} \nend)"
+        );
+        let r = c.cmds(&["FUNCTION", "LOAD", &body]);
+        assert!(!r.is_error(), "{r:?}");
+    }
+    let info = c.cmds(&["INFO", "memory"]);
+    let bytes: u64 = info
+        .as_str()
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory_vm_functions:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    eprintln!("used_memory_vm_functions after {n} loads: {bytes}");
+    // Redis 8.10's suite allows 14,500,000 for this.
+    assert!(bytes < 14_500_000, "{bytes}");
+}
+
+/// What a script runs counts as its client's (`tot-cmds`), as in Redis:
+/// `EVAL` and its `redis.call('ping')` are two.
+#[test]
+fn test_a_script_s_commands_count_as_its_client_s() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let tot_cmds = |info: &RespValue| -> i64 {
+        info.as_str()
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("tot-cmds="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let before = tot_cmds(&c.cmds(&["CLIENT", "INFO"]));
+    c.cmds(&["EVAL", "redis.call('ping')", "0"]);
+    let after = tot_cmds(&c.cmds(&["CLIENT", "INFO"]));
+    // The first CLIENT INFO, EVAL and PING; not the second CLIENT INFO.
+    assert_eq!(after - before, 3);
+}

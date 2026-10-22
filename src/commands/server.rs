@@ -146,7 +146,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ("backupdirname", ctx.config.backupdirname.clone()),
         (
             "backup-sealed-ttl",
-            ctx.config.backup_sealed_ttl.to_string(),
+            crate::commands::backup::sealed_ttl(ctx.config).to_string(),
         ),
         ("preload-file", ctx.config.preload_file.clone()),
         (
@@ -167,10 +167,101 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .to_string(),
         ),
+        (
+            "array-slice-size",
+            crate::types::ARRAY_SLICE_SIZE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "array-sparse-kmax",
+            crate::types::ARRAY_SPARSE_KMAX
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
+        (
+            "array-sparse-kmin",
+            crate::types::ARRAY_SPARSE_KMIN
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        ),
     ]
 }
 
+/// `CONFIG SET` of the array settings, as Redis checks them: the slice size
+/// a power of two from 256 to 65536; `kmax` and `kmin` from 0 to 256, `kmin`
+/// below `kmax` unless `kmax` is 0 (sparse slices off).
+fn config_set_array(param: &str, value: &str) -> Vec<u8> {
+    use crate::types::{ARRAY_SLICE_SIZE, ARRAY_SPARSE_KMAX, ARRAY_SPARSE_KMIN};
+    use std::sync::atomic::Ordering::Relaxed;
+    let failed = |why: &str| {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+        ))
+    };
+    let (min, max) = if param == "array-slice-size" {
+        (256, 65536)
+    } else {
+        (0, 256)
+    };
+    let Some(v) = value
+        .parse::<u32>()
+        .ok()
+        .filter(|v| (min..=max).contains(v))
+    else {
+        return failed(&format!(
+            "argument must be between {min} and {max} inclusive"
+        ));
+    };
+    match param {
+        "array-slice-size" if !v.is_power_of_two() => {
+            return failed("array-slice-size must be a power of two");
+        }
+        "array-slice-size" => ARRAY_SLICE_SIZE.store(v, Relaxed),
+        "array-sparse-kmax" if v != 0 && v <= ARRAY_SPARSE_KMIN.load(Relaxed) => {
+            return failed(
+                "array-sparse-kmax must be greater than array-sparse-kmin when non-zero",
+            );
+        }
+        "array-sparse-kmax" => ARRAY_SPARSE_KMAX.store(v, Relaxed),
+        _ => {
+            let kmax = ARRAY_SPARSE_KMAX.load(Relaxed);
+            if kmax != 0 && v >= kmax {
+                return failed("array-sparse-kmin must be less than array-sparse-kmax");
+            }
+            ARRAY_SPARSE_KMIN.store(v, Relaxed);
+        }
+    }
+    resp_simple("OK")
+}
+
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
+
+/// A setting's own name, for one Redis also takes under an older one.
+fn config_name(name: &str) -> &str {
+    match name {
+        "cluster-slave-no-failover" => "cluster-replica-no-failover",
+        "slave-lazy-flush" => "replica-lazy-flush",
+        "slave-serve-stale-data" => "replica-serve-stale-data",
+        "slave-read-only" => "replica-read-only",
+        "slave-ignore-maxmemory" => "replica-ignore-maxmemory",
+        "slave-announce-ip" => "replica-announce-ip",
+        "cluster-slave-validity-factor" => "cluster-replica-validity-factor",
+        "list-max-ziplist-size" => "list-max-listpack-size",
+        "slave-priority" => "replica-priority",
+        "slave-announce-port" => "replica-announce-port",
+        "repl-ping-slave-period" => "repl-ping-replica-period",
+        "min-slaves-to-write" => "min-replicas-to-write",
+        "min-slaves-max-lag" => "min-replicas-max-lag",
+        "lua-time-limit" => "busy-reply-threshold",
+        "hash-max-ziplist-entries" => "hash-max-listpack-entries",
+        "zset-max-ziplist-entries" => "zset-max-listpack-entries",
+        "hash-max-ziplist-value" => "hash-max-listpack-value",
+        "zset-max-ziplist-value" => "zset-max-listpack-value",
+        "slaveof" => "replicaof",
+        other => other,
+    }
+}
 
 /// `CONFIG SET` of one setting.
 fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
@@ -186,6 +277,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
+                Some(config_set_array(&param, value))
+            }
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES
@@ -636,6 +730,19 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     )),
                 }
             }
+            // Seconds; 0, the default, is off.
+            "backup-sealed-ttl" => match value.parse::<i64>() {
+                Ok(n) if n >= 0 => {
+                    crate::commands::backup::set_sealed_ttl(n as u64);
+                    Some(resp_simple("OK"))
+                }
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -2289,6 +2396,61 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// `INFO keysizes` for database `db`: for strings, lists, sets, sorted sets
+/// and hashes, how many keys have a length (bytes, or items) in each
+/// power-of-two bin, as Redis 8.10 writes it:
+/// `db0_distrib_lists_items:1=2,4=1` (one to one, two or three; four to
+/// seven). Nothing for a type with no keys.
+fn keysizes(db: usize, shards: &crate::store::Db) -> String {
+    const TYPES: [&str; 5] = [
+        "distrib_strings_sizes",
+        "distrib_lists_items",
+        "distrib_sets_items",
+        "distrib_zsets_items",
+        "distrib_hashes_items",
+    ];
+    // Bin 0 is the empty, bin n holds 2^(n-1) to 2^n - 1.
+    let mut bins = [[0u64; 65]; 5];
+    for shard in shards.iter() {
+        for value in read_lock!(shard).values() {
+            let (kind, len) = match value {
+                crate::types::KiviDBValue::String(b) => (0, b.len()),
+                crate::types::KiviDBValue::List(l) => (1, l.read().len()),
+                crate::types::KiviDBValue::Set(s) => (2, s.read().len()),
+                crate::types::KiviDBValue::SortedSet(z) => (3, z.read().len()),
+                crate::types::KiviDBValue::Hash(h) => (4, h.read().len()),
+                crate::types::KiviDBValue::HashEx(h) => (4, h.read().len()),
+                _ => continue,
+            };
+            let bin = (usize::BITS - len.leading_zeros()) as usize;
+            bins[kind][bin] += 1;
+        }
+    }
+    let mut out = String::new();
+    for (kind, name) in TYPES.iter().enumerate() {
+        let counts: Vec<String> = bins[kind]
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(bin, n)| format!("{}={n}", keysizes_label(bin)))
+            .collect();
+        if !counts.is_empty() {
+            out.push_str(&format!("db{db}_{name}:{}\r\n", counts.join(",")));
+        }
+    }
+    out
+}
+
+/// The label of a `keysizes` bin: its least length, in 1024s past 1023.
+fn keysizes_label(bin: usize) -> String {
+    if bin == 0 {
+        return "0".into();
+    }
+    let least = bin - 1;
+    let suffix = ["", "K", "M", "G", "T", "P", "E"][least / 10];
+    format!("{}{suffix}", 1u64 << (least % 10))
+}
+
 /// Given a command invocation (cmd[0] = command name, cmd[1..] = args),
 /// return RESP-encoded key entries. Each entry is either a bulk string (GETKEYS)
 /// or a 2-element array [key, [flags...]] (GETKEYSANDFLAGS).
@@ -2745,8 +2907,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut out = String::new();
 
+            // `keysizes` is in Redis's default INFO, kept as keys change. Here
+            // it is counted when asked for, a pass over every key: not in the
+            // default, which monitoring asks for every few seconds.
             let want = |s: &str| {
-                all || asked(s) || (default && !matches!(s, "commandstats" | "latencystats"))
+                all || asked(s)
+                    || (default && !matches!(s, "commandstats" | "latencystats" | "keysizes"))
             };
 
             if want("server") {
@@ -2853,6 +3019,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             i, keys, expires, avg_ttl
                         ));
                     }
+                }
+                out.push_str("\r\n");
+            }
+
+            if want("keysizes") {
+                out.push_str("# Keysizes\r\n");
+                for (i, db) in ctx.store.iter().enumerate() {
+                    out.push_str(&keysizes(i, db));
                 }
                 out.push_str("\r\n");
             }
@@ -3436,10 +3610,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // not to be moved back, so it is moved only once the
                     // others are set.
                     settings.sort_by_key(|(name, _)| name == "port");
-                    if let Some((_, (twice, _))) = settings
-                        .iter()
-                        .enumerate()
-                        .find(|(i, (name, _))| settings[..*i].iter().any(|(seen, _)| seen == name))
+                    if let Some((_, (twice, _))) =
+                        settings.iter().enumerate().find(|(i, (name, _))| {
+                            settings[..*i]
+                                .iter()
+                                .any(|(seen, _)| config_name(seen) == config_name(name))
+                        })
                     {
                         return Some(resp_error(&format!(
                             "ERR CONFIG SET failed (possibly related to argument '{twice}') -                              duplicate parameter"

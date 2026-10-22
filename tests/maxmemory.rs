@@ -284,3 +284,30 @@ fn test_maxmemory_always_allowed_commands() {
 
     c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
 }
+
+/// Past `maxmemory` under `noeviction`, a new subscription is refused as a
+/// write is, as in Redis 8.10; taking one away is not.
+#[test]
+fn test_maxmemory_refuses_new_subscriptions() {
+    let _lock = lock();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(1100));
+
+    for cmd in ["SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE"] {
+        let r = c.cmds(&[cmd, "news"]);
+        assert!(
+            r.is_error() && r.error_str().contains("OOM command not allowed"),
+            "{cmd}: {r:?}"
+        );
+    }
+    let r = c.cmds(&["UNSUBSCRIBE", "news"]);
+    assert!(!r.is_error(), "UNSUBSCRIBE: {r:?}");
+    c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
+}

@@ -1698,14 +1698,16 @@ fn test_redis_crc64_is_redis_crc64() {
 }
 
 // A Redis payload is taken only whole and from an RDB version this reads:
-// one that fails its checksum, comes from a newer version than Redis 8.10's,
-// or holds a type the loader does not know is refused, as Redis refuses it.
+// one that fails its checksum or comes from a newer version than Redis
+// 8.10's is refused as Redis refuses it; one sealed right that holds a type
+// the loader does not know, or more than one value, is `Bad data format`.
 #[test]
 fn test_restore_refuses_redis_payloads_it_cannot_read() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
     const REFUSED: &str = "ERR DUMP payload version or checksum are wrong";
+    const BAD_DATA: &str = "ERR Bad data format";
 
     let fixture = redis_dump_fixtures()
         .into_iter()
@@ -1718,14 +1720,15 @@ fn test_restore_refuses_redis_payloads_it_cannot_read() {
         body.extend_from_slice(&crc.to_le_bytes());
         body
     };
-    let refused = |c: &mut Conn, key: &str, payload: &[u8]| {
+    let refused_with = |c: &mut Conn, key: &str, payload: &[u8], error: &str| {
         let reply = c.cmd(&[b"RESTORE", key.as_bytes(), b"0", payload]);
         assert!(
-            matches!(&reply, RespValue::Error(e) if e == REFUSED),
-            "{key}: expected a refusal, got {reply:?}"
+            matches!(&reply, RespValue::Error(e) if e == error),
+            "{key}: expected {error}, got {reply:?}"
         );
         assert!(c.cmds(&["EXISTS", key]).as_int() == 0, "{key} was created");
     };
+    let refused = |c: &mut Conn, key: &str, payload: &[u8]| refused_with(c, key, payload, REFUSED);
 
     let mut corrupt = good.clone();
     corrupt[3] ^= 0x20;
@@ -1738,13 +1741,13 @@ fn test_restore_refuses_redis_payloads_it_cannot_read() {
 
     let mut unknown_type = good[..good.len() - 8].to_vec();
     unknown_type[0] = 200;
-    refused(&mut c, "unknown-type", &resealed(unknown_type));
+    refused_with(&mut c, "unknown-type", &resealed(unknown_type), BAD_DATA);
 
     // Bytes left over after the value: not one value.
     let mut trailing = good[..good.len() - 10].to_vec();
     trailing.push(0);
     trailing.extend_from_slice(&15u16.to_le_bytes());
-    refused(&mut c, "trailing", &resealed(trailing));
+    refused_with(&mut c, "trailing", &resealed(trailing), BAD_DATA);
 
     // The payload itself, for contrast.
     assert!(c.cmd(&[b"RESTORE", b"good", b"0", &good]).is_ok());
@@ -1978,4 +1981,44 @@ fn test_restore_estimates_entries_read_for_a_stream_from_redis_5() {
     assert_eq!(group("g1")["lag"], "1");
     assert_eq!(group("g2")["entries-read"], "0");
     assert_eq!(group("g2")["lag"], "2");
+}
+
+/// A payload whose string claims a length near 2^64 is refused as Redis
+/// refuses it, `Bad data format`, and the server stays up. Room for the
+/// claimed length used to be made at once, and the process aborted — with a
+/// checksum that matched, since anyone can compute one, as with none: a zero
+/// checksum is none, as Redis writes with checksums off (the Redis suite's
+/// "RESTORE fail with invalid payload size").
+#[test]
+fn test_restore_of_a_huge_claimed_length_is_bad_data_not_a_crash() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // String type, a 64-bit length of 2^64 - 9, no data, RDB version 12.
+    let mut sealed = b"\x00\x81\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xF7\x0c\x00".to_vec();
+    let crc = kividb::snapshot::redis_crc64(&sealed);
+    sealed.extend_from_slice(&crc.to_le_bytes());
+    let mut unsealed = b"\x00\x81\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xF7\x0c\x00".to_vec();
+    unsealed.extend_from_slice(&[0u8; 8]);
+    // An LZF string whose claimed original length is far past what LZF makes.
+    let mut lzf = b"\xC3\x01\x81\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xF7\x00\x0c\x00".to_vec();
+    lzf.extend_from_slice(&[0u8; 8]);
+    for payload in [&sealed, &unsealed, &lzf] {
+        let reply = c.cmd(&[b"RESTORE", b"huge", b"0", payload]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == "ERR Bad data format"),
+            "{reply:?}"
+        );
+    }
+    assert!(c.cmds(&["PING"]).is_ok() || c.cmds(&["PING"]).as_str() == "PONG");
+
+    // A wrong checksum is still that.
+    let mut wrong = b"\x00\x01a\x0c\x00".to_vec();
+    wrong.extend_from_slice(&[1u8; 8]);
+    let reply = c.cmd(&[b"RESTORE", b"k", b"0", &wrong]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR DUMP payload version or checksum are wrong"),
+        "{reply:?}"
+    );
 }

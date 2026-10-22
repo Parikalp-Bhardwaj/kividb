@@ -800,11 +800,12 @@ class TestLatencyGraph:
                 pytest.skip("No latency events recorded")
             event_name = latest[0][0]
             graph = r.execute_command("LATENCY", "GRAPH", event_name)
-            # Sparkline uses Unicode block characters ▁▂▃▄▅▆▇█
-            sparkline_chars = set("▁▂▃▄▅▆▇█")
-            assert any(c in sparkline_chars for c in graph), (
-                f"Graph output contains no sparkline characters: {repr(graph)}"
-            )
+            # Redis's graph: a header with the high and the low, a rule of
+            # 80 dashes, and an ASCII sparkline of _ o # and |.
+            lines = graph.split("\n")
+            assert lines[0].startswith(f"{event_name} - high "), repr(graph)
+            assert lines[1] == "-" * 80, repr(graph)
+            assert any(c in set("_o#|") for c in graph), repr(graph)
         finally:
             r.close()
             proc.terminate()

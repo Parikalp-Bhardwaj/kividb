@@ -887,8 +887,12 @@ pub async fn handle_client(
                 quit_requested = true;
                 break;
             }
-            // For `CLIENT LIST`'s `cmd=` and `db=`.
-            activity.record(&cmd, selected_db);
+            // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
+            // for a blocked command dispatched once more with what it waited
+            // for: it is one command.
+            if !blocking_slot.resuming() {
+                activity.record(&cmd, selected_db);
+            }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             reply_gate.settle(&mut out_buf);
@@ -919,14 +923,12 @@ pub async fn handle_client(
             // Must be done here, not in execute_command, because std::thread::sleep
             // inside a tokio task blocks the worker thread and prevents UNPAUSE
             // from being processed on another connection.
-            if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0
-                && crate::pause::holds(&cmd, &tx.queue)
-            {
-                let _held = crate::pause::Held::new();
-                while crate::pause::holds(&cmd, &tx.queue) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
-            }
+            let _ran =
+                if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    crate::pause::gate(&cmd, &tx.queue, client_id).await
+                } else {
+                    None
+                };
             // ══════════════════════════════════════════════════════════════
             // FAST PATH — zero heap allocations, zero string comparisons
             // for the common case: authenticated, no active transaction,

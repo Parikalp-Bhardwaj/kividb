@@ -170,6 +170,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'acl|setuser' command",
                 ));
             }
+            // What tracking clients are still to be told of (the writes before
+            // this in a transaction) is told under the permissions they had,
+            // before this changes them, as Redis does: a BCAST client is told
+            // only of keys its user may read.
+            crate::tracking::flush_pending(
+                ctx.tracking_table,
+                ctx.client_registry,
+                Some(ctx.client_id),
+            );
             let username = match std::str::from_utf8(cmd[2]) {
                 Ok(s) => s.to_string(),
                 Err(_) => return Some(resp_error("ERR invalid username")),

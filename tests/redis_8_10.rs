@@ -3447,3 +3447,141 @@ fn client_info_counts_a_connections_traffic() {
     );
     assert!(field(&after, "tot-net-out") - field(&before, "tot-net-out") > 300);
 }
+
+/// `tot-cmds` counts a command once it has run, as Redis does: a `CLIENT
+/// INFO` does not count itself, and a blocked `BLPOP` counts when it is
+/// answered, not while it waits (8.10's unit/introspection).
+#[test]
+fn client_info_counts_a_command_once_it_has_run() {
+    let mut c = conn();
+    let tot_cmds = |list: &str, id: i64| -> i64 {
+        list.lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap_or_else(|| panic!("client {id} in {list}"))
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("tot-cmds="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut rd = conn();
+    let id = rd.cmd(&["CLIENT", "ID"]).i();
+    c.cmd(&["DEL", "tot_cmds_list"]);
+    let before = tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id);
+    rd.send(&["BLPOP", "tot_cmds_list", "0"]);
+    wait_until("the BLPOP to block", || {
+        c.cmd(&["CLIENT", "LIST"])
+            .s()
+            .lines()
+            .any(|l| l.starts_with(&format!("id={id} ")) && l.contains(" cmd=blpop "))
+    });
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id), before);
+    c.cmd(&["LPUSH", "tot_cmds_list", "a"]);
+    rd.read();
+    wait_until("the BLPOP to count", || {
+        tot_cmds(c.cmd(&["CLIENT", "LIST"]).s(), id) == before + 1
+    });
+}
+
+/// `COMMAND GETKEYSANDFLAGS` knows the commands Redis 8.10 added (the key
+/// specs are made from 8.10.2's), as unit/introspection-2 checks.
+#[test]
+fn getkeysandflags_knows_the_8_10_commands() {
+    let mut c = conn();
+    let flags = |c: &mut Conn, args: &[&str]| -> Vec<(String, String)> {
+        let mut full = vec!["COMMAND", "GETKEYSANDFLAGS"];
+        full.extend_from_slice(args);
+        c.cmd(&full)
+            .arr()
+            .iter()
+            .map(|key| {
+                let pair = key.arr();
+                (pair[0].s().to_string(), pair[1].strings().join(" "))
+            })
+            .collect()
+    };
+    let one = |key: &str, flags: &str| vec![(key.to_string(), flags.to_string())];
+    assert_eq!(flags(&mut c, &["delex", "k1"]), one("k1", "RM delete"));
+    assert_eq!(
+        flags(&mut c, &["pfmerge", "dest"]),
+        one("dest", "RW access insert")
+    );
+    assert_eq!(flags(&mut c, &["pfmerge", "dest", "src"]).len(), 2);
+    assert_eq!(
+        flags(&mut c, &["delex", "k1", "ifeq", "v1"]),
+        one("k1", "RW delete")
+    );
+    assert_eq!(
+        flags(&mut c, &["set", "k1", "v1", "IFEQ", "v1"]),
+        one("k1", "RW update")
+    );
+    assert_eq!(
+        flags(&mut c, &["msetex", "2", "k1", "v1", "k2", "v2", "ex", "10"]),
+        [
+            ("k1".to_string(), "OW update".to_string()),
+            ("k2".to_string(), "OW update".to_string())
+        ]
+    );
+    for args in [
+        &["digest", "k1"][..],
+        &["increx", "k1"],
+        &["sdiffcard", "1", "k1"],
+        &["arlen", "k1"],
+    ] {
+        let got = flags(&mut c, args);
+        assert_eq!(got.len(), 1, "{args:?}: {got:?}");
+        assert_eq!(got[0].0, "k1", "{args:?}");
+    }
+}
+
+/// `INFO keysizes` (Redis 8.10): per database and type, how many keys have a
+/// length in each power-of-two bin. Database 13, which no other test here
+/// uses. Not in the default INFO.
+#[test]
+fn info_keysizes_bins_keys_by_length() {
+    let mut c = conn();
+    assert!(c.cmd(&["SELECT", "13"]).ok());
+    c.cmd(&["FLUSHDB"]);
+    let line = |c: &mut Conn, field: &str| -> String {
+        let info = c.cmd(&["INFO", "keysizes"]).s().to_string();
+        assert!(info.starts_with("# Keysizes\r\n"), "{info}");
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("db13_{field}:")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    // The i'th bin holds 2^i to 2^(i+1) - 1.
+    for (len, bin) in [
+        (1, "1"),
+        (2, "2"),
+        (3, "2"),
+        (4, "4"),
+        (7, "4"),
+        (8, "8"),
+        (10, "8"),
+    ] {
+        c.cmd(&["SET", "mykey", &"x".repeat(len)]);
+        assert_eq!(
+            line(&mut c, "distrib_strings_sizes"),
+            format!("{bin}=1"),
+            "{len}"
+        );
+    }
+    c.cmd(&["SET", "big", &"x".repeat(2048)]);
+    c.cmd(&["SET", "empty", ""]);
+    assert_eq!(line(&mut c, "distrib_strings_sizes"), "0=1,8=1,2K=1");
+    c.cmd(&["RPUSH", "l", "1", "2", "3", "4"]);
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["SADD", "s", "a", "b"]);
+    c.cmd(&["ZADD", "z", "1", "a"]);
+    assert_eq!(line(&mut c, "distrib_lists_items"), "4=1");
+    assert_eq!(line(&mut c, "distrib_hashes_items"), "1=1");
+    assert_eq!(line(&mut c, "distrib_sets_items"), "2=1");
+    assert_eq!(line(&mut c, "distrib_zsets_items"), "1=1");
+    c.cmd(&["DEL", "l"]);
+    assert_eq!(line(&mut c, "distrib_lists_items"), "");
+    assert!(!c.cmd(&["INFO"]).s().contains("# Keysizes"));
+    assert!(c.cmd(&["INFO", "everything"]).s().contains("# Keysizes"));
+    c.cmd(&["FLUSHDB"]);
+}

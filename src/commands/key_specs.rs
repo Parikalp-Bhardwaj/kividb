@@ -111,6 +111,9 @@ pub fn keys_of(cmd: &[&[u8]]) -> Option<Result<Vec<(usize, &'static str)>, NoKey
     }
     let keys = match evaluate(specs, cmd) {
         Ok(keys) => by_the_arguments(&name, cmd, keys),
+        // `PFMERGE dest` merges nothing in: its key is the destination
+        // (Redis's `pfmergeGetKeys`), not the empty range of sources.
+        Err(()) if name == "PFMERGE" && cmd.len() == 2 => vec![(1, specs[0].flags)],
         Err(()) => Vec::new(),
     };
     Some(if keys.is_empty() && !*optional {
@@ -208,6 +211,16 @@ fn by_the_arguments(
                 "RW update"
             } else {
                 "OW update"
+            };
+            keys.iter_mut().for_each(|key| key.1 = flags);
+        }
+        // Without a condition the key is only removed; with one it is read
+        // and compared first (Redis 8.10's `delexGetKeys`).
+        "DELEX" => {
+            let flags = if cmd.len() > 2 {
+                "RW delete"
+            } else {
+                "RM delete"
             };
             keys.iter_mut().for_each(|key| key.1 = flags);
         }

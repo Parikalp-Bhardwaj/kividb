@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`INFO keysizes`** (Redis 8.10): for each database, how many strings,
+  lists, sets, sorted sets and hashes have a length in each power-of-two
+  bin (`db0_distrib_lists_items:1=2,4=1`). Redis keeps these as keys change
+  and gives them in the default `INFO`; here they are counted when asked
+  for (`INFO keysizes`, `all`, `everything`), a pass over the keys, so they
+  are not in the default `INFO`, which monitoring asks for every few
+  seconds, and cost writes nothing.
+
 - **Redis 8.10 additions:** the keyspace event classes `o` (a key's value
   overwritten), `c` (its type changed) and `a` (array commands, part of
   `A`); `XIDMPRECORD`; per-client `tot-net-in`, `tot-net-out`, `tot-cmds`,
@@ -30,6 +38,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   new or rebuilt documents.
 
 ### Changed
+
+- **A script's error ends as Redis's does**, naming the script and the
+  place: `... script: <sha1>, on @user_script:1.` (the function's name for
+  `FCALL`). `redis.error_reply` gives a message without a code the code
+  `ERR` (`redis.error_reply('X')` is `-ERR X`), as Redis does. A new
+  `SUBSCRIBE`, `PSUBSCRIBE` or `SSUBSCRIBE` past `maxmemory` under
+  `noeviction` is refused with `OOM`, as Redis 8.10 refuses it.
+
+- `HEXPIRE`, `HPEXPIRE` and the `EX`/`PX` of `HGETEX` and `HSETEX` take a
+  time of 0 as now, as Redis 8.10 does: the fields go at once (`HEXPIRE`
+  replies 2 for each). Only a negative time is refused, `invalid expire
+  time, must be >= 0`. A time of 0 used to be an error.
+- `RESTORE` tells its two errors apart as Redis does: `DUMP payload version
+  or checksum are wrong` for the trailer, and `Bad data format` for a
+  payload sealed right that holds no value it can read. A zero checksum is
+  taken as none, as Redis writes with checksums off.
+- `overwritten` and `type_changed` are announced before the command's own
+  event for the commands that replace a value whole (SET, the `*STORE`s,
+  SORT … STORE, BITOP …), and after it for RENAME, COPY and RESTORE, in
+  Redis's order.
 
 These follow Redis 8.10, the release KiviDB reports itself as; a client
 written against an earlier KiviDB may notice them.
@@ -59,6 +87,91 @@ written against an earlier KiviDB may notice them.
   `ARGREP`, `XCFGSET`, the slowlog settings).
 
 ### Fixed
+
+- **`error()` given a table is reported by its `err`.**
+  `error({err = 'ERR ...'})` and `error(redis.error_reply(...))` replied
+  `ERR user_script:1: table: 0x... script:`; they reply with the message,
+  line breaks in it made spaces, and `error({})` with `ERR unknown error`.
+  `redis.acl_check_cmd` refuses a command with the wrong number of
+  arguments (`Wrong number of args for redis.acl_check_cmd()`) instead of
+  answering for it. Loading many functions no longer lets the Lua heap run
+  a third over what they hold: the collector is stepped as they load, as in
+  Redis. An `HSETEX` with a time already past announces `hset` and then
+  `hdel`; it announced only `hdel`. **The clients a `CLIENT PAUSE` held go
+  on before anything else once `CLIENT UNPAUSE` ends it**, as in Redis: a
+  `CLIENT UNBLOCK` sent straight after found the `BLPOP` the pause had held
+  not yet blocked, and answered 0. They also go on at once; they looked
+  again only every millisecond.
+  **`XTRIM` and `XADD` trimming with `ACKED` pass over an entry a group
+  still needs** and go on to the next, as Redis does; they stopped at it.
+  With `~`, under `DELREF` or `ACKED`, a node that cannot go whole is gone
+  through entry by entry, as in Redis. **`XDELEX … ACKED` deletes an entry
+  of a stream with no consumer groups**, as Redis 8.10 does: nothing refers
+  to it. It answered 2, so that once the last group was destroyed nothing
+  could be deleted with `ACKED`.
+  `XACKDEL` on a group that does not exist answers -1 for each ID, as for
+  a key that does not exist, as Redis 8.10 does; it was a `NOGROUP` error.
+  `XNACK` takes its options before the `IDS` block as well as after it,
+  names an option it does not know, and answers `NOGROUP` for a key that
+  does not exist (it answered 0), as Redis 8.10 does. `XGROUP CREATE` and
+  `SETID` cap `ENTRIESREAD` at the entries the stream has had added.
+  `XREAD` refuses `CLAIM`, which is `XREADGROUP`'s; `CLAIM`'s time is read
+  as Redis reads an integer (`+10` is not one) and a negative one is
+  refused. An entry `XCLAIM … FORCE` creates starts as one delivery, as
+  in Redis (it started at none).
+  Entries `XNACK` releases are claimed in the order they were released,
+  and one released again goes to the back, as in Redis's NACK zone (they
+  were claimed by ID). `CLAIM -0` is not an integer, as Redis reads one.
+- `MEMORY USAGE` of a string is what Redis 8 reports for one: its object's
+  header, key and value, rounded up to the allocator's size class. It was
+  a share of the key table's entries plus the value, which for small
+  strings came out above the most Redis's suite allows (64 bytes for a
+  1-byte key and value; it said 73).
+- `LATENCY GRAPH` draws Redis's graph: a header with the high and the low
+  (`<event> - high N ms, low N ms (all time high N ms)`), a rule, and an
+  ASCII sparkline of four rows labelled with how long ago each sample was.
+  It was a line of Unicode block characters. (The all-time high is the
+  highest of the samples kept.)
+- **A `BCAST` tracking client is told only of the keys its user may read**,
+  by the user it is authenticated as now, as Redis 8.10 does. It was told
+  of every key its prefixes matched, keys its user had no access to
+  included.
+- `CLIENT INFO`/`CLIENT LIST`'s `tot-cmds` counts a command once it has
+  run, as Redis does: a `CLIENT INFO` does not count itself, and a blocked
+  `BLPOP` counts once, when it is answered (it counted when it began, and
+  again when it was answered). The commands a script runs (`redis.call`)
+  count as its client's.
+- **`COMMAND GETKEYS` and `GETKEYSANDFLAGS` know the commands Redis 8.10
+  added** (`DELEX`, `DIGEST`, `INCREX`, `LMOVEM`, `SDIFFCARD`, the array
+  commands and the stream ones): the key specs are now made from Redis
+  8.10.2's command descriptions, not 8.0.0's, by `scripts/gen_keyspecs.py`.
+  `DELEX key` is `RM delete`, and with a condition `RW delete`, as in
+  Redis. `GETKEYSANDFLAGS delex k1` was `Invalid arguments specified`.
+- **`ARINFO FULL` reports an array's slices as Redis keeps them**: dense or
+  sparse, by Redis's rules (a slice turns dense past `array-sparse-kmax`
+  elements, and sparse again when a deletion leaves `array-sparse-kmin` or
+  fewer), with Redis's fields `avg-dense-size`, `avg-dense-fill` and
+  `avg-sparse-size` in place of `avg-slice-size` and `avg-fill-rate`. It
+  had called a slice dense when it was half full. `array-slice-size`,
+  `array-sparse-kmax` and `array-sparse-kmin` can be set as in Redis.
+  `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
+  the last index is `insert index overflow`, as in Redis.
+- **`ARRING` follows Redis 8.10**: the ring is the array itself. A size
+  that shrinks it, or grows it after it has wrapped, rebuilds it from the
+  newest item back as far as the first hole, oldest first from index 0,
+  so a grown ring uses its new room. `ARSEEK` only moves the cursor, and
+  `ARLASTITEMS` walks back from it, wrapping, with a nil for a hole.
+  `ARINFO` no longer reports `ring-size`, which Redis does not have, and
+  `OBJECT ENCODING` of an array is `sliced-array`.
+
+- **`CONFIG SET` of a setting under both its names is a duplicate**
+  (`busy-reply-threshold` and `lua-time-limit`, and the other
+  `slave`/`replica` and `ziplist`/`listpack` pairs), and
+  **`backup-sealed-ttl` takes effect at run time** (it was accepted and not
+  applied). The `overwritten`/`type_changed` bookkeeping added in #66 no
+  longer costs every command: it was 16 instructions a command with the
+  events off, the default (measured with callgrind); now it is one branch on
+  a write.
 
 - **Redis 8.10 compatibility** (#66 and the work after it). CI now runs
   Redis 8.10.2's test suite (#64): it went from 2079 passed, 76 failed and
@@ -202,6 +315,14 @@ written against an earlier KiviDB may notice them.
   raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
 
 ### Security
+
+- **A `RESTORE` could crash the server.** A payload whose string claimed a
+  length near 2^64 made the RDB reader allocate that much at once, and the
+  process aborted. The payload's checksum did not stop it: anyone can compute
+  one for their own payload. A crafted RDB from a primary in a full sync
+  could do the same. Strings are now read as the bytes arrive, an LZF
+  string's claimed size is bounded by what LZF can produce, and such a
+  payload is refused with `ERR Bad data format`. Affects 1.1.0 and earlier.
 
 - **The Docker image is distroless.** Its runtime base is
   `gcr.io/distroless/cc-debian12` (glibc, libgcc, CA certificates, time

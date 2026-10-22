@@ -212,10 +212,26 @@ pub(super) fn strict_integer(raw: &[u8]) -> Option<i64> {
     if digits.is_empty()
         || !digits.bytes().all(|b| b.is_ascii_digit())
         || (digits.len() > 1 && digits.starts_with('0'))
+        // `-0` is not how Redis writes zero.
+        || (s.starts_with('-') && digits == "0")
     {
         return None;
     }
     s.parse().ok()
+}
+
+/// A pending entry whose `delivered_at` is below this was released by
+/// `XNACK`, not delivered at that time: no real time in milliseconds is
+/// this small.
+pub(super) const NACKED_BELOW: u64 = 1 << 40;
+
+/// The `delivered_at` an entry `XNACK` releases is given: the next of an
+/// increasing count, so that released entries are claimed in the order they
+/// were released (a re-NACKed one goes to the back, as in Redis's NACK zone),
+/// all before anything that was delivered.
+pub(super) fn nack_time() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % NACKED_BELOW
 }
 
 /// The retention settings `XINFO STREAM` reports.
@@ -434,42 +450,57 @@ pub(super) fn delete_entry(stream: &mut StreamInner, id: &StreamId, refs: TrimRe
     true
 }
 
-/// Trim `stream` from its oldest entry forward, stopping at the first entry
-/// the policy does not allow to go. Returns the number removed.
+/// Trim `stream` from its oldest entry forward. Returns the number removed.
+///
+/// Under `ACKED` an entry some group still needs stays, and the trim goes on
+/// past it to the next, as Redis's `streamTrim` does.
 pub(super) fn trim_stream(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs) -> usize {
+    trim_walk(stream, to, refs, 0)
+}
+
+/// [`trim_stream`], removing at most `limit` entries (zero for no limit).
+fn trim_walk(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs, limit: u64) -> usize {
+    use std::ops::Bound::{Excluded, Unbounded};
     let mut removed = 0usize;
-    while let Some(id) = stream.entries.keys().next() {
+    // The last entry passed over, which the walk goes on after.
+    let mut kept: Option<StreamId> = None;
+    while limit == 0 || (removed as u64) < limit {
+        let next = match &kept {
+            None => stream.entries.keys().next(),
+            Some(after) => stream
+                .entries
+                .range((Excluded(after), Unbounded))
+                .next()
+                .map(|(id, _)| id),
+        };
+        let Some(id) = next else {
+            break;
+        };
         let over = match to {
             TrimTo::MaxLen(max) => stream.entries.len() as u64 > *max,
             TrimTo::MinId(min) => id < min,
         };
-        if !over || !remove_oldest(stream, refs) {
+        if !over {
             break;
+        }
+        let id = id.clone();
+        if refs == TrimRefs::Acked && !acked_by_all_groups(stream, &id) {
+            kept = Some(id);
+            continue;
+        }
+        // `max_deleted_id` is not moved: it marks where `XDEL` and the like
+        // deleted an entry, which is what makes a group's count of what it
+        // has read uncertain. Redis's trim does not move it either. See
+        // `Shape`.
+        stream.entries.remove(&id);
+        if refs == TrimRefs::DelRef {
+            for g in stream.groups.values_mut() {
+                g.pel.remove(&id);
+            }
         }
         removed += 1;
     }
     removed
-}
-
-/// Remove the oldest entry, unless the policy says it has to stay.
-fn remove_oldest(stream: &mut StreamInner, refs: TrimRefs) -> bool {
-    let Some(id) = stream.entries.keys().next().cloned() else {
-        return false;
-    };
-    if refs == TrimRefs::Acked && !acked_by_all_groups(stream, &id) {
-        return false;
-    }
-    // `max_deleted_id` is not moved: it marks where an entry was deleted
-    // from *between* others (`XDEL`), which is what makes a group's count of
-    // what it has read uncertain. Entries trimmed from the front leave no
-    // such gap. See `Shape`.
-    stream.entries.remove(&id);
-    if refs == TrimRefs::DelRef {
-        for g in stream.groups.values_mut() {
-            g.pel.remove(&id);
-        }
-    }
-    true
 }
 
 /// `stream-node-max-entries`: how many entries Redis keeps in one node of a
@@ -600,6 +631,13 @@ pub(super) fn trim_stream_approx(
     refs: TrimRefs,
     approx: Approx,
 ) -> usize {
+    // Whole nodes only, but for `KEEPREF`. Under `DELREF` and `ACKED` each
+    // entry has its groups' references to see to, and Redis goes through a
+    // node it cannot remove whole entry by entry, and on to the next: such
+    // a trim is an exact one, as far as `LIMIT` lets it go.
+    if refs != TrimRefs::KeepRef {
+        return trim_walk(stream, to, refs, approx.limit);
+    }
     let mut removed = 0u64;
     loop {
         let len = stream.entries.len() as u64;
@@ -624,7 +662,7 @@ pub(super) fn trim_stream_approx(
             break;
         }
         for _ in 0..node {
-            if !remove_oldest(stream, refs) {
+            if stream.entries.pop_first().is_none() {
                 return removed as usize;
             }
             removed += 1;
@@ -637,11 +675,18 @@ pub(super) fn trim_stream_approx(
 /// `~` trim did, for propagation: a replica (or the AOF, replayed) given
 /// `MAXLEN ~ 1000` would decide for itself how much "about" is — by its own
 /// `stream-node-max-entries` — and end up with a different stream.
+///
+/// Under `ACKED` the entries kept were passed over, not where the trim
+/// stopped. A `MINID` is then the first entry left below it that every group
+/// is done with (one the trim did not reach, for its `LIMIT`), or, with
+/// none, the `MINID` given: a replica trimming exactly to that removes what
+/// this did.
 pub(super) fn exact_trim_args(
     parts: &mut Vec<Vec<u8>>,
     from: usize,
     to: usize,
     stream: &StreamInner,
+    refs: TrimRefs,
 ) {
     let mut to = to.min(parts.len());
     let mut i = from;
@@ -654,6 +699,19 @@ pub(super) fn exact_trim_args(
             parts[i + 1] = b"=".to_vec();
             if maxlen {
                 parts[i + 2] = stream.entries.len().to_string().into_bytes();
+            } else if refs == TrimRefs::Acked {
+                let given = std::str::from_utf8(&parts[i + 2])
+                    .ok()
+                    .and_then(StreamId::parse);
+                if let Some(given) = given
+                    && let Some(first) = stream
+                        .entries
+                        .range(..given)
+                        .map(|(id, _)| id)
+                        .find(|id| acked_by_all_groups(stream, id))
+                {
+                    parts[i + 2] = first.to_string().into_bytes();
+                }
             } else if let Some(first) = stream.entries.keys().next() {
                 parts[i + 2] = first.to_string().into_bytes();
             }
@@ -1013,12 +1071,41 @@ mod tests {
     }
 
     #[test]
-    fn acked_stops_at_the_first_entry_a_group_still_needs() {
-        // Read up to 4; 3 is still pending.
+    fn acked_passes_over_the_entries_a_group_still_needs() {
+        // Read up to 4; 3 is still pending: 1, 2 and 4 go.
         let mut s = stream_with(5);
         s.groups.insert("g".into(), group(4, &[3]));
-        assert_eq!(trim_stream(&mut s, &TrimTo::MaxLen(0), TrimRefs::Acked), 2);
-        assert_eq!(s.entries.keys().next(), Some(&id(3)));
+        assert_eq!(trim_stream(&mut s, &TrimTo::MaxLen(0), TrimRefs::Acked), 3);
+        let left: Vec<_> = s.entries.keys().cloned().collect();
+        assert_eq!(left, vec![id(3), id(5)]);
+
+        // The same with `~`, and with a MINID: the trim goes past 3.
+        let mut s = stream_with(5);
+        s.groups.insert("g".into(), group(4, &[3]));
+        let to = TrimTo::MinId(id(6));
+        assert_eq!(
+            trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 0, node: 2 }),
+            3
+        );
+
+        // As far as LIMIT lets it.
+        let mut s = stream_with(5);
+        s.groups.insert("g".into(), group(4, &[3]));
+        assert_eq!(
+            trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 2, node: 2 }),
+            2
+        );
+        let left: Vec<_> = s.entries.keys().cloned().collect();
+        assert_eq!(left, vec![id(3), id(4), id(5)]);
+        // Propagated as a MINID that removes the same: 4, the first left
+        // below 6 that the group is done with.
+        let mut parts: Vec<Vec<u8>> = ["XTRIM", "s", "MINID", "~", "6-0", "LIMIT", "2", "ACKED"]
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        exact_trim_args(&mut parts, 2, 7, &s, TrimRefs::Acked);
+        assert_eq!(parts[3], b"=");
+        assert_eq!(parts[4], id(4).to_string().into_bytes());
 
         // Nothing pending, but 5 has not been delivered yet.
         let mut s = stream_with(5);
@@ -1117,7 +1204,7 @@ mod tests {
         .iter()
         .map(|p| p.as_bytes().to_vec())
         .collect();
-        exact_trim_args(&mut parts, 2, 7, &s);
+        exact_trim_args(&mut parts, 2, 7, &s, TrimRefs::KeepRef);
         let parts: Vec<&str> = parts
             .iter()
             .map(|p| std::str::from_utf8(p).unwrap())

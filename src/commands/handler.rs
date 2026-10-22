@@ -125,6 +125,77 @@ pub(crate) fn dispatch_command_handlers(ctx: &mut Ctx, name: &str) -> Option<Vec
     fast.or_else(|| dispatch_command_handlers_fallback(ctx, name))
 }
 
+/// The values a command may replace whole (Redis's `setKey`), taken before
+/// it runs, to announce `overwritten` and `type_changed` for those it did.
+struct ReplaceWatch {
+    before: Vec<(usize, usize, crate::types::KiviDBValue)>,
+    /// The command's own events are held back, so that these go first.
+    holding: bool,
+}
+
+#[cold]
+#[inline(never)]
+fn replace_watch_begin(ctx: &Ctx, name: &str) -> Option<ReplaceWatch> {
+    let before: Vec<_> = crate::keyspace_events::whole_value_targets(name, &ctx.cmd)
+        .into_iter()
+        .filter_map(|(db, pos)| {
+            let db = db.unwrap_or(*ctx.selected_db);
+            let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
+            let value = crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key))
+                .get(key)?
+                .clone();
+            Some((db, pos, value))
+        })
+        .collect();
+    if before.is_empty() {
+        return None;
+    }
+    let holding = crate::keyspace_events::overwritten_goes_first(name);
+    if holding {
+        crate::keyspace_events::hold();
+    }
+    Some(ReplaceWatch { before, holding })
+}
+
+#[cold]
+#[inline(never)]
+fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
+    let held = if watch.holding {
+        crate::keyspace_events::release()
+    } else {
+        Vec::new()
+    };
+    for (db, pos, old) in watch.before {
+        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
+            continue;
+        };
+        let now = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key))
+            .get(key)
+            .cloned();
+        if let Some(now) = now
+            && !now.same_value(&old)
+        {
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                db,
+                crate::keyspace_events::KS_OVERWRITTEN,
+                "overwritten",
+                key,
+            );
+            if now.type_name() != old.type_name() {
+                crate::keyspace_events::notify(
+                    ctx.pubsub,
+                    db,
+                    crate::keyspace_events::KS_TYPE_CHANGED,
+                    "type_changed",
+                    key,
+                );
+            }
+        }
+    }
+    crate::keyspace_events::replay(ctx.pubsub, held);
+}
+
 /// Run one Redis command from inside a Lua script (`redis.call` / `redis.pcall`).
 /// `parts` are owned; switched into `ctx.cmd` for the duration of the call.
 #[cfg_attr(not(feature = "lua"), allow(dead_code))]
@@ -855,61 +926,26 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         Vec::new()
     };
 
-    // `notify-keyspace-events o` / `c`: the values the command may replace
-    // whole, to see afterwards which it did (Redis's `setKey`).
-    let replaced_watch =
-        crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED;
-    let before_replace: Vec<(usize, usize, crate::types::KiviDBValue)> = if writes_operation
+    // `notify-keyspace-events o` / `c` (see `replace_watch_begin`). With
+    // neither on, which is the default, this is a load and a branch on a
+    // write and nothing on a read: building and dropping an empty watch on
+    // every command cost 16 instructions a command (measured, #66).
+    let replacing = if writes_operation
         && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
-            & replaced_watch
+            & (crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED)
             != 0
     {
-        crate::keyspace_events::whole_value_targets(name, &ctx.cmd)
-            .into_iter()
-            .filter_map(|(db, pos)| {
-                let db = db.unwrap_or(*ctx.selected_db);
-                let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
-                let value = crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key))
-                    .get(key)?
-                    .clone();
-                Some((db, pos, value))
-            })
-            .collect()
+        replace_watch_begin(ctx, name)
     } else {
-        Vec::new()
+        None
     };
 
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
 
-    for (db, pos, old) in before_replace {
-        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
-            continue;
-        };
-        let now = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key))
-            .get(key)
-            .cloned();
-        if let Some(now) = now
-            && !now.same_value(&old)
-        {
-            crate::keyspace_events::notify(
-                ctx.pubsub,
-                db,
-                crate::keyspace_events::KS_OVERWRITTEN,
-                "overwritten",
-                key,
-            );
-            if now.type_name() != old.type_name() {
-                crate::keyspace_events::notify(
-                    ctx.pubsub,
-                    db,
-                    crate::keyspace_events::KS_TYPE_CHANGED,
-                    "type_changed",
-                    key,
-                );
-            }
-        }
+    if let Some(watch) = replacing {
+        replace_watch_end(ctx, watch);
     }
 
     for pos in absent {

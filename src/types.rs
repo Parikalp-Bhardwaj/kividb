@@ -758,13 +758,49 @@ impl Default for HashInner {
 
 // ── Array — Redis 8.8 sparse array type (AR* commands) ───────────────────────
 
-/// Nominal slice width reported by `ARINFO`.
+/// `array-slice-size`: how many indices one slice of an array covers, for
+/// arrays made from now on (an array keeps the size it was made with).
+pub static ARRAY_SLICE_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4096);
+/// `array-sparse-kmax`: a sparse slice holds at most this many elements, and
+/// one more makes it dense. 0: slices are always dense.
+pub static ARRAY_SPARSE_KMAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(10);
+/// `array-sparse-kmin`: a dense slice left with this many elements or fewer
+/// may become sparse again.
+pub static ARRAY_SPARSE_KMIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(5);
+
+fn array_kmax() -> u32 {
+    ARRAY_SPARSE_KMAX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn array_kmin() -> u32 {
+    ARRAY_SPARSE_KMIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How Redis would hold one slice of an array: what `ARINFO FULL` reports.
 ///
-/// Redis backs this type with a directory of fixed-width slices; KiviDB uses a
-/// sparse `BTreeMap` instead (see [`ArrayInner::entries`]). The slice-shaped
-/// `ARINFO` fields are derived from this constant so the reply carries the same
-/// fields with comparable values, matching Redis's own 4096 default.
-pub const ARRAY_SLICE_SIZE: u64 = 4096;
+/// The elements themselves are in [`ArrayInner::entries`]. This is only the
+/// shape Redis's `sparsearray.c` would have given the slice, kept as it
+/// would keep it: a sparse slice (a sorted list with room for `cap`) turns
+/// dense once it would pass `array-sparse-kmax` elements; a dense one (a
+/// window of `winsize` slots from `offset`) grows by powers of two, and turns
+/// sparse again when a deletion leaves it with `array-sparse-kmin` or fewer
+/// and that saves memory. Which a slice is depends on how it got there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArraySliceShape {
+    Sparse { cap: u32 },
+    Dense { offset: u32, winsize: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArraySlice {
+    pub count: u32,
+    pub shape: ArraySliceShape,
+}
+
+/// Redis's initial dense window.
+const AR_SLICE_MIN_ALLOC: u32 = 8;
+/// `sizeof(arSlice)` on a 64-bit build.
+const AR_SLICE_HEADER: usize = 32;
 
 /// Highest addressable array index.
 ///
@@ -780,7 +816,7 @@ pub const ARRAY_MAX_INDEX: u64 = i64::MAX as u64;
 /// `ARSCAN`, `ARGREP`, `AROP`, `ARDELRANGE`) all document complexity
 /// proportional to the number of *existing* elements touched rather than to the
 /// numeric span of the requested range.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ArrayInner {
     /// Sparse index → value.
     ///
@@ -800,6 +836,22 @@ pub struct ArrayInner {
     /// `ARRING` writes at `next_insert % ring_size` so newer values overwrite
     /// older ones in a fixed-size window.
     pub ring_size: Option<u64>,
+    /// The slices Redis would hold, by slice number (see [`ArraySlice`]).
+    pub slices: BTreeMap<u64, ArraySlice>,
+    /// `array-slice-size` when the array was made.
+    pub slice_size: u32,
+}
+
+impl Default for ArrayInner {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_insert: 0,
+            ring_size: None,
+            slices: BTreeMap::new(),
+            slice_size: ARRAY_SLICE_SIZE.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 impl ArrayInner {
@@ -837,7 +889,187 @@ impl ArrayInner {
     /// this is what `ARSET`/`ARMSET` count for their integer reply.
     #[inline]
     pub fn set(&mut self, idx: u64, value: Arc<[u8]>) -> bool {
+        if !self.entries.contains_key(&idx) {
+            self.shape_insert(idx);
+        }
         self.entries.insert(idx, value).is_none()
+    }
+
+    fn slice_of(&self, idx: u64) -> (u64, u32) {
+        let size = u64::from(self.slice_size.max(1));
+        (idx / size, (idx % size) as u32)
+    }
+
+    /// The offsets of the first and last elements in slice `id`.
+    fn slice_bounds(&self, id: u64) -> Option<(u32, u32)> {
+        let size = u64::from(self.slice_size.max(1));
+        let range = self.entries.range(id * size..(id + 1).saturating_mul(size));
+        let mut keys = range.map(|(&idx, _)| (idx % size) as u32);
+        let first = keys.next()?;
+        Some((first, keys.next_back().unwrap_or(first)))
+    }
+
+    fn dense_new(&self, rel: u32) -> ArraySliceShape {
+        let winsize = AR_SLICE_MIN_ALLOC.min(self.slice_size);
+        let offset = rel.min(self.slice_size - winsize);
+        ArraySliceShape::Dense { offset, winsize }
+    }
+
+    /// `arSparsePromote`: the dense window a sparse slice becomes.
+    fn promoted(&self, id: u64) -> ArraySliceShape {
+        let Some((min, max)) = self.slice_bounds(id) else {
+            return self.dense_new(0);
+        };
+        let size = self.slice_size;
+        let winsize = (max - min + 1).next_power_of_two().max(AR_SLICE_MIN_ALLOC);
+        if winsize >= size {
+            return ArraySliceShape::Dense {
+                offset: 0,
+                winsize: size,
+            };
+        }
+        ArraySliceShape::Dense {
+            offset: min.min(size - winsize),
+            winsize,
+        }
+    }
+
+    /// `arSliceDenseGrowIfNeeded`.
+    fn grown(&self, offset: u32, winsize: u32, rel: u32) -> ArraySliceShape {
+        let size = self.slice_size;
+        if rel >= offset + winsize {
+            let mut w = winsize;
+            while rel >= offset + w && w < size {
+                w <<= 1;
+            }
+            if w >= size {
+                return ArraySliceShape::Dense {
+                    offset: 0,
+                    winsize: size,
+                };
+            }
+            return ArraySliceShape::Dense {
+                offset: offset.min(size - w),
+                winsize: w,
+            };
+        }
+        if rel < offset {
+            let end = offset + winsize;
+            let w = (end - rel)
+                .next_power_of_two()
+                .max(AR_SLICE_MIN_ALLOC)
+                .min(size);
+            let offset = if w == size { 0 } else { end.saturating_sub(w) };
+            return ArraySliceShape::Dense { offset, winsize: w };
+        }
+        ArraySliceShape::Dense { offset, winsize }
+    }
+
+    /// An element is about to be added at the empty `idx` (`arSet`).
+    fn shape_insert(&mut self, idx: u64) {
+        let (id, rel) = self.slice_of(idx);
+        let kmax = array_kmax();
+        let slice = match self.slices.get(&id) {
+            Some(slice) => *slice,
+            None => ArraySlice {
+                count: 0,
+                shape: if kmax > 0 {
+                    ArraySliceShape::Sparse { cap: kmax.min(4) }
+                } else {
+                    self.dense_new(rel)
+                },
+            },
+        };
+        let shape = match slice.shape {
+            ArraySliceShape::Dense { offset, winsize } => self.grown(offset, winsize, rel),
+            ArraySliceShape::Sparse { .. } if slice.count >= kmax => match self.promoted(id) {
+                ArraySliceShape::Dense { offset, winsize } => self.grown(offset, winsize, rel),
+                sparse => sparse,
+            },
+            ArraySliceShape::Sparse { cap } if slice.count >= cap => ArraySliceShape::Sparse {
+                cap: (cap * 2).min(kmax),
+            },
+            sparse => sparse,
+        };
+        self.slices.insert(
+            id,
+            ArraySlice {
+                count: slice.count + 1,
+                shape,
+            },
+        );
+    }
+
+    /// `n` elements have gone from slice `id`: it goes when empty, and a
+    /// dense one may become sparse (`arDenseMaybeDemote`).
+    fn shape_removed(&mut self, id: u64, n: u32) {
+        let Some(slice) = self.slices.get_mut(&id) else {
+            return;
+        };
+        slice.count = slice.count.saturating_sub(n);
+        if slice.count == 0 {
+            self.slices.remove(&id);
+            return;
+        }
+        let (kmax, kmin) = (array_kmax(), array_kmin());
+        let ArraySliceShape::Dense { winsize, .. } = slice.shape else {
+            return;
+        };
+        let pointer = std::mem::size_of::<usize>();
+        let sparse_bytes = |cap: u32| {
+            let offsets = cap as usize * 2;
+            let padding = (pointer - offsets % pointer) % pointer;
+            AR_SLICE_HEADER + offsets + padding + cap as usize * pointer
+        };
+        let dense_bytes = AR_SLICE_HEADER + winsize as usize * pointer;
+        if kmax == 0
+            || slice.count > kmin
+            || slice.count > kmax
+            || winsize == AR_SLICE_MIN_ALLOC
+            || winsize < 4 * kmin
+            || dense_bytes < sparse_bytes(kmin) * 5 / 4
+        {
+            return;
+        }
+        slice.shape = ArraySliceShape::Sparse { cap: kmin };
+    }
+
+    /// Before values are written to every index from `lo` to `hi`: a slice
+    /// they would take past `array-sparse-kmax` is made dense first, as
+    /// Redis's `arMayPromoteToDenseForRangeSet` does for a bulk `ARSET` or
+    /// `ARINSERT`.
+    pub fn promote_for_range(&mut self, lo: u64, hi: u64) {
+        let kmax = array_kmax();
+        if kmax == 0 || lo > hi {
+            return;
+        }
+        let size = u64::from(self.slice_size.max(1));
+        for id in lo / size..=hi / size {
+            let start = if id == lo / size { lo % size } else { 0 } as u32;
+            let end = if id == hi / size { hi % size } else { size - 1 } as u32;
+            let span = end - start + 1;
+            match self.slices.get(&id).copied() {
+                None if span > kmax => {
+                    let shape = self.dense_new(start);
+                    self.slices.insert(id, ArraySlice { count: 0, shape });
+                }
+                Some(ArraySlice {
+                    count,
+                    shape: ArraySliceShape::Sparse { .. },
+                }) => {
+                    let base = id * size;
+                    let existing = self
+                        .entries
+                        .range(base + u64::from(start)..=base + u64::from(end))
+                        .count() as u32;
+                    if span > kmax || count + (span - existing) > kmax {
+                        let shape = self.promoted(id);
+                        self.slices.insert(id, ArraySlice { count, shape });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     #[inline]
@@ -848,7 +1080,31 @@ impl ArrayInner {
     /// Remove the element at `idx`. Returns true when something was removed.
     #[inline]
     pub fn del(&mut self, idx: u64) -> bool {
-        self.entries.remove(&idx).is_some()
+        if self.entries.remove(&idx).is_none() {
+            return false;
+        }
+        let (id, _) = self.slice_of(idx);
+        self.shape_removed(id, 1);
+        true
+    }
+
+    /// Remove every element from `lo` to `hi`: how many there were. A slice
+    /// is looked at for becoming sparse once, when its part of the range is
+    /// gone (`arDeleteRange`), not after each element.
+    pub fn del_range(&mut self, lo: u64, hi: u64) -> u64 {
+        if lo > hi {
+            return 0;
+        }
+        let doomed: Vec<u64> = self.entries.range(lo..=hi).map(|(&idx, _)| idx).collect();
+        let mut per_slice: BTreeMap<u64, u32> = BTreeMap::new();
+        for idx in &doomed {
+            self.entries.remove(idx);
+            *per_slice.entry(self.slice_of(*idx).0).or_default() += 1;
+        }
+        for (id, n) in per_slice {
+            self.shape_removed(id, n);
+        }
+        doomed.len() as u64
     }
 }
 

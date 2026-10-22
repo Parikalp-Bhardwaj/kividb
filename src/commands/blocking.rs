@@ -246,6 +246,12 @@ impl BlockingSlot {
         self.in_resume
     }
 
+    /// Whether the next dispatch is a resume: what the wait produced is
+    /// waiting for it.
+    pub fn resuming(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;

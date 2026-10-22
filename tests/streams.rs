@@ -2161,20 +2161,26 @@ fn test_xdelex_acked_waits_for_every_group() {
 }
 
 #[test]
-fn test_xdelex_acked_without_groups_deletes_nothing() {
+fn test_xdelex_acked_without_groups_deletes() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
     c.cmds(&["XADD", "s", "1-0", "f", "v"]);
+    c.cmds(&["XADD", "s", "2-0", "f", "v"]);
 
-    // No consumer group has acknowledged it — there are none — so ACKED
-    // leaves it, and says so with 2 (as Redis documents).
+    // With no consumer groups nothing refers to an entry: ACKED deletes it,
+    // as in Redis 8.10.
     let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "1-0"]);
+    assert_eq!(r.as_array()[0].as_int(), 1);
+
+    // And once the last group that held it back is destroyed.
+    c.cmds(&["XGROUP", "CREATE", "s", "g", "0"]);
+    c.cmds(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+    let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "2-0"]);
     assert_eq!(r.as_array()[0].as_int(), 2);
-    assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 1);
-    // The default policy deletes it.
-    let r = c.cmds(&["XDELEX", "s", "IDS", "1", "1-0"]);
+    c.cmds(&["XGROUP", "DESTROY", "s", "g"]);
+    let r = c.cmds(&["XDELEX", "s", "ACKED", "IDS", "1", "2-0"]);
     assert_eq!(r.as_array()[0].as_int(), 1);
     assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 0);
 }
@@ -2469,7 +2475,7 @@ fn test_xackdel_missing_key() {
     assert_eq!(arr[1].as_int(), -1);
 }
 
-// No-such group → NOGROUP error
+// No such group → -1 for every ID, as for no such key (Redis 8.10)
 #[test]
 fn test_xackdel_no_such_group() {
     let port = free_port();
@@ -2477,16 +2483,10 @@ fn test_xackdel_no_such_group() {
     let mut c = Conn::connect(port);
 
     c.cmds(&["XADD", "s", "1-0", "f", "v"]);
-    let r = c.cmds(&["XACKDEL", "s", "nosuchgroup", "1-0"]);
-    assert!(r.is_error());
-    let msg = match &r {
-        RespValue::Error(e) => e.as_str(),
-        _ => "",
-    };
-    assert!(
-        msg.contains("NOGROUP"),
-        "expected NOGROUP error, got: {msg}"
-    );
+    let r = c.cmds(&["XACKDEL", "s", "nosuchgroup", "IDS", "2", "1-0", "2-0"]);
+    let ids: Vec<i64> = r.as_array().iter().map(RespValue::as_int).collect();
+    assert_eq!(ids, [-1, -1]);
+    assert_eq!(c.cmds(&["XLEN", "s"]).as_int(), 1);
 }
 
 // Arity check
@@ -2992,11 +2992,32 @@ fn test_xnack_errors() {
     let mut c = Conn::connect(port);
     let ids = setup_pending(&mut c, "xn:err", "g", 1);
 
-    // Missing key → 0, not an error.
+    // Missing key → NOGROUP, as for a missing group (Redis 8.10).
+    let r = c.cmds(&["XNACK", "xn:absent", "g", "FAIL", "IDS", "1", &ids[0]]);
+    assert!(format!("{r:?}").contains("NOGROUP"), "{r:?}");
+    // Options before the IDS block as well as after; one it does not know
+    // is named.
     assert_eq!(
-        c.cmds(&["XNACK", "xn:absent", "g", "FAIL", "IDS", "1", &ids[0]])
-            .as_int(),
-        0
+        c.cmds(&[
+            "XNACK",
+            "xn:err",
+            "g",
+            "FAIL",
+            "RETRYCOUNT",
+            "3",
+            "IDS",
+            "1",
+            &ids[0]
+        ])
+        .as_int(),
+        1
+    );
+    let r = c.cmds(&[
+        "XNACK", "xn:err", "g", "FAIL", "BADOPT", "IDS", "1", &ids[0],
+    ]);
+    assert!(
+        format!("{r:?}").contains("Unrecognized XNACK option 'BADOPT'"),
+        "{r:?}"
     );
     // Unknown group is NOGROUP.
     let r = c.cmds(&["XNACK", "xn:err", "nosuch", "FAIL", "IDS", "1", &ids[0]]);
@@ -3089,4 +3110,200 @@ fn test_approximate_trim_ends_nodes_at_stream_node_max_bytes() {
     c.cmds(&["CONFIG", "SET", "stream-node-max-bytes", "4kb"]);
     let r = c.cmds(&["CONFIG", "GET", "stream-node-max-bytes"]);
     assert_eq!(r.as_array()[1].as_str(), "4096");
+}
+
+/// `XTRIM … ACKED`, with `~` or without, passes over an entry a group still
+/// needs and goes on to the next, as Redis does (8.10's unit/type/stream).
+#[test]
+fn test_xtrim_acked_passes_over_what_a_group_still_needs() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for approx in [true, false] {
+        c.cmds(&["DEL", "s"]);
+        for id in ["1-0", "2-0", "3-0", "4-0", "5-0"] {
+            c.cmds(&["XADD", "s", id, "f", "v"]);
+        }
+        c.cmds(&["XGROUP", "CREATE", "s", "g", "0"]);
+        c.cmds(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+        c.cmds(&["XACK", "s", "g", "1-0", "2-0", "4-0"]);
+
+        let how = if approx { "~" } else { "=" };
+        let r = c.cmds(&["XTRIM", "s", "MINID", how, "6-0", "ACKED"]);
+        assert_eq!(r.as_int(), 3, "{how}");
+        let left = c.cmds(&["XRANGE", "s", "-", "+"]);
+        let ids: Vec<&str> = left
+            .as_array()
+            .iter()
+            .map(|e| e.as_array()[0].as_str())
+            .collect();
+        assert_eq!(ids, ["3-0", "5-0"], "{how}");
+    }
+}
+
+/// Redis 8.10's stream-cgroups checks: ENTRIESREAD past what was added is
+/// capped to it; CLAIM is XREADGROUP's, its time a strict non-negative
+/// integer; an entry XCLAIM FORCE makes starts as one delivery.
+#[test]
+fn test_entriesread_cap_and_claim_arguments() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let entries_read = |c: &mut Conn| -> i64 {
+        let info = c.cmds(&["XINFO", "GROUPS", "cg:s"]);
+        let g = info.as_array()[0].as_array();
+        let at = g
+            .iter()
+            .position(|v| matches!(v, RespValue::Bulk(b) if b == b"entries-read"))
+            .unwrap();
+        g[at + 1].as_int()
+    };
+    c.cmds(&["DEL", "cg:s"]);
+    c.cmds(&["XADD", "cg:s", "*", "f", "v"]);
+    assert!(
+        c.cmds(&["XGROUP", "CREATE", "cg:s", "g", "$", "ENTRIESREAD", "9999"])
+            .is_ok()
+    );
+    assert_eq!(entries_read(&mut c), 1);
+    assert!(
+        c.cmds(&["XGROUP", "SETID", "cg:s", "g", "$", "ENTRIESREAD", "9999"])
+            .is_ok()
+    );
+    assert_eq!(entries_read(&mut c), 1);
+
+    let err = |r: RespValue| format!("{r:?}");
+    assert!(
+        err(c.cmds(&["XREAD", "CLAIM", "10", "STREAMS", "cg:s", "0"]))
+            .contains("The CLAIM option is only supported by XREADGROUP")
+    );
+    assert!(
+        err(c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "CLAIM",
+            "+10",
+            "STREAMS",
+            "cg:s",
+            ">"
+        ]))
+        .contains("min-idle-time is not an integer")
+    );
+    assert!(
+        err(c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "CLAIM",
+            "-1",
+            "STREAMS",
+            "cg:s",
+            ">"
+        ]))
+        .contains("min-idle-time must be a positive integer")
+    );
+
+    c.cmds(&["DEL", "cg:s"]);
+    for id in ["1-0", "2-0", "3-0"] {
+        c.cmds(&["XADD", "cg:s", id, "f", "v"]);
+    }
+    c.cmds(&["XGROUP", "CREATE", "cg:s", "g", "0"]);
+    c.cmds(&[
+        "XCLAIM", "cg:s", "g", "c3", "0", "1-0", "2-0", "FORCE", "JUSTID",
+    ]);
+    let r = c.cmds(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c2",
+        "CLAIM",
+        "0",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "cg:s",
+        ">",
+    ]);
+    let messages = r.as_array()[0].as_array()[1].as_array();
+    assert_eq!(messages.len(), 2);
+    for m in messages {
+        assert_eq!(m.as_array()[3].as_int(), 1, "{m:?}");
+    }
+}
+
+/// Entries XNACK releases are claimed in the order they were released, and
+/// one released again goes to the back, as in Redis 8.10's NACK zone.
+/// `CLAIM -0` is not an integer, as Redis reads one.
+#[test]
+fn test_renack_goes_to_the_back() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["DEL", "nz:s"]);
+    for id in ["1-0", "2-0", "3-0"] {
+        c.cmds(&["XADD", "nz:s", id, "f", "v"]);
+    }
+    c.cmds(&["XGROUP", "CREATE", "nz:s", "grp", "0"]);
+    c.cmds(&["XREADGROUP", "GROUP", "grp", "c1", "STREAMS", "nz:s", ">"]);
+    c.cmds(&[
+        "XNACK", "nz:s", "grp", "FAIL", "IDS", "3", "1-0", "2-0", "3-0",
+    ]);
+    c.cmds(&["XNACK", "nz:s", "grp", "FAIL", "IDS", "1", "1-0"]);
+    let mut order = Vec::new();
+    for _ in 0..3 {
+        let r = c.cmds(&[
+            "XREADGROUP",
+            "GROUP",
+            "grp",
+            "c2",
+            "COUNT",
+            "1",
+            "CLAIM",
+            "0",
+            "STREAMS",
+            "nz:s",
+            ">",
+        ]);
+        order.push(
+            r.as_array()[0].as_array()[1].as_array()[0].as_array()[0]
+                .as_str()
+                .to_string(),
+        );
+    }
+    assert_eq!(order, ["2-0", "3-0", "1-0"]);
+
+    // XINFO STREAM FULL shows a released entry's delivery time as 0.
+    c.cmds(&["XNACK", "nz:s", "grp", "FAIL", "IDS", "1", "1-0"]);
+    // The pending entry `[id, consumer, delivery time, count]` for 1-0.
+    fn find<'a>(v: &'a RespValue, id: &[u8]) -> Option<&'a [RespValue]> {
+        let RespValue::Array(items) = v else {
+            return None;
+        };
+        if items.len() == 4 && matches!(&items[0], RespValue::Bulk(b) if b == id) {
+            return Some(items);
+        }
+        items.iter().find_map(|item| find(item, id))
+    }
+    let full = c.cmds(&["XINFO", "STREAM", "nz:s", "FULL"]);
+    let entry = find(&full, b"1-0").expect("1-0 pending");
+    assert_eq!(entry[2], RespValue::Int(0), "{entry:?}");
+
+    let r = c.cmds(&[
+        "XREADGROUP",
+        "GROUP",
+        "grp",
+        "c2",
+        "CLAIM",
+        "-0",
+        "STREAMS",
+        "nz:s",
+        ">",
+    ]);
+    assert!(
+        format!("{r:?}").contains("min-idle-time is not an integer"),
+        "{r:?}"
+    );
 }

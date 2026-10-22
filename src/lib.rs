@@ -135,7 +135,7 @@ async fn server_tokio(
         crate::cluster::ClusterState::from_config(&config).expect("cluster config file"),
     );
     let tracking_table = crate::tracking::new_tracking_table();
-    crate::tracking::register_for(&store, &tracking_table, &client_registry);
+    crate::tracking::register_for(&store, &tracking_table, &client_registry, &acl_store);
 
     // HNSW compaction worker — drains background rebuild requests.
     // Single OS thread; no tokio runtime needed.

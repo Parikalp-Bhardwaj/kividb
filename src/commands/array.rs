@@ -22,13 +22,13 @@ use crate::resp::write::{
 };
 use crate::store;
 use crate::store::Key;
-use crate::types::{ARRAY_MAX_INDEX, ARRAY_SLICE_SIZE, ArrayInner, KiviDBValue};
+use crate::types::{ARRAY_MAX_INDEX, ArrayInner, ArraySliceShape, KiviDBValue};
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
 
 const ERR_WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const ERR_INDEX_RANGE: &str = "ERR index is out of range";
-const ERR_CURSOR_EXHAUSTED: &str = "ERR array insert cursor is exhausted";
+const ERR_CURSOR_EXHAUSTED: &str = "ERR insert index overflow";
 
 /// Upper bound on how many slots `ARGETRANGE` will materialise in one reply.
 ///
@@ -305,6 +305,9 @@ fn cmd_arset(ctx: &mut Ctx) -> Vec<u8> {
     let values: Vec<Arc<[u8]>> = ctx.cmd[3..].iter().map(|v| Arc::from(*v)).collect();
 
     match with_array_write(ctx, &key, |inner| {
+        if n_values > 1 {
+            inner.promote_for_range(start, start + n_values - 1);
+        }
         let mut new_slots = 0i64;
         for (offset, value) in values.into_iter().enumerate() {
             if inner.set(start + offset as u64, value) {
@@ -523,16 +526,12 @@ fn cmd_ardelrange(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     match with_existing_array_write(ctx, &key, 0i64, |inner| {
-        // Collect first, then remove: can't mutate the map while ranging it.
-        // Deduplicated via the set semantics of collecting keys per span and
-        // removing once, so overlapping spans don't double-count.
-        let mut doomed: Vec<u64> = Vec::new();
-        for (lo, hi) in spans {
-            doomed.extend(inner.entries.range(lo..=hi).map(|(&i, _)| i));
-        }
-        doomed.sort_unstable();
-        doomed.dedup();
-        doomed.iter().filter(|&&i| inner.del(i)).count() as i64
+        // One span after another, as Redis does: what an earlier span took
+        // is not there for a later one to count again.
+        spans
+            .into_iter()
+            .map(|(lo, hi)| inner.del_range(lo, hi))
+            .sum::<u64>() as i64
     }) {
         Ok(n) => resp_integer(n),
         Err(e) => e,
@@ -592,6 +591,9 @@ fn cmd_arinsert(ctx: &mut Ctx) -> Vec<u8> {
         if inner.cursor_exhausted() || n - 1 > ARRAY_MAX_INDEX - inner.next_insert {
             return Err(resp_error(ERR_CURSOR_EXHAUSTED));
         }
+        if n > 1 {
+            inner.promote_for_range(inner.next_insert, inner.next_insert + n - 1);
+        }
         let mut last = inner.next_insert;
         for value in values {
             last = inner.next_insert;
@@ -603,6 +605,33 @@ fn cmd_arinsert(ctx: &mut Ctx) -> Vec<u8> {
         Ok(Ok(last)) => resp_integer(last as i64),
         Ok(Err(e)) | Err(e) => e,
     }
+}
+
+/// `arRingRework`: from the newest position back, at most `keep` items, as
+/// far as the first hole; written again oldest first from 0, the cursor after
+/// the newest.
+fn ring_rebuilt(inner: &ArrayInner, span: u64, keep: u64) -> ArrayInner {
+    let anchor = if inner.next_insert == 0 {
+        span - 1
+    } else {
+        (inner.next_insert - 1) % span
+    };
+    let mut kept: Vec<Arc<[u8]>> = Vec::new();
+    let mut at = anchor;
+    while (kept.len() as u64) < keep {
+        let Some(v) = inner.get(at) else {
+            break;
+        };
+        kept.push(Arc::clone(v));
+        at = if at == 0 { span - 1 } else { at - 1 };
+    }
+    let mut rebuilt = ArrayInner::new();
+    let n = kept.len() as u64;
+    for (i, v) in kept.into_iter().rev().enumerate() {
+        rebuilt.set(i as u64, v);
+    }
+    rebuilt.next_insert = n;
+    rebuilt
 }
 
 /// `ARRING key size value [value ...]` → the last index written.
@@ -629,19 +658,28 @@ fn cmd_arring(ctx: &mut Ctx) -> Vec<u8> {
     let values: Vec<Arc<[u8]>> = ctx.cmd[3..].iter().map(|v| Arc::from(*v)).collect();
 
     match with_array_write(ctx, &key, |inner| {
-        // Resizing the window drops anything that no longer fits inside it.
-        if inner.ring_size != Some(size) {
-            inner.entries.retain(|&idx, _| idx < size);
-            inner.ring_size = Some(size);
-            // Keep the cursor inside the new window so the next write is where
-            // the caller would expect rather than somewhere past the end.
-            inner.next_insert %= size;
+        // The ring is the array: its span is the array's length, and a size
+        // that changes its shape rebuilds it first (Redis's
+        // `arRingNeedsRework` / `arRingRework`).
+        let span = inner.len();
+        let keep = if span == 0 || size == span {
+            None
+        } else if size < span {
+            Some(size)
+        } else if inner.next_insert != 0 && inner.next_insert < span {
+            // Grown after it had wrapped: the new room comes after the newest.
+            Some(span)
+        } else {
+            None
+        };
+        if let Some(keep) = keep {
+            *inner = ring_rebuilt(inner, span, keep);
         }
-        let mut last = inner.next_insert % size;
+        let mut last = 0;
         for value in values {
             last = inner.next_insert % size;
             inner.set(last, value);
-            inner.next_insert = (last + 1) % size;
+            inner.next_insert = last + 1;
         }
         last
     }) {
@@ -691,10 +729,7 @@ fn cmd_arseek(ctx: &mut Ctx) -> Vec<u8> {
     // Explicitly does not create the key — the reply distinguishes "moved" from
     // "no such key", which only means something if a miss stays a miss.
     match with_existing_array_write(ctx, &key, 0i64, |inner| {
-        inner.next_insert = match inner.ring_size {
-            Some(size) => idx % size,
-            None => idx,
-        };
+        inner.next_insert = idx;
         1
     }) {
         Ok(n) => resp_integer(n),
@@ -1168,9 +1203,9 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
         Some(k) => k.to_string(),
         None => return resp_error("ERR key must be valid UTF-8"),
     };
+    // Zero or less is nothing to give, as in Redis.
     let count = match parse_count(ctx.cmd[2]) {
-        Ok(n) if n >= 0 => n as u64,
-        Ok(_) => return resp_error("ERR count must be a non-negative integer"),
+        Ok(n) => n.max(0) as u64,
         Err(e) => return e,
     };
     let mut rev = false;
@@ -1182,34 +1217,23 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     match with_array_read(ctx, &key, Vec::new(), |inner| {
-        // Newest-first, then flipped unless REV was asked for.
-        let mut newest_first: Vec<Vec<u8>> = Vec::new();
-        if count == 0 {
+        // From the newest position back, as many steps as asked (no more
+        // than there are elements), wrapping at the end of the array; a hole
+        // is a nil. Newest first, then flipped unless REV was asked for.
+        let len = inner.len();
+        let steps = count.min(inner.count());
+        let mut newest_first: Vec<Option<Vec<u8>>> = Vec::new();
+        if steps == 0 {
             return newest_first;
         }
-        match inner.ring_size {
-            Some(size) if size > 0 => {
-                // Bounded by the window: at most `size` positions to visit.
-                let steps = count.min(size);
-                for step in 1..=steps {
-                    // next_insert is already reduced mod size; add `size` before
-                    // subtracting so the arithmetic stays in unsigned range.
-                    let idx = (inner.next_insert + size - (step % size)) % size;
-                    if let Some(v) = inner.get(idx) {
-                        newest_first.push(v.to_vec());
-                    }
-                }
-            }
-            _ => {
-                // Walk the map backwards below the cursor — skips gaps for free
-                // instead of stepping index by index through a sparse span.
-                for (_, v) in inner.entries.range(..inner.next_insert).rev() {
-                    if newest_first.len() as u64 >= count {
-                        break;
-                    }
-                    newest_first.push(v.to_vec());
-                }
-            }
+        let mut at = if inner.next_insert == 0 {
+            len - 1
+        } else {
+            inner.next_insert - 1
+        };
+        for _ in 0..steps {
+            newest_first.push(inner.get(at).map(|v| v.to_vec()));
+            at = if at == 0 { len - 1 } else { at - 1 };
         }
         newest_first
     }) {
@@ -1217,7 +1241,15 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
             if !rev {
                 items.reverse();
             }
-            resp_array(items.iter().map(|v| resp_bulk(v)).collect())
+            resp_array(
+                items
+                    .iter()
+                    .map(|v| match v {
+                        Some(v) => resp_bulk(v),
+                        None => crate::resp::write::resp_null_bulk(),
+                    })
+                    .collect(),
+            )
         }
         Err(e) => e,
     }
@@ -1225,55 +1257,39 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
 
 // ── ARINFO ───────────────────────────────────────────────────────────────────
 
-/// Slice statistics derived from the sparse map.
-///
-/// KiviDB has no literal slice directory (see [`ArrayInner`]); these are computed
-/// by bucketing occupied indices into [`ARRAY_SLICE_SIZE`]-wide windows so the
-/// reply carries Redis's field names with values that mean the same thing.
+/// What `ARINFO FULL` reports of an array's slices, as Redis counts it.
 struct SliceStats {
     slices: u64,
     dense: u64,
     sparse: u64,
-    avg_size: f64,
-    avg_fill_rate: f64,
+    dense_winsize: u64,
+    dense_count: u64,
+    sparse_cap: u64,
 }
 
 fn slice_stats(inner: &ArrayInner) -> SliceStats {
-    let mut buckets: Vec<(u64, u64)> = Vec::new(); // (bucket_id, occupancy)
-    for &idx in inner.entries.keys() {
-        let bucket = idx / ARRAY_SLICE_SIZE;
-        match buckets.last_mut() {
-            // Keys arrive in ascending order, so a repeat bucket is always the
-            // one just pushed — no map or sort needed.
-            Some((b, n)) if *b == bucket => *n += 1,
-            _ => buckets.push((bucket, 1)),
+    let mut stats = SliceStats {
+        slices: inner.slices.len() as u64,
+        dense: 0,
+        sparse: 0,
+        dense_winsize: 0,
+        dense_count: 0,
+        sparse_cap: 0,
+    };
+    for slice in inner.slices.values() {
+        match slice.shape {
+            ArraySliceShape::Dense { winsize, .. } => {
+                stats.dense += 1;
+                stats.dense_winsize += u64::from(winsize);
+                stats.dense_count += u64::from(slice.count);
+            }
+            ArraySliceShape::Sparse { cap } => {
+                stats.sparse += 1;
+                stats.sparse_cap += u64::from(cap);
+            }
         }
     }
-    let slices = buckets.len() as u64;
-    if slices == 0 {
-        return SliceStats {
-            slices: 0,
-            dense: 0,
-            sparse: 0,
-            avg_size: 0.0,
-            avg_fill_rate: 0.0,
-        };
-    }
-    // A slice Redis would store densely is one where materialising every slot
-    // costs less than keeping per-element index overhead — half full is the
-    // conventional cut-off and the one used here.
-    let dense = buckets
-        .iter()
-        .filter(|(_, n)| *n * 2 >= ARRAY_SLICE_SIZE)
-        .count() as u64;
-    let total: u64 = buckets.iter().map(|(_, n)| *n).sum();
-    SliceStats {
-        slices,
-        dense,
-        sparse: slices - dense,
-        avg_size: total as f64 / slices as f64,
-        avg_fill_rate: (total as f64 / slices as f64) / ARRAY_SLICE_SIZE as f64,
-    }
+    stats
 }
 
 /// `ARINFO key [FULL]` → array metadata. RESP2 flat array, RESP3 map.
@@ -1309,23 +1325,30 @@ fn cmd_arinfo(ctx: &mut Ctx) -> Vec<u8> {
             // for a 4096-wide slice means very large sparse arrays.
             (
                 "super-dir-entries",
-                resp_integer(stats.slices.div_ceil(ARRAY_SLICE_SIZE).saturating_sub(1) as i64),
+                resp_integer(
+                    stats
+                        .slices
+                        .div_ceil(u64::from(inner.slice_size))
+                        .saturating_sub(1) as i64,
+                ),
             ),
-            ("slice-size", resp_integer(ARRAY_SLICE_SIZE as i64)),
+            ("slice-size", resp_integer(i64::from(inner.slice_size))),
         ];
-        if let Some(size) = inner.ring_size {
-            kv.push(("ring-size", resp_integer(size as i64)));
-        }
         if full {
+            let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
             kv.push(("dense-slices", resp_integer(stats.dense as i64)));
             kv.push(("sparse-slices", resp_integer(stats.sparse as i64)));
             kv.push((
-                "avg-slice-size",
-                crate::resp::write::resp_double_bulk(stats.avg_size),
+                "avg-dense-size",
+                crate::resp::write::resp_double_bulk(ratio(stats.dense_winsize, stats.dense)),
             ));
             kv.push((
-                "avg-fill-rate",
-                crate::resp::write::resp_double_bulk(stats.avg_fill_rate),
+                "avg-dense-fill",
+                crate::resp::write::resp_double_bulk(ratio(stats.dense_count, stats.dense_winsize)),
+            ));
+            kv.push((
+                "avg-sparse-size",
+                crate::resp::write::resp_double_bulk(ratio(stats.sparse_cap, stats.sparse)),
             ));
         }
         Some(kv)

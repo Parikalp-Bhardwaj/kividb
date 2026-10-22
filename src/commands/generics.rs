@@ -102,6 +102,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
             if small { "listpackex" } else { "hashtable" }
         }
         KiviDBValue::Stream(_) => "stream",
+        KiviDBValue::Array(_) => "sliced-array",
         _ => "raw",
     }
 }
@@ -1254,9 +1255,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             // Verify the trailer (version + checksum) and decode.
-            let value = match crate::snapshot::restore_payload(payload) {
-                Some(v) => v,
-                None => return Some(resp_error("ERR DUMP payload version or checksum are wrong")),
+            let value = match crate::snapshot::restore_payload_checked(payload) {
+                Ok(v) => v,
+                Err(e) => return Some(resp_error(e.message())),
             };
 
             // A restored series has to be findable by its labels, the same as

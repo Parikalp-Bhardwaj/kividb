@@ -2768,3 +2768,82 @@ fn test_client_setinfo_arity() {
     assert!(c.cmds(&["CLIENT", "SETINFO", "LIB-NAME"]).is_error());
     assert!(c.cmds(&["CLIENT", "SETINFO"]).is_error());
 }
+
+/// A `BCAST` client is told only of the keys its user may read, by the user
+/// it is now, as in Redis 8.10 (unit/tracking).
+#[test]
+fn test_bcast_tells_only_what_the_user_may_read() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    for rule in [["usr_a", ">passA", "~a:*"], ["usr_b", ">passB", "~b:*"]] {
+        let r = admin.cmds(&["ACL", "SETUSER", rule[0], "on", rule[1], rule[2], "+@all"]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let mut tc = Conn::connect(port);
+    assert!(tc.cmds(&["AUTH", "usr_a", "passA"]).is_ok());
+    tc.cmds(&["HELLO", "3"]);
+    assert!(
+        tc.cmds(&[
+            "CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "a:", "PREFIX", "b:"
+        ])
+        .is_ok()
+    );
+
+    let invalidated = |tc: &mut Conn| -> Vec<String> {
+        let push = tc.read_value();
+        let parts = push.as_array();
+        assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
+        parts[1]
+            .as_array()
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    };
+
+    admin.cmds(&["SET", "a:1", "v"]);
+    admin.cmds(&["SET", "b:1", "v"]);
+    assert_eq!(invalidated(&mut tc), ["a:1"]);
+
+    assert!(tc.cmds(&["AUTH", "usr_b", "passB"]).is_ok());
+    admin.cmds(&["SET", "a:2", "v"]);
+    admin.cmds(&["SET", "b:2", "v"]);
+    assert_eq!(invalidated(&mut tc), ["b:2"]);
+
+    // Of one command's keys, the ones it may read.
+    admin.cmds(&["MSET", "a:3", "v", "b:3", "v"]);
+    assert_eq!(invalidated(&mut tc), ["b:3"]);
+    assert_eq!(tc.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
+}
+
+/// A write and an `ACL SETUSER` that takes the key away, in one
+/// transaction: the BCAST client is told of the key under the permissions it
+/// had when the key was written, as in Redis 8.10 (unit/tracking).
+#[test]
+fn test_bcast_pending_is_told_before_acl_setuser_changes_the_user() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "setu", "on", ">setpass", "~p:*", "+@all"])
+            .is_ok()
+    );
+    let mut tc = Conn::connect(port);
+    assert!(tc.cmds(&["AUTH", "setu", "setpass"]).is_ok());
+    tc.cmds(&["HELLO", "3"]);
+    assert!(
+        tc.cmds(&["CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "p:"])
+            .is_ok()
+    );
+
+    admin.cmds(&["MULTI"]);
+    admin.cmds(&["SET", "p:x", "1"]);
+    admin.cmds(&["ACL", "SETUSER", "setu", "resetkeys", "~q:*"]);
+    admin.cmds(&["EXEC"]);
+
+    let push = tc.read_value();
+    let parts = push.as_array();
+    assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
+    assert_eq!(parts[1].as_array()[0].as_str(), "p:x");
+}

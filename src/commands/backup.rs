@@ -389,7 +389,7 @@ fn seal(ctx: &Ctx) -> Vec<u8> {
         return resp_error(&format!("ERR could not seal the backup: {e}"));
     }
 
-    let ttl = ctx.config.backup_sealed_ttl;
+    let ttl = sealed_ttl(ctx.config);
     {
         let mut backup = BACKUP.lock();
         if backup.seq != seq {
@@ -546,6 +546,20 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             "ERR unknown subcommand '{other}'. Try BACKUP HELP."
         )),
     })
+}
+
+/// `backup-sealed-ttl` as `CONFIG SET` left it, or as configured.
+static SEALED_TTL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub(crate) fn sealed_ttl(config: &crate::config::Config) -> u64 {
+    match SEALED_TTL.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => config.backup_sealed_ttl,
+        set => set,
+    }
+}
+
+pub(crate) fn set_sealed_ttl(seconds: u64) {
+    SEALED_TTL.store(seconds, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

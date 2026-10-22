@@ -54,7 +54,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "GRAPH" => {
-            // Minimal ASCII sparkline — Redis returns a bulk string
+            // Redis's graph: a header with the high and the low, then the
+            // samples as an ASCII sparkline (see `graph`).
             if cmd.len() < 3 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'latency|graph' command",
@@ -65,8 +66,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if samples.is_empty() {
                 return Some(resp_error(&format!("ERR No samples for event '{event}'")));
             }
-            let graph = build_sparkline(&samples);
-            Some(resp_bulk_str(&graph))
+            Some(resp_bulk_str(&graph(&event, &samples, unix_now_secs())))
         }
 
         "HISTOGRAM" => {
@@ -182,24 +182,135 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn build_sparkline(samples: &[crate::latency::LatencySample]) -> String {
-    // 7-row, up-to-80-col ASCII chart
-    let bars = "▁▂▃▄▅▆▇█";
-    let bar_chars: Vec<char> = bars.chars().collect();
-    let max_ms = samples
+/// `LATENCY GRAPH`, as Redis's `latencyCommandGenSparkeline` draws it: a
+/// header, a rule of 80 dashes, and the samples as a sparkline of four rows
+/// (`sparkline.c`, filled), each labelled with how long ago it was, read
+/// downwards. Past 80 samples the graph goes on below. The "all time high"
+/// is the highest of the samples kept.
+fn graph(event: &str, samples: &[crate::latency::LatencySample], now: u64) -> String {
+    const COLUMNS: usize = 80;
+    const ROWS: usize = 4;
+    let values: Vec<u32> = samples.iter().map(|s| s.latency_ms).collect();
+    let max = values.iter().copied().max().unwrap_or(0);
+    let min = values.iter().copied().min().unwrap_or(0);
+    let labels: Vec<String> = samples
         .iter()
-        .map(|s| s.latency_ms)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    samples
-        .iter()
-        .take(80)
         .map(|s| {
-            let idx = ((s.latency_ms as f64 / max_ms as f64) * (bar_chars.len() - 1) as f64).round()
-                as usize;
-            bar_chars[idx.min(bar_chars.len() - 1)]
+            let ago = now.saturating_sub(s.timestamp);
+            match ago {
+                0..60 => format!("{ago}s"),
+                60..3600 => format!("{}m", ago / 60),
+                3600..86400 => format!("{}h", ago / 3600),
+                _ => format!("{}d", ago / 86400),
+            }
         })
-        .collect()
+        .collect();
+
+    let mut out = format!("{event} - high {max} ms, low {min} ms (all time high {max} ms)\n");
+    out.push_str(&"-".repeat(COLUMNS));
+    out.push('\n');
+    let (lo, hi) = (min as f64, max as f64);
+    for (n, start) in (0..values.len()).step_by(COLUMNS).enumerate() {
+        if n != 0 {
+            out.push('\n');
+        }
+        let end = (start + COLUMNS).min(values.len());
+        sparkline(
+            &mut out,
+            &values[start..end],
+            &labels[start..end],
+            lo,
+            hi,
+            ROWS,
+        );
+    }
+    out
+}
+
+/// Redis's `sparklineRenderRange`, with `SPARKLINE_FILL`.
+fn sparkline(out: &mut String, values: &[u32], labels: &[String], lo: f64, hi: f64, rows: usize) {
+    const CHARSET_FILL: &[u8] = b"_o#";
+    let steps = (CHARSET_FILL.len() * rows) as i64;
+    let relmax = if hi - lo == 0.0 { 1.0 } else { hi - lo };
+    let label_margin_top = 1;
+    let mut row = 0;
+    loop {
+        let mut chars = vec![b' '; values.len()];
+        let mut more = false;
+        for (j, &value) in values.iter().enumerate() {
+            if row < rows {
+                let step = (((value as f64 - lo) * steps as f64) / relmax) as i64;
+                let step = step.clamp(0, steps - 1);
+                let at = step - ((rows - row - 1) * CHARSET_FILL.len()) as i64;
+                more = true;
+                if (0..CHARSET_FILL.len() as i64).contains(&at) {
+                    chars[j] = CHARSET_FILL[at as usize];
+                } else if at >= CHARSET_FILL.len() as i64 {
+                    chars[j] = b'|';
+                }
+            } else {
+                if row - rows < label_margin_top {
+                    more = true;
+                    break;
+                }
+                let label = labels[j].as_bytes();
+                let at = row - rows - label_margin_top;
+                if at < label.len() {
+                    more = true;
+                    chars[j] = label[at];
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+        row += 1;
+        out.push_str(std::str::from_utf8(&chars).unwrap_or_default());
+        out.push('\n');
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::graph;
+    use crate::latency::LatencySample;
+
+    #[test]
+    fn the_graph_is_redis_s() {
+        let samples = [
+            LatencySample {
+                timestamp: 110,
+                latency_ms: 10,
+            },
+            LatencySample {
+                timestamp: 130,
+                latency_ms: 300,
+            },
+            LatencySample {
+                timestamp: 150,
+                latency_ms: 150,
+            },
+        ];
+        let g = graph("expire-cycle", &samples, 160);
+        let mut lines = g.lines();
+        assert_eq!(
+            lines.next(),
+            Some("expire-cycle - high 300 ms, low 10 ms (all time high 300 ms)")
+        );
+        assert_eq!(lines.next(), Some("-".repeat(80).as_str()));
+        // Four rows of the sparkline, a blank line, then the labels read
+        // downwards: 50s, 30s and 10s ago.
+        let rest: Vec<&str> = lines.collect();
+        assert_eq!(
+            rest,
+            [" # ", " | ", " |#", "_||", "   ", "531", "000", "sss"]
+        );
+    }
 }

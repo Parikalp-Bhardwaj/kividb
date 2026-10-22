@@ -670,7 +670,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
         parts[id_index] = id_str_out.clone().into_bytes();
         if approx.is_some() {
-            stream_extra::exact_trim_args(&mut parts, 2, id_index, &inner);
+            stream_extra::exact_trim_args(&mut parts, 2, id_index, &inner, trim_refs);
         }
         effect(parts);
     }
@@ -935,6 +935,11 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                     .and_then(|s| s.parse().ok());
                 i += 2;
             }
+            "CLAIM" if i + 1 < cmd.len() => {
+                return resp_error(
+                    "ERR The CLAIM option is only supported by XREADGROUP. You called XREAD instead.",
+                );
+            }
             "STREAMS" => {
                 i += 1;
                 break;
@@ -1195,7 +1200,7 @@ pub fn xtrim(ctx: &mut Ctx) -> Vec<u8> {
                     if removed > 0 {
                         let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
                         let end = parts.len();
-                        stream_extra::exact_trim_args(&mut parts, 2, end, &inner);
+                        stream_extra::exact_trim_args(&mut parts, 2, end, &inner, refs);
                         effect(parts);
                     }
                     removed
@@ -1301,6 +1306,16 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
 
 // ── XGROUP CREATE ─────────────────────────────────────────────────────────────
 
+/// `ENTRIESREAD n` for a stream that has had `added` entries: no more
+/// than those, as Redis caps it (a lag below zero means nothing).
+fn capped_entries_read(n: u64, added: u64) -> u64 {
+    if n != ConsumerGroup::NO_COUNT && n > added {
+        added
+    } else {
+        n
+    }
+}
+
 /// `ENTRIESREAD n`: a count, or -1 for "not known".
 fn entries_read_arg(raw: &[u8]) -> Result<u64, Vec<u8>> {
     match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
@@ -1382,6 +1397,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         }
     };
 
+    let entries_read = capped_entries_read(entries_read, inner.entries_added);
     inner.groups.insert(
         group.clone(),
         ConsumerGroup {
@@ -1461,6 +1477,7 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_error("ERR no such key"),
         Some(KiviDBValue::Stream(s)) => {
             let mut inner = s.write();
+            let added = inner.entries_added;
             let new_id = if id_str == "$" {
                 inner.last_id.clone()
             } else {
@@ -1481,7 +1498,8 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
                     g.last_id = new_id;
                     // A new position without a count is a position whose
                     // count is not known.
-                    g.entries_read = entries_read.unwrap_or(ConsumerGroup::NO_COUNT);
+                    g.entries_read =
+                        capped_entries_read(entries_read.unwrap_or(ConsumerGroup::NO_COUNT), added);
                     resp_simple("OK")
                 }
             }
@@ -1706,12 +1724,13 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
                 i += 2;
             }
             "CLAIM" => {
-                claim_min_idle = match cmd
-                    .get(i + 1)
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| s.parse().ok())
+                // As Redis reads an integer: `+10` is not one.
+                claim_min_idle = match cmd.get(i + 1).and_then(|b| stream_extra::strict_integer(b))
                 {
-                    Some(ms) => Some(ms),
+                    Some(ms) if ms < 0 => {
+                        return resp_error("ERR min-idle-time must be a positive integer");
+                    }
+                    Some(ms) => Some(ms as u64),
                     None => {
                         return resp_error("ERR min-idle-time is not an integer or out of range");
                     }
@@ -2047,7 +2066,7 @@ fn run_xreadgroup_delivery(
                     let Some(pending) = g.pel.get_mut(&id) else {
                         continue;
                     };
-                    let idle = if pending.delivered_at == 0 {
+                    let idle = if pending.delivered_at < stream_extra::NACKED_BELOW {
                         0
                     } else {
                         now.saturating_sub(pending.delivered_at)
@@ -2343,11 +2362,11 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     })
                     .take(count)
                     .map(|(id, p)| {
-                        // `delivered_at == 0` is the XNACK marker for "released,
+                        // `delivered_at` below `NACKED_BELOW` is XNACK's mark for "released,
                         // never re-delivered". Redis reports that as an idle of
                         // -1 rather than "now", which would otherwise read as an
                         // absurd age measured from the epoch.
-                        let idle = if p.delivered_at == 0 {
+                        let idle = if p.delivered_at < stream_extra::NACKED_BELOW {
                             -1
                         } else {
                             now.saturating_sub(p.delivered_at) as i64
@@ -2533,10 +2552,12 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
                     None => continue,
                 }
 
+                // An entry FORCE makes starts as one delivery, as Redis's
+                // `streamCreateNACK` makes it (JUSTID then leaves it at 1).
                 let pending = g.pel.entry(id.clone()).or_insert(PelEntry {
                     consumer: new_consumer.clone(),
                     delivered_at,
-                    delivery_count: 0,
+                    delivery_count: 1,
                 });
                 pending.consumer = new_consumer.clone();
                 pending.delivered_at = delivered_at;
@@ -2939,7 +2960,7 @@ fn xinfo_stream_full(
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
                         resp_bulk_str(&p.consumer),
-                        resp_integer(p.delivered_at as i64),
+                        resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
                 })
@@ -2953,7 +2974,7 @@ fn xinfo_stream_full(
                         .map(|(id, p)| {
                             resp_array(vec![
                                 resp_bulk_str(&id.to_string()),
-                                resp_integer(p.delivered_at as i64),
+                                resp_integer(shown_delivery_time(p.delivered_at)),
                                 resp_integer(p.delivery_count as i64),
                             ])
                         })
@@ -3188,8 +3209,8 @@ fn notify_xread_waiters(ctx: &Ctx, key: &str) {
 // Per ID:
 //    1  → deleted
 //   -1  → no such entry in the stream
-//    2  → not deleted: still referenced (ACKED), or there are no consumer
-//         groups for it to have been acknowledged by
+//    2  → not deleted: still referenced (ACKED). With no consumer groups
+//         nothing refers to it, and ACKED deletes it (Redis 8.10).
 
 pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
@@ -3230,8 +3251,8 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
                 }
                 return resp_integer(-1);
             }
-            let acked = refs != TrimRefs::Acked || !inner.groups.is_empty();
-            if acked && stream_extra::delete_entry(&mut inner, id, refs) {
+            // With no groups, nothing refers to it (Redis 8.10).
+            if stream_extra::delete_entry(&mut inner, id, refs) {
                 resp_integer(1)
             } else {
                 resp_integer(2)
@@ -3291,8 +3312,9 @@ pub fn xackdel(ctx: &mut Ctx) -> Vec<u8> {
 
     // One write lock covers the acknowledgement and the deletion.
     let mut inner = stream.write();
+    // No such group: -1 for every ID, as for no such key (Redis 8.10).
     if !inner.groups.contains_key(&group_name) {
-        return resp_error("NOGROUP No such consumer group");
+        return resp_array(ids.iter().map(|_| resp_integer(-1)).collect());
     }
 
     let replies = ids
@@ -3523,6 +3545,16 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
 /// The functional effect — immediate claimability — is preserved via the
 /// delivery-time-0 marker; the relative ordering against other already-idle
 /// entries is not. Documented in `docs/REDIS_8_8_COMMANDS.md`.
+/// A pending entry's delivery time as `XINFO STREAM FULL` shows it: 0 for
+/// one `XNACK` released, as in Redis (see `stream_extra::nack_time`).
+fn shown_delivery_time(delivered_at: u64) -> i64 {
+    if delivered_at < stream_extra::NACKED_BELOW {
+        0
+    } else {
+        delivered_at as i64
+    }
+}
+
 pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     // key group MODE IDS numids id  → 7 minimum
@@ -3551,25 +3583,49 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
     } else if cmd[3].eq_ignore_ascii_case(b"FATAL") {
         Mode::Fatal
     } else {
-        return resp_error("ERR syntax error, expected one of SILENT, FAIL or FATAL");
+        return resp_error("ERR mode must be SILENT, FAIL, or FATAL");
     };
 
-    if !cmd[4].eq_ignore_ascii_case(b"IDS") {
-        return resp_error("ERR syntax error, expected IDS");
+    // The options, in any order, as Redis reads them: `IDS numids id ...`,
+    // `FORCE`, `RETRYCOUNT n`.
+    let mut ids_at: Option<(usize, usize)> = None;
+    let mut retrycount: Option<u64> = None;
+    let mut force = false;
+    let mut i = 4;
+    while i < cmd.len() {
+        let more = i + 1 < cmd.len();
+        if cmd[i].eq_ignore_ascii_case(b"IDS") && more {
+            let numids = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                Some(n) if (1..=i64::from(i32::MAX)).contains(&n) => n as usize,
+                _ => return resp_error("ERR numids must be a positive integer"),
+            };
+            if numids > cmd.len() - (i + 2) {
+                return resp_error("ERR number of IDs doesn't match numids");
+            }
+            ids_at = Some((i + 2, numids));
+            i += 2 + numids;
+        } else if cmd[i].eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+            i += 1;
+        } else if cmd[i].eq_ignore_ascii_case(b"RETRYCOUNT") && more {
+            match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                Some(n) if n >= 0 => retrycount = Some(n as u64),
+                Some(_) => return resp_error("ERR Invalid RETRYCOUNT value, must be >= 0"),
+                None => return resp_error("ERR value is not an integer or out of range"),
+            }
+            i += 2;
+        } else {
+            return resp_error(&format!(
+                "ERR Unrecognized XNACK option '{}'",
+                String::from_utf8_lossy(cmd[i])
+            ));
+        }
     }
-    let numids: usize = match parse_utf8(cmd[5]).and_then(|s| s.parse().ok()) {
-        Some(n) => n,
-        None => return resp_error("ERR value is not an integer or out of range"),
+    let Some((ids_from, numids)) = ids_at else {
+        return resp_error("ERR syntax error, expected IDS keyword");
     };
-    if numids == 0 {
-        return resp_error("ERR numids must be greater than 0");
-    }
-    if numids > cmd.len().saturating_sub(6) {
-        return resp_error("ERR syntax error, numids does not match the number of IDs given");
-    }
-
     let mut ids: Vec<StreamId> = Vec::with_capacity(numids);
-    for raw in &cmd[6..6 + numids] {
+    for raw in &cmd[ids_from..ids_from + numids] {
         match StreamId::parse(std::str::from_utf8(raw).unwrap_or("")) {
             Some(id) => ids.push(id),
             None => {
@@ -3577,35 +3633,18 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
             }
         }
     }
-
-    // Trailing options after the ID block.
-    let mut retrycount: Option<u64> = None;
-    let mut force = false;
-    let mut i = 6 + numids;
-    while i < cmd.len() {
-        if cmd[i].eq_ignore_ascii_case(b"RETRYCOUNT") {
-            if i + 1 >= cmd.len() {
-                return resp_error("ERR syntax error");
-            }
-            match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
-                Some(n) if n >= 0 => retrycount = Some(n as u64),
-                _ => return resp_error("ERR value is not an integer or out of range"),
-            }
-            i += 2;
-        } else if cmd[i].eq_ignore_ascii_case(b"FORCE") {
-            force = true;
-            i += 1;
-        } else {
-            return resp_error("ERR syntax error");
-        }
-    }
+    let no_group = || {
+        resp_error(&format!(
+            "NOGROUP No such key '{key}' or consumer group '{group}'"
+        ))
+    };
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
+        None => no_group(),
         Some(KiviDBValue::Stream(s)) => {
             let mut inner = s.write();
             // FORCE needs to know which IDs exist in the stream; take that set
@@ -3619,9 +3658,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
             };
 
             let Some(g) = inner.groups.get_mut(&group) else {
-                return resp_error(&format!(
-                    "NOGROUP No such consumer group '{group}' for key name '{key}'"
-                ));
+                return no_group();
             };
 
             let mut released = 0i64;
@@ -3640,9 +3677,10 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                                 Mode::Fatal => i64::MAX as u64,
                             },
                         };
-                        // Unowned, and immediately claimable.
+                        // Unowned, and immediately claimable, after what
+                        // was released before it.
                         entry.consumer = String::new();
-                        entry.delivered_at = 0;
+                        entry.delivered_at = stream_extra::nack_time();
                         released += 1;
                     }
                     None if force => {
@@ -3660,7 +3698,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                             id.clone(),
                             PelEntry {
                                 consumer: String::new(),
-                                delivered_at: 0,
+                                delivered_at: stream_extra::nack_time(),
                                 delivery_count,
                             },
                         );
