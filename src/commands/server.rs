@@ -3339,13 +3339,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("used_memory_dataset_perc:{dataset_perc:.2}%\r\n"));
                 // The VM `EVAL` scripts run in (`[s used_memory_lua]` in
                 // unit/scripting.tcl).
+                // `used_memory_vm_eval` is its name since Redis 7, and
+                // `used_memory_lua` the old one.
                 #[cfg(feature = "lua")]
                 out.push_str(&format!(
-                    "used_memory_lua:{}\r\n",
-                    crate::commands::lua::eval_vm_bytes()
+                    "used_memory_lua:{eval}\r\nused_memory_vm_eval:{eval}\r\nused_memory_scripts_eval:{scripts}\r\n",
+                    eval = crate::commands::lua::eval_vm_bytes(),
+                    scripts = crate::commands::lua::cached_scripts_bytes()
                 ));
                 #[cfg(not(feature = "lua"))]
-                out.push_str("used_memory_lua:0\r\n");
+                out.push_str(
+                    "used_memory_lua:0\r\nused_memory_vm_eval:0\r\nused_memory_scripts_eval:0\r\n",
+                );
                 // The VM functions are loaded into.
                 #[cfg(feature = "lua")]
                 out.push_str(&format!(
@@ -3354,6 +3359,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 #[cfg(not(feature = "lua"))]
                 out.push_str("used_memory_vm_functions:0\r\n");
+                #[cfg(feature = "lua")]
+                out.push_str(&format!(
+                    "used_memory_vm_total:{}\r\n",
+                    crate::commands::lua::eval_vm_bytes()
+                        + crate::commands::lua::functions_vm_bytes()
+                ));
+                #[cfg(not(feature = "lua"))]
+                out.push_str("used_memory_vm_total:0\r\n");
                 #[cfg(feature = "lua")]
                 out.push_str(&format!(
                     "number_of_cached_scripts:{}\r\n",

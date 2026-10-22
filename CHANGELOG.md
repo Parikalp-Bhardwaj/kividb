@@ -39,12 +39,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **`EVAL` scripts and functions have a Lua VM each**, as in Redis. What
-  scripts hold (their compiled code) is reported as `used_memory_lua`,
-  which was always 0, and no longer counts in `used_memory_vm_functions`.
-  `SCRIPT FLUSH` lets go of the scripts' VM, as Redis's does; `FUNCTION
-  FLUSH` leaves it. The two still share one lock: a script and a function
-  never run at the same time.
+- **`EVAL` scripts and functions have a Lua VM each**, as in Redis. The
+  shared VM that runs scripts one at a time is reported as `used_memory_lua`
+  (and Redis's newer name, `used_memory_vm_eval`), which was always 0, and
+  no longer counts in `used_memory_vm_functions`; `used_memory_vm_total` is
+  the two together, and `used_memory_scripts_eval` what the cached scripts'
+  text takes. The VMs each thread keeps for parallel scripts are not in
+  these figures. `SCRIPT FLUSH` lets go of the scripts' VMs, the threads'
+  as well, as Redis lets go of its own (with `ASYNC`, more than 64 scripts
+  are freed in the background); `FUNCTION FLUSH` leaves them, and `SCRIPT
+  FLUSH` leaves the functions'. A flushed VM is made again when next
+  wanted, and shows 0 until then. The two still share one lock: a script
+  and a function never run at the same time, and `SCRIPT RESET` renews both
+  under it at once.
 
 - **A script's error ends as Redis's does**, naming the script and the
   place: `... script: <sha1>, on @user_script:1.` (the function's name for

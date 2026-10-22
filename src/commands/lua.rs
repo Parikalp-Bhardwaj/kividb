@@ -65,6 +65,16 @@ pub(crate) fn cached_script_count() -> usize {
     script_store().read().len()
 }
 
+/// `used_memory_scripts_eval`: what the cached scripts' text takes, with
+/// their SHA1s.
+pub(crate) fn cached_scripts_bytes() -> u64 {
+    script_store()
+        .read()
+        .iter()
+        .map(|(sha, body)| (sha.len() + body.len()) as u64)
+        .sum()
+}
+
 #[derive(Clone)]
 struct FunctionLibrary {
     name: String,
@@ -109,7 +119,7 @@ fn fn_name_to_library() -> &'static RwLock<HashMap<String, String>> {
     FN_NAME_TO_LIBRARY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// One shared Lua VM (Redis-compatible): scripts do not run in parallel. A
+/// The shared Lua VMs (Redis-compatible): scripts do not run in parallel. A
 /// second script, and every other client's command, waits for the one that
 /// is running — and is told `BUSY` only once that one has run for longer
 /// than `lua-time-limit`. (They used to be told `BUSY` at once, so any two
@@ -155,6 +165,17 @@ impl Vm {
             Vm::Functions => &FUNCTIONS_VM_BYTES,
         }
     }
+
+    /// How many times it has been flushed: each thread's own VM of this
+    /// kind (parallel scripts) is made again when this has moved on.
+    fn generation(self) -> &'static AtomicU64 {
+        static EVAL: AtomicU64 = AtomicU64::new(0);
+        static FUNCTIONS: AtomicU64 = AtomicU64::new(0);
+        match self {
+            Vm::Eval => &EVAL,
+            Vm::Functions => &FUNCTIONS,
+        }
+    }
 }
 thread_local! {
     /// Points at the active [`Lua`] while the global VM mutex is held on this thread.
@@ -166,7 +187,7 @@ static LUA_HOLD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 /// Unix ms at which the script now holding the VM took it.
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
-/// Bytes the shared VM held when it was last let go: `INFO`'s
+/// Bytes the functions' VM held when it was last let go: `INFO`'s
 /// `used_memory_vm_functions`, read without waiting for a running script.
 static FUNCTIONS_VM_BYTES: AtomicU64 = AtomicU64::new(0);
 /// `used_memory_lua`: the `EVAL` VM, as [`FUNCTIONS_VM_BYTES`] is read.
@@ -604,9 +625,11 @@ fn sha1_hex(source: &str) -> String {
 }
 
 thread_local! {
-    static LUA: RefCell<Option<Lua>> = const { RefCell::new(None) };
+    /// With the [`Vm::generation`] it was made in: a flush after that
+    /// makes it stale, and it is made again when next wanted.
+    static LUA: RefCell<Option<(u64, Lua)>> = const { RefCell::new(None) };
     /// This thread's own VM for functions, beside [`LUA`] for scripts.
-    static LUA_FUNCTIONS: RefCell<Option<Lua>> = const { RefCell::new(None) };
+    static LUA_FUNCTIONS: RefCell<Option<(u64, Lua)>> = const { RefCell::new(None) };
 }
 
 /// Clears script evaluation context when leaving `EVAL` / `FCALL`.
@@ -739,7 +762,7 @@ where
 
     // A script under its tag's lock runs on this thread's own VM, beside the
     // scripts of other threads. The shared VM below is for the scripts that
-    // run alone, one at a time, and for functions, which are loaded into it.
+    // run alone, one at a time, and the functions' VM beside it.
     if crate::tag_locks::beside_others() {
         return Ok(with_this_threads_vm(vm, f));
     }
@@ -822,7 +845,13 @@ where
     };
     which.with(|mine| {
         let mut mine = mine.borrow_mut();
-        let lua = mine.get_or_insert_with(new_lua_vm);
+        // Made again after `SCRIPT FLUSH` or `FUNCTION FLUSH`, as the shared
+        // VMs are: this thread's is let go of when next wanted.
+        let generation = vm.generation().load(Ordering::Acquire);
+        if mine.as_ref().is_none_or(|(made, _)| *made != generation) {
+            *mine = Some((generation, new_lua_vm()));
+        }
+        let (_, lua) = mine.as_mut().expect("made above");
         // For a script the script calls (`redis.call('EVALSHA', …)`).
         let nn = std::ptr::NonNull::from(&mut *lua);
         EXEC_LUA.with(|c| {
@@ -4223,7 +4252,7 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
     }
     let libraries = std::mem::take(&mut *function_store().write());
     let names = std::mem::take(&mut *fn_name_to_library().write());
-    let vm = match lua_vm_take_for_admin(Vm::Functions) {
+    let vm = match lua_vms_renew_for_admin(&[Vm::Functions]) {
         Ok(vm) => vm,
         Err(LuaVmBusy) => {
             return resp_error(
@@ -4240,20 +4269,28 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// Replace the VM only when no script holds it (`LUA_HOLD_DEPTH == 0`).
-fn lua_vm_reset_for_admin(vm: Vm) -> Result<(), LuaVmBusy> {
-    lua_vm_take_for_admin(vm).map(drop)
-}
-
-/// Take the VM out, for the next script to make a new one, only when no
-/// script holds it (`LUA_HOLD_DEPTH == 0`).
-fn lua_vm_take_for_admin(vm: Vm) -> Result<Option<Lua>, LuaVmBusy> {
+/// Take each of `vms` out under one hold of the lock, for the next script
+/// or function to make a new one, and make each thread's own VMs of those
+/// kinds stale. Only when no script holds the lock (`LUA_HOLD_DEPTH == 0`):
+/// otherwise nothing is changed. Returns the VMs taken out, for the caller to
+/// drop or free in the background.
+///
+/// Redis puts a new VM in at once and reports its size; here the new one is
+/// made when first wanted, and 0 is reported until then. An empty VM of ours
+/// (with cjson, cmsgpack, bit and the read-only proxies) is about 50 KB,
+/// where Redis's suite allows a flushed functions VM 40000 bytes.
+fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
     }
-    vm.bytes().store(0, Ordering::Relaxed);
-    Ok(guard.of(vm).take())
+    let mut old = Vec::with_capacity(vms.len());
+    for &vm in vms {
+        vm.bytes().store(0, Ordering::Relaxed);
+        vm.generation().fetch_add(1, Ordering::Release);
+        old.extend(guard.of(vm).take());
+    }
+    Ok(old)
 }
 
 fn function_stats() -> Vec<u8> {
@@ -4570,7 +4607,7 @@ fn load_merged_into_vm(
         Ok(Err(error)) => {
             // The store was not changed. Drop any functions committed before
             // a later library failed; the next call rebuilds the VM from it.
-            let _ = lua_vm_reset_for_admin(Vm::Functions);
+            let _ = lua_vms_renew_for_admin(&[Vm::Functions]);
             return Err(error);
         }
     };
@@ -4632,7 +4669,7 @@ fn function_restore(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return resp_error(&e),
     };
 
-    if let Err(LuaVmBusy) = lua_vm_reset_for_admin(Vm::Functions) {
+    if let Err(LuaVmBusy) = lua_vms_renew_for_admin(&[Vm::Functions]) {
         return resp_error(
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         );
@@ -4731,17 +4768,26 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             resp_array(parts)
         }
         "FLUSH" => {
-            // `SCRIPT FLUSH [ASYNC|SYNC]` — we only support synchronous semantics.
-            // The scripts go, and so does the VM that compiled them, as
-            // Redis resets its scripting VM: what they held is let go.
-            // (A script running now keeps it, and it goes next time.)
-            script_store().write().clear();
-            let _ = lua_vm_reset_for_admin(Vm::Eval);
+            // `SCRIPT FLUSH [ASYNC|SYNC]`: the scripts go, and so does the VM
+            // that compiled them, as Redis resets its scripting VM. (A script
+            // running now keeps it, and it goes next time.) `ASYNC` frees
+            // them in the background when there are more than 64, as Redis
+            // does (`freeLuaScriptsAsync`), counting the scripts.
+            let async_free = match ctx.cmd.get(2) {
+                None => false,
+                Some(word) if ctx.cmd.len() == 3 && word.eq_ignore_ascii_case(b"SYNC") => false,
+                Some(word) if ctx.cmd.len() == 3 && word.eq_ignore_ascii_case(b"ASYNC") => true,
+                Some(_) => return resp_error("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
+            };
+            let scripts = std::mem::take(&mut *script_store().write());
+            let vm = lua_vms_renew_for_admin(&[Vm::Eval]).unwrap_or_default();
+            if async_free && scripts.len() > 64 {
+                let n = scripts.len() as u64;
+                crate::lazyfree::free_later((vm, scripts), n);
+            }
             resp_simple("OK")
         }
-        "RESET" => match lua_vm_reset_for_admin(Vm::Eval)
-            .and_then(|()| lua_vm_reset_for_admin(Vm::Functions))
-        {
+        "RESET" => match lua_vms_renew_for_admin(&[Vm::Eval, Vm::Functions]).map(drop) {
             Ok(()) => resp_simple("OK"),
             Err(LuaVmBusy) => resp_error(
                 "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",

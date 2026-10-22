@@ -1452,6 +1452,65 @@ fn test_scripts_and_functions_have_a_vm_each() {
     c.cmds(&["FUNCTION", "FLUSH"]);
     assert_eq!(info(&mut c, "used_memory_lua"), scripts);
     c.cmds(&["SCRIPT", "FLUSH"]);
+    // The VM goes; a new one is made when a script next runs.
     assert_eq!(info(&mut c, "used_memory_lua"), 0);
+    assert_eq!(info(&mut c, "used_memory_vm_eval"), 0);
+    assert_eq!(
+        info(&mut c, "used_memory_vm_total"),
+        info(&mut c, "used_memory_vm_functions")
+    );
     assert_eq!(c.cmds(&["EVAL", "return 7", "0"]).as_int(), 7);
+    assert!(info(&mut c, "used_memory_scripts_eval") > 0);
+}
+
+/// What one flush does to the other kind (vimoppa's review of #75): a
+/// function still runs after `SCRIPT FLUSH`, a script cached before
+/// `FUNCTION FLUSH` still runs after it, and `SCRIPT RESET` renews both VMs
+/// with everything still working after.
+#[test]
+fn test_each_flush_leaves_the_other_kind_working() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=keep\nredis.register_function('keep', function() return 5 end)",
+    ]);
+    let sha = c.cmds(&["SCRIPT", "LOAD", "return 6"]).as_str().to_string();
+
+    // SCRIPT FLUSH: the function is untouched; the script is gone.
+    c.cmds(&["SCRIPT", "FLUSH"]);
+    assert_eq!(c.cmds(&["FCALL", "keep", "0"]).as_int(), 5);
+    assert!(c.cmds(&["EVALSHA", &sha, "0"]).is_error());
+
+    // FUNCTION FLUSH: a script cached before it still runs.
+    let sha = c.cmds(&["SCRIPT", "LOAD", "return 6"]).as_str().to_string();
+    assert_eq!(c.cmds(&["EVALSHA", &sha, "0"]).as_int(), 6);
+    c.cmds(&["FUNCTION", "FLUSH", "ASYNC"]);
+    assert_eq!(c.cmds(&["EVALSHA", &sha, "0"]).as_int(), 6);
+    assert!(c.cmds(&["FCALL", "keep", "0"]).is_error());
+
+    // SCRIPT RESET renews both VMs in one go; scripts and functions run after.
+    c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=keep\nredis.register_function('keep', function() return 5 end)",
+    ]);
+    assert_eq!(
+        c.cmds(&["SCRIPT", "RESET"]),
+        RespValue::SimpleStr("OK".into())
+    );
+    assert_eq!(c.cmds(&["EVAL", "return 8", "0"]).as_int(), 8);
+    assert_eq!(c.cmds(&["FCALL", "keep", "0"]).as_int(), 5);
+
+    // SCRIPT FLUSH takes SYNC or ASYNC and nothing else.
+    assert_eq!(
+        c.cmds(&["SCRIPT", "FLUSH", "ASYNC"]),
+        RespValue::SimpleStr("OK".into())
+    );
+    assert!(c.cmds(&["SCRIPT", "FLUSH", "NOW"]).is_error());
 }
