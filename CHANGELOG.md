@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+**Read before upgrading:** in scripts, `pcall` and `assert` now behave as in
+Redis. A script that reads `e.err` from an error `pcall` caught no longer
+finds it there: `e` is now the `err` itself. One that gives `assert` a table
+for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
+
+### Changed
+
+- **`pcall` hands back the error's message, and `assert` takes only a
+  string, as in Redis (#90).** A table raised with an `err` that is a string
+  or a number (`error({err = ...})`, `error(redis.error_reply(...))`) comes
+  back from `pcall` as that `err`. A failed `redis.call`
+  (`ERR value is not an integer or out of range`), and any other error from
+  the scripting API (`cjson.decode`, `redis.sha1hex`, ...), comes back as its
+  message, where it was an object whose text began `runtime error:` and
+  ended in a traceback.
+  `xpcall`, and a table without such an `err`, are left as they are.
+  `assert`'s message is a string or a number: `assert(false, nil)` says
+  `assertion failed!`, and a table is refused with
+  `bad argument #2 to 'assert' (string expected, got table)`.
+
 ### Fixed
 
 - **Expired keys are removed as fast as they come due** (#87). The
