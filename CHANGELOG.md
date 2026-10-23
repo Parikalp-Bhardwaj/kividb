@@ -122,9 +122,11 @@ written against an earlier KiviDB may notice them.
   end (6.5 GB after three minutes, against Redis's 271 MB). Reads never
   returned an expired key, but the memory was not given back. Each shard is
   now gone through once a cycle, its expired keys deleted in batches under
-  one lock, and a cycle that runs out of time is followed straight away
-  instead of 100 ms later. Under the same load the keyspace stays at the
-  live 1.8 million keys and memory is flat. This was in 1.1.0 too.
+  one lock, and a cycle that runs out of time while more than a tenth of
+  the keys it looked at were expired is followed straight away instead of
+  100 ms later, as in Redis. Under the same load the keyspace stays at the
+  live 1.8 million keys, memory is flat, and expiry takes about a fifth of
+  a core. This was in 1.1.0 too.
 
 - **Packages: the service is enabled and started whenever the package
   brings the unit.** An upgrade from the 1.1.0 `.deb`/`.rpm`, which had no
