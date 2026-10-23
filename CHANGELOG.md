@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.1.2]
 
-A patch release of 1.1.0.
+A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
 
 ### Added
 
@@ -447,6 +447,12 @@ written against an earlier KiviDB may notice them.
   symlink already at the temporary path is replaced, not written through.
   Redis resets the mode to `0644` less the umask on every rewrite, so this
   differs from it on purpose.
+
+## [1.1.1] - 2026-10-23 [YANKED]
+
+Withdrawn: under a high rate of writes with a TTL, background expiry fell
+behind and memory grew without bound (#87). Its changes are all in 1.1.2,
+with the fix; use 1.1.2.
 
 ## [1.1.0]
 
