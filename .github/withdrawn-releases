@@ -1,0 +1,7 @@
+# Releases withdrawn after they were published: still downloadable (their
+# images and tags stay), marked [YANKED] in CHANGELOG.md, and never the
+# release a stable release's notes count from (release.yml, "List the merged
+# pull requests"). One tag a line.
+
+# Background expiry fell behind under TTL churn (#87); replaced by v1.1.2.
+v1.1.1
