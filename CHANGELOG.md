@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`error()` and `assert` leave the table they raise as the script made
+  it (#84).** Since #81 a table with a metatable of its own replied
+  `ERR user_script:1: table: 0x...`, or what its own `__tostring` gave,
+  instead of its `err`; a table raised again replied with the `err` it had
+  the first time; and a script that caught one with `pcall` saw an internal
+  mark in `tostring` and a metatable it had not set. Each now replies with
+  its `err` as it is when raised, and a caught table is left as the script
+  made it.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

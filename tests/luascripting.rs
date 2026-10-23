@@ -1375,6 +1375,118 @@ fn test_error_and_assert_raise_as_lua_does() {
     assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
 }
 
+/// A table `error` raises is left as the script made it: one with a
+/// metatable of its own replies with its `err` too, one raised again replies
+/// with its `err` as it is then, and one caught with `pcall` is still a
+/// plain table to `tostring` and `getmetatable`.
+#[test]
+fn test_error_leaves_the_table_it_raises_alone() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let r = c.cmds(&[
+        "EVAL",
+        "error(setmetatable({err='ERR meta'}, {__index = {}}))",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR meta script: "), "{r:?}");
+    assert!(r.as_error().ends_with(", on @user_script:1."), "{r:?}");
+
+    let r = c.cmds(&[
+        "EVAL",
+        "local t = {err='ERR first'}\nlocal ok = pcall(error, t)\nt.err = 'ERR second'\nerror(t)",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR second script: "), "{r:?}");
+    assert!(r.as_error().ends_with(", on @user_script:4."), "{r:?}");
+
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(error, {err='ERR x'})\nreturn {tostring(e):sub(1, 7), getmetatable(e) == nil and 1 or 0}",
+        "0",
+    ]);
+    assert_eq!(
+        r,
+        RespValue::Array(vec![
+            RespValue::Bulk(b"table: ".to_vec()),
+            RespValue::Int(1)
+        ])
+    );
+
+    // A table caught before does not stand in for a later error with the
+    // same text: in the same script, or in a later one.
+    let r = c.cmds(&[
+        "EVAL",
+        "local t = {err='ERR caught'}\npcall(error, t)\nerror(tostring(t), 0)",
+        "0",
+    ]);
+    assert!(r.as_error().contains(" table: 0x"), "{r:?}");
+    let r = c.cmds(&[
+        "EVAL",
+        "pcall(error, setmetatable({err='ERR earlier'}, {__tostring = function() return 'boom' end}))\nreturn 1",
+        "0",
+    ]);
+    assert_eq!(r, RespValue::Int(1));
+    let r = c.cmds(&["EVAL", "error('boom', 0)", "0"]);
+    assert!(r.as_error().contains(" boom script: "), "{r:?}");
+    // Nor in a later script that fails without `error`, with the same text.
+    let r = c.cmds(&[
+        "EVAL",
+        "pcall(error, setmetatable({err='ERR earlier'}, {__tostring = function() return \"user_script:1: attempt to call a nil value (local 'f')\" end}))\nreturn 1",
+        "0",
+    ]);
+    assert_eq!(r, RespValue::Int(1));
+    let r = c.cmds(&["EVAL", "local f = nil f()", "0"]);
+    assert!(
+        r.as_error().contains("attempt to call a nil value"),
+        "{r:?}"
+    );
+
+    let r = c.cmds(&[
+        "EVAL",
+        "error(setmetatable({err='ERR own'}, {__tostring = function() return 'own' end}))",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR own script: "), "{r:?}");
+    let r = c.cmds(&[
+        "EVAL",
+        "error(setmetatable({err='ERR own'}, {__tostring = function() error('boom') end}))",
+        "0",
+    ]);
+    assert!(r.as_error().starts_with("ERR own script: "), "{r:?}");
+
+    // Nor does one a finalizer raises and catches while another script runs.
+    let forged = "user_script:2: Script attempted to access nonexistent global variable 'nosuch'";
+    let finalizers = format!(
+        "for i = 1, 50 do setmetatable({{}}, {{__gc = function() pcall(error, setmetatable({{err='ERR forged'}}, {{__tostring = function() return \"{forged}\" end}})) end}}) end\nreturn 1"
+    );
+    assert_eq!(c.cmds(&["EVAL", &finalizers, "0"]), RespValue::Int(1));
+    let r = c.cmds(&[
+        "EVAL",
+        "local t = {} for i = 1, 300000 do t[i] = {} end\nreturn nosuch",
+        "0",
+    ]);
+    assert!(
+        r.as_error()
+            .contains("nonexistent global variable 'nosuch'"),
+        "{r:?}"
+    );
+
+    // An `err` ends at a NUL, as Redis reads it.
+    let r = c.cmds(&["EVAL", "error({err='ERR a\\0b'})", "0"]);
+    assert!(r.as_error().starts_with("ERR a script: "), "{r:?}");
+
+    let lib = "#!lua name=metalib\nredis.register_function('raise_meta', function() error(setmetatable({err='ERR meta fn'}, {})) end)";
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", lib]).as_str(), "metalib");
+    let r = c.cmds(&["FCALL", "raise_meta", "0"]);
+    assert!(
+        r.as_error().starts_with("ERR meta fn script: raise_meta"),
+        "{r:?}"
+    );
+}
+
 /// `redis.error_reply` gives a message without a code the code `ERR`, as
 /// Redis does, and keeps one that has a code.
 #[test]
