@@ -237,10 +237,10 @@ pub struct ExpireCursor {
 /// ([`ACTIVE_EXPIRE_STALE_PERCENT`]), so the caller should come back at once
 /// rather than in 100 ms. Running out of time with few expired keys found is
 /// not being behind: the next cycle takes up where this one stopped. In a
-/// shard it finds every key
-/// past its time in one pass over the shard's expiry times, and deletes them
-/// in batches of [`ACTIVE_EXPIRE_BATCH`], each under one lock of the expiry
-/// shard and one of the value shard.
+/// shard it finds the keys past their time [`ACTIVE_EXPIRE_BATCH`] at a time,
+/// each pass over the shard's expiry times stopping at its batch's last key,
+/// and deletes each batch under one lock of the expiry shard and one of the
+/// value shard.
 ///
 /// It used to take twenty keys at a time, each time searching the shard from
 /// its start: every twenty passed over the same live keys again, so the more
@@ -282,22 +282,22 @@ pub fn active_expire_cycle(
         let cell = &db_exp[shard];
         if !cell.holds_nothing() {
             let now = crate::script_clock::wall_system_time_now();
-            let due: Vec<Key> = {
-                let times = read_lock!(cell);
-                seen += times.len();
-                times
-                    .iter()
-                    .filter(|(_, exp)| **exp < now)
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            };
-            due_total += due.len();
-            for batch in due.chunks(ACTIVE_EXPIRE_BATCH) {
-                expire_batch(store, expiry_store, index_store, db, shard, batch, now);
+            // A batch at a time: a pass stops at the batch's last key, so it
+            // copies no more keys than it deletes. Collecting every due key
+            // of the shard first copied all of them, again each cycle, when
+            // the budget ran out after the first batch: with 49 million keys
+            // the thread spent its time copying and deleted 5,000 a second.
+            loop {
+                let (looked, due) = expire_pass(store, expiry_store, index_store, db, shard, now);
+                seen += looked;
+                due_total += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
                     // This shard is gone through again next time: what is
                     // left of it, and what has come due since.
                     return behind(seen, due_total);
+                }
+                if due < ACTIVE_EXPIRE_BATCH {
+                    break;
                 }
             }
         }
@@ -308,6 +308,32 @@ pub fn active_expire_cycle(
         }
     }
     false
+}
+
+/// One pass over shard `shard` of database `db`: up to
+/// [`ACTIVE_EXPIRE_BATCH`] keys past their time at `now`, the pass stopping
+/// at the last of them, deleted. Returns how many keys it looked at and how
+/// many were due.
+fn expire_pass(
+    store: &Store,
+    expiry_store: &ExpiryStore,
+    index_store: &IndexStore,
+    db: usize,
+    shard: usize,
+    now: SystemTime,
+) -> (usize, usize) {
+    let mut looked = 0usize;
+    let due: Vec<Key> = read_lock!(expiry_store[db][shard])
+        .iter()
+        .inspect(|_| looked += 1)
+        .filter(|(_, exp)| **exp < now)
+        .take(ACTIVE_EXPIRE_BATCH)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !due.is_empty() {
+        expire_batch(store, expiry_store, index_store, db, shard, &due, now);
+    }
+    (looked, due.len())
 }
 
 /// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
@@ -1235,5 +1261,43 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         assert!(!active_expire_cycle(&store, &expiry, &index, &mut cursor));
         assert_eq!(keys(&store), 2_000);
+    }
+
+    /// A shard with three batches' worth due: a pass takes one batch and
+    /// stops there, so it copies no more keys than it deletes (it used to copy
+    /// every due key of the shard, then run out of time after one batch).
+    #[test]
+    fn a_pass_takes_one_batch_and_stops() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let shards = expiry[0].len();
+        // Long keys, as UUIDs are: past CompactString's inline length.
+        let mut n = 0;
+        let mut i = 0;
+        while n < 3 * ACTIVE_EXPIRE_BATCH {
+            let key = format!("gone:{i:0>40}");
+            i += 1;
+            if store::shard_index(shards, &key) == 0 {
+                put(&store, &expiry, &key, past);
+                n += 1;
+            }
+        }
+        let (looked, due) = expire_pass(&store, &expiry, &index, 0, 0, SystemTime::now());
+        assert_eq!(due, ACTIVE_EXPIRE_BATCH);
+        assert_eq!(
+            looked, ACTIVE_EXPIRE_BATCH,
+            "it went past the batch's last key"
+        );
+        assert_eq!(keys(&store), n - ACTIVE_EXPIRE_BATCH);
+
+        let mut cursor = ExpireCursor::default();
+        let mut cycles = 0;
+        while keys(&store) > 0 {
+            active_expire_cycle(&store, &expiry, &index, &mut cursor);
+            cycles += 1;
+            assert!(cycles < 1000, "never emptied");
+        }
     }
 }
