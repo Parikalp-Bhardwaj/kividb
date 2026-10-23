@@ -481,11 +481,12 @@ fn function_environment(lua: &Lua) -> LuaResult<(LuaTable, LuaTable, LuaTable)> 
 fn run_library_code(lua: &Lua, code: &str) -> LuaResult<()> {
     let (env, meta, loading) = function_environment(lua)?;
     meta.raw_set("__index", loading)?;
-    let result = lua
-        .load(code)
-        .set_name("=library")
-        .set_environment(env)
-        .exec();
+    let result = table_errors(
+        lua.load(code)
+            .set_name("=library")
+            .set_environment(env)
+            .exec(),
+    );
     meta.raw_set("__index", lua.globals())?;
     result
 }
@@ -1887,8 +1888,8 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
-    // A table raised by `error` or `assert` is marked with its `err` and the
-    // line, as Redis's error handler reads one: see [`mark_error_table`].
+    // A table raised by `error` or `assert` is kept with its `err` and the
+    // line, as Redis's error handler reads one: see [`remember_error_table`].
     // SAFETY: C functions that do what Lua's own `error` and `assert` do.
     unsafe {
         let globals = lua.globals();
@@ -3408,11 +3409,24 @@ fn redis_simple_error_has_category_prefix(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c == '_' || c == '-')
 }
 
-/// What [`mark_error_table`] puts before a table's `err`, then the line and
-/// a `\u{1}`. Not NUL: mlua reads an error's message as a C string.
+/// What [`remember_error_table`] puts before a table's `err`, then the line
+/// and a `\u{1}`. Not NUL: mlua reads an error's message as a C string.
 const TABLE_ERROR_MARK: &str = "\u{1}kividb-error\u{1}";
 
-/// The line and the message of a table [`mark_error_table`] marked, from a
+thread_local! {
+    /// What [`remember_error_table`] kept of the table a script raised last
+    /// on this thread: what `tostring` makes of it, then its message, marked.
+    /// It lasts until the call it was raised in returns ([`table_errors`]),
+    /// or until `error` or `assert` raise another table, or a value that is
+    /// not a string with the place before it. A finalizer's raise is not
+    /// kept ([`in_finalizer`]).
+    static RAISED_TABLE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
+    /// Whether [`RAISED_TABLE`] holds anything: a call that succeeds reads
+    /// this, which is one load, and not that.
+    static TABLE_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The line and the message of a table [`remember_error_table`] kept, from a
 /// Lua error's text.
 fn marked_table_error(s: &str) -> Option<(&str, &str)> {
     let at = s.find(TABLE_ERROR_MARK)?;
@@ -3422,7 +3436,7 @@ fn marked_table_error(s: &str) -> Option<(&str, &str)> {
 }
 
 /// `error` in scripts: Lua's own (`luaB_error`), but a table it raises is
-/// marked by [`mark_error_table`] first.
+/// kept by [`remember_error_table`] first.
 unsafe extern "C-unwind" fn script_error(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
     unsafe {
         let level = mlua::ffi::luaL_optinteger(state, 2, 1) as std::ffi::c_int;
@@ -3432,7 +3446,7 @@ unsafe extern "C-unwind" fn script_error(state: *mut mlua::ffi::lua_State) -> st
 }
 
 /// `assert` in scripts: Lua's own (`luaB_assert`), with a table for its
-/// message marked as `error` marks one.
+/// message kept as `error` keeps one.
 unsafe extern "C-unwind" fn script_assert(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
     use mlua::ffi;
     unsafe {
@@ -3448,7 +3462,7 @@ unsafe extern "C-unwind" fn script_assert(state: *mut mlua::ffi::lua_State) -> s
 }
 
 /// Raise the value at 1 as `luaB_error` does: a string with the place at
-/// `level` before it, a table marked.
+/// `level` before it, a table kept.
 unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::c_int) -> ! {
     use mlua::ffi;
     unsafe {
@@ -3457,7 +3471,7 @@ unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::
             ffi::lua_pushvalue(state, 1);
             ffi::lua_concat(state, 2);
         } else {
-            mark_error_table(state);
+            remember_error_table(state);
         }
         ffi::lua_error(state)
     }
@@ -3465,54 +3479,36 @@ unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::
 
 /// Without this a table given to `error()` (`error({err = ...})`,
 /// `error(redis.error_reply(...))`) comes back as `table: 0x…`: mlua makes
-/// a string of any error that is not one, with `tostring`. So such a table
-/// is given a `__tostring` as it is raised, while the line it is raised on
-/// is known: its `err` (`ERR unknown error` without one) and that line,
-/// behind [`TABLE_ERROR_MARK`], with line breaks made spaces as Redis's reply
-/// has them. A script that catches it with `pcall` still has the table.
+/// a string of any error that is not one, with `tostring`. So the table at 1
+/// is kept in [`RAISED_TABLE`] as it is raised, while the line it is raised
+/// on is known: what `tostring` makes of it, then its `err` (`ERR unknown
+/// error` without one) and that line behind [`TABLE_ERROR_MARK`], with line
+/// breaks made spaces as Redis's reply has them. [`table_errors`] puts that
+/// in place of the `tostring` if the call fails with it.
 ///
 /// Redis reads the table in a message handler its scripts are called under.
 /// Here that cost every call about 2,400 instructions (an `EVALSHA` of a
 /// `GET` 11% more) for the rare one that fails (#80); this costs nothing
-/// until a table is raised. A table that has a metatable already is left as
-/// it is.
-unsafe fn mark_error_table(state: *mut mlua::ffi::lua_State) {
+/// until a table is raised. The table itself is left alone: a script that
+/// catches it with `pcall` has it as it made it.
+///
+/// The Lua calls that can fail (out of memory) come before any Rust value
+/// is made, so a Lua error unwinds through none that needs dropping.
+unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
     use mlua::ffi;
     unsafe {
-        if ffi::lua_type(state, 1) != ffi::LUA_TTABLE || ffi::lua_checkstack(state, 3) == 0 {
+        // A finalizer runs in whatever call collects its table, another
+        // client's too: what it raises is not that call's.
+        if in_finalizer(state) {
             return;
         }
-        if ffi::lua_getmetatable(state, 1) != 0 {
-            ffi::lua_pop(state, 1);
+        // A table raised before and caught is not what this fails with. A
+        // string with the place before it is kept to: a `__tostring` of the
+        // table's own that fails, while mlua makes the message, raises one.
+        if ffi::lua_type(state, 1) != ffi::LUA_TTABLE || ffi::lua_checkstack(state, 4) == 0 {
+            forget_raised_table();
             return;
         }
-        ffi::lua_createtable(state, 0, 1);
-        push_error_table_message(state);
-        ffi::lua_pushcclosure(state, error_table_tostring, 1);
-        ffi::lua_setfield(state, -2, c"__tostring".as_ptr());
-        ffi::lua_setmetatable(state, 1);
-    }
-}
-
-/// Push what a marked table's `__tostring` gives, for the table at 1.
-unsafe fn push_error_table_message(state: *mut mlua::ffi::lua_State) {
-    use mlua::ffi;
-    unsafe {
-        ffi::lua_pushstring(state, c"err".as_ptr());
-        let msg = match ffi::lua_rawget(state, 1) {
-            ffi::LUA_TSTRING => {
-                let mut len = 0;
-                let p = ffi::lua_tolstring(state, -1, &mut len);
-                String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), len))
-                    .into_owned()
-            }
-            ffi::LUA_TNUMBER if ffi::lua_isinteger(state, -1) != 0 => {
-                ffi::lua_tointeger(state, -1).to_string()
-            }
-            ffi::LUA_TNUMBER => ffi::lua_tonumber(state, -1).to_string(),
-            _ => "ERR unknown error".to_string(),
-        };
-        ffi::lua_pop(state, 1);
         // The frame that raised it: past `error` (or `assert`) itself.
         let mut line = 1;
         let mut ar: ffi::lua_Debug = std::mem::zeroed();
@@ -3525,22 +3521,126 @@ unsafe fn push_error_table_message(state: *mut mlua::ffi::lua_State) {
                 break;
             }
         }
-        let marked = format!(
-            "{TABLE_ERROR_MARK}{line}\u{1}{}",
+        // As mlua will, with a `__tostring` of the table's own too. If that
+        // fails, mlua's message is what it failed with.
+        ffi::lua_pushcfunction(state, value_tostring);
+        ffi::lua_pushvalue(state, 1);
+        if ffi::lua_pcall(state, 1, 1, 0) != ffi::LUA_OK
+            && ffi::lua_type(state, -1) != ffi::LUA_TSTRING
+        {
+            ffi::lua_settop(state, 1);
+            forget_raised_table();
+            return;
+        }
+        ffi::lua_pushstring(state, c"err".as_ptr());
+        match ffi::lua_rawget(state, 1) {
+            ffi::LUA_TSTRING => {}
+            ffi::LUA_TNUMBER => {
+                let mut integer = 0;
+                let n = ffi::lua_tointegerx(state, -1, &mut integer);
+                if integer != 0 {
+                    ffi::lua_pushfstring(state, c"%I".as_ptr(), n);
+                } else {
+                    ffi::lua_pushfstring(state, c"%f".as_ptr(), ffi::lua_tonumber(state, -1));
+                }
+                ffi::lua_replace(state, -2);
+            }
+            _ => {
+                ffi::lua_pop(state, 1);
+                ffi::lua_pushstring(state, c"ERR unknown error".as_ptr());
+            }
+        }
+        // Two strings now, that `lua_tolstring` reads as they are.
+        let bytes = |index| {
+            let mut len = 0;
+            let p = ffi::lua_tolstring(state, index, &mut len);
+            String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), len))
+        };
+        // The `err` up to a NUL, as Redis reads it.
+        let msg = bytes(-1);
+        let msg = msg.split('\0').next().unwrap_or_default();
+        let kept = format!(
+            "{}{TABLE_ERROR_MARK}{line}\u{1}{}",
+            bytes(-2),
             msg.replace(['\r', '\n'], " ")
         );
-        ffi::lua_pushlstring(state, marked.as_ptr().cast(), marked.len());
+        if RAISED_TABLE
+            .try_with(|cell| *cell.borrow_mut() = Some(kept.into()))
+            .is_ok()
+        {
+            let _ = TABLE_KEPT.try_with(|kept| kept.set(true));
+        }
+        ffi::lua_settop(state, 1);
     }
 }
 
-/// A marked table's `__tostring`: the message it was given.
-unsafe extern "C-unwind" fn error_table_tostring(
-    state: *mut mlua::ffi::lua_State,
-) -> std::ffi::c_int {
+/// Forget what [`remember_error_table`] kept, if anything.
+fn forget_raised_table() {
+    if TABLE_KEPT
+        .try_with(|kept| kept.replace(false))
+        .unwrap_or(false)
+    {
+        let _ = RAISED_TABLE.try_with(|kept| kept.take());
+    }
+}
+
+/// Whether a `__gc` metamethod is on the stack.
+unsafe fn in_finalizer(state: *mut mlua::ffi::lua_State) -> bool {
+    use mlua::ffi;
     unsafe {
-        mlua::ffi::lua_pushvalue(state, mlua::ffi::lua_upvalueindex(1));
+        let mut ar: ffi::lua_Debug = std::mem::zeroed();
+        let mut level = 0;
+        while ffi::lua_getstack(state, level, &mut ar) != 0 {
+            if ffi::lua_getinfo(state, c"n".as_ptr(), &mut ar) != 0
+                && !ar.name.is_null()
+                && std::ffi::CStr::from_ptr(ar.name).to_bytes() == b"__gc"
+            {
+                return true;
+            }
+            level += 1;
+        }
+        false
+    }
+}
+
+/// `tostring` of the value at 1, for [`remember_error_table`] to call protected.
+unsafe extern "C-unwind" fn value_tostring(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    unsafe {
+        mlua::ffi::luaL_tolstring(state, 1, std::ptr::null_mut());
     }
     1
+}
+
+/// mlua makes a string of an error that is not one with `tostring`, so a
+/// table a script raised comes back as `table: 0x…`. If a call failed with
+/// the one [`remember_error_table`] kept, its message is put in its place.
+/// What was kept goes either way: it does not outlive the call.
+#[inline]
+fn table_errors<T>(result: LuaResult<T>) -> LuaResult<T> {
+    if !TABLE_KEPT.with(|kept| kept.get()) {
+        return result;
+    }
+    with_kept_message(result)
+}
+
+/// [`table_errors`], with something kept.
+#[cold]
+fn with_kept_message<T>(result: LuaResult<T>) -> LuaResult<T> {
+    TABLE_KEPT.with(|kept| kept.set(false));
+    let kept = RAISED_TABLE.with(|kept| kept.take());
+    let (Err(LuaError::RuntimeError(text)), Some(kept)) = (&result, kept) else {
+        return result;
+    };
+    let Some(at) = kept.find(TABLE_ERROR_MARK) else {
+        return result;
+    };
+    // mlua's message is that `tostring`, then its traceback on a new line.
+    match text.strip_prefix(&kept[..at]) {
+        Some(rest) if rest.is_empty() || rest.starts_with('\n') => {
+            Err(LuaError::RuntimeError(format!("{}{rest}", &kept[at..])))
+        }
+        _ => result,
+    }
 }
 
 /// Shape Lua `error()` / runtime abort strings into Redis-style `user_script:… script:` messages.
@@ -3635,7 +3735,7 @@ fn clean_lua_error(e: &LuaError) -> String {
         _ => e.to_string(),
     };
     let s = raw.strip_prefix("runtime error: ").unwrap_or(raw.as_str());
-    // A table's `err` (see `mark_error_table`): already one line, up to the
+    // A table's `err` (see `remember_error_table`): already one line, up to the
     // traceback mlua adds.
     if let Some(at) = s.find(TABLE_ERROR_MARK) {
         let marked = &s[at..];
@@ -3816,7 +3916,9 @@ fn eval_script(
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
 
-    let result = match compiled_script(lua, source, lua_body).and_then(|f| f.call::<LuaValue>(())) {
+    let result = match table_errors(
+        compiled_script(lua, source, lua_body).and_then(|f| f.call::<LuaValue>(())),
+    ) {
         Ok(v) => v,
         Err(e) => {
             *ctx.selected_db = saved_db;
@@ -3934,7 +4036,9 @@ fn eval_function_call(
 
     let keys_t: LuaTable = lua.globals().get("KEYS").map_err(|e| e.to_string())?;
     let argv_t: LuaTable = lua.globals().get("ARGV").map_err(|e| e.to_string())?;
-    let result = match func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t))) {
+    let result = match table_errors(
+        func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t))),
+    ) {
         Ok(v) => v,
         Err(e) => {
             *ctx.selected_db = saved_db;
