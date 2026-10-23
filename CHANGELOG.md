@@ -27,17 +27,6 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `assertion failed!`, and a table is refused with
   `bad argument #2 to 'assert' (string expected, got table)`.
 
-### Fixed
-
-- **`error()` and `assert` leave the table they raise as the script made
-  it (#84).** Since #81 a table with a metatable of its own replied
-  `ERR user_script:1: table: 0x...`, or what its own `__tostring` gave,
-  instead of its `err`; a table raised again replied with the `err` it had
-  the first time; and a script that caught one with `pcall` saw an internal
-  mark in `tostring` and a metatable it had not set. Each now replies with
-  its `err` as it is when raised, and a caught table is left as the script
-  made it.
-
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
@@ -147,17 +136,23 @@ written against an earlier KiviDB may notice them.
 
 ### Fixed
 
-- **Expired keys are removed as fast as they come due** (#87). The
-  background expiry took them twenty at a time, each time searching the
-  shard from its start, so it slowed as the keyspace grew: under a steady
-  load of `SET ... EX 20` at about 90,000 a second on 8 vCPUs, the server held
-  17.6 million keys where 1.8 million were live, and its memory grew without
-  end (6.5 GB after three minutes, against Redis's 271 MB). Reads never
-  returned an expired key, but the memory was not given back. Each shard is
-  now gone through once a cycle, its expired keys deleted in batches under
-  one lock, and a cycle that runs out of time is followed straight away
-  instead of 100 ms later. Under the same load the keyspace stays at the
-  live 1.8 million keys and memory is flat. This was in 1.1.0 too.
+- **Expired keys no longer pile up under a steady stream of writes with a
+  TTL** (#87). The background expiry took them twenty at a time, each time
+  searching the shard from its start, so it slowed as the keyspace grew:
+  under a steady load of `SET ... EX 20` at about 90,000 a second on 8
+  vCPUs, the server held 17.6 million keys where 1.8 million were live, and
+  its memory grew without end (6.5 GB after three minutes, against Redis's
+  271 MB). Reads never returned an expired key, but the memory was not
+  given back. Now expired keys are found and deleted 1,024 at a time, each
+  batch under one lock, by a quarter of the cores (at least one thread),
+  each going through its own shards; a thread whose cycle runs out of time
+  while more than a tenth of the keys it looked at were expired starts the
+  next straight away instead of 100 ms later, as in Redis. Under the same
+  load the keyspace stays at the live 1.8 million keys and memory is flat;
+  on 8 vCPUs expiry keeps up with about 200,000 keys coming due a second
+  under load, and deletes about a million a second when idle. Faster than
+  that it still falls behind: a pipelined `SET ... EX` load of about 600,000
+  a second outgrew it. This was in 1.1.0 too.
 
 - **Packages: the service is enabled and started whenever the package
   brings the unit.** An upgrade from the 1.1.0 `.deb`/`.rpm`, which had no
