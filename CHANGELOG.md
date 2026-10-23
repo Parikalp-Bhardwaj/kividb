@@ -37,6 +37,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   field as FLOAT32: it refuses the field's query vectors and does not index
   new or rebuilt documents.
 
+- **The `.deb` and `.rpm` packages run KiviDB as a service** (#44). They
+  installed the binary and nothing else: no config and no unit, so the
+  server could not be run as a service, and started from `/` it would have
+  written its snapshot and AOF there. They now bring a systemd unit,
+  `kividb.service`, that runs the server as an unprivileged `kividb` user
+  with its data in `/var/lib/kividb`, and a config, `/etc/kividb/kividb.conf`
+  (owned by `kividb`, mode `0640`, so `CONFIG REWRITE` works), that listens
+  on `127.0.0.1:6380` with the update check off. Removing the package stops
+  and disables the service; the `kividb` user and `/var/lib/kividb` are kept.
+
 ### Changed
 
 - **`EVAL` scripts and functions have a Lua VM each**, as in Redis. The
@@ -373,6 +383,21 @@ written against an earlier KiviDB may notice them.
   It was empty, and clients that check it before using FT.* refused to
   connect: redisvl 0.4, which LlamaIndex's Redis vector store requires,
   raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
+
+- **`CLIENT LIST` and `CLIENT INFO` report `qbuf`, `qbuf-free` and `idle`
+  truthfully** (#32, #60). `idle=` was always 0 and the query-buffer fields
+  were placeholders. `idle=` is now the seconds since the connection last
+  ran a command, on a monotonic clock, and listing clients does not reset
+  it. A client's query buffer grows for a large argument and is shrunk back
+  once it is no longer needed, as in Redis: under the Tokio server on
+  Redis's two-second idle timer, under io_uring at the client's next read
+  (an idle client's buffer is not shrunk until it sends something). The
+  io_uring server now reads straight into the buffer it parses, saving a
+  copy of every read.
+- **A hash field whose time had passed came back from a snapshot as a field
+  that never expires** (#48): the loader dropped its time and kept the
+  field. It is now dropped when the snapshot loads, and a hash left with no
+  fields is not loaded at all.
 
 ### Security
 
