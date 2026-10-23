@@ -483,7 +483,9 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
             // Persist metadata
             w.write_all(&inner.retention.to_le_bytes())?;
-            w.write_all(&inner.chunk_size.to_le_bytes())?; // usize — careful on 32-bit
+            // A u64 on every target, so a 32-bit build reads a 64-bit one's
+            // snapshot (and compiles: usize is 4 bytes there).
+            w.write_all(&(inner.chunk_size as u64).to_le_bytes())?;
             // Labels: write as count + (key, value) pairs
             w.write_all(&(inner.labels.len() as u32).to_le_bytes())?;
             for (lk, lv) in inner.labels.iter() {
@@ -1437,7 +1439,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     ts.retention = u64::from_le_bytes(ret_buf);
                     let mut cs_buf = [0u8; 8];
                     r.read_exact(&mut cs_buf)?;
-                    ts.chunk_size = usize::from_le_bytes(cs_buf);
+                    ts.chunk_size =
+                        usize::try_from(u64::from_le_bytes(cs_buf)).unwrap_or(usize::MAX);
                     let mut lcount_buf = [0u8; 4];
                     r.read_exact(&mut lcount_buf)?;
                     let lcount = u32::from_le_bytes(lcount_buf) as usize;
@@ -4831,7 +4834,11 @@ mod function_section_tests {
     /// as the reader reads them.
     #[test]
     fn rdb_lengths_round_trip_at_each_forms_edges() {
-        for len in [0, 0x3F, 0x40, 0x3FFF, 0x4000, 0xFFFF_FFFF, 0x1_0000_0000] {
+        for len in [0u64, 0x3F, 0x40, 0x3FFF, 0x4000, 0xFFFF_FFFF, 0x1_0000_0000] {
+            // The 64-bit form's edge is past a 32-bit usize.
+            let Ok(len) = usize::try_from(len) else {
+                continue;
+            };
             let mut out = Vec::new();
             rdb_write_length(&mut out, len);
             let (read, encoded) = rdb_read_length(&mut &out[..]).unwrap();

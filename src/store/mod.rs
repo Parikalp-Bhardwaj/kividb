@@ -12,14 +12,17 @@ use crate::types::KiviDBValue;
 /// Which shard `key` is in, of `shards` (a power of two). The keyspace and
 /// the expiry store have the same number, so one index serves both: a
 /// command that looks in both hashes its key once.
+///
+/// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
+/// constants); the shard is taken from its low bits.
 #[inline]
 pub fn shard_index(shards: usize, key: &str) -> usize {
-    let mut hash: usize = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf29ce484222325;
     for byte in key.bytes() {
-        hash ^= byte as usize;
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    hash & (shards - 1)
+    (hash as usize) & (shards - 1)
 }
 
 pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
