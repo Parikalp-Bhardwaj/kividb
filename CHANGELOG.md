@@ -9,6 +9,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Expired keys are removed as fast as they come due** (#87). The
+  background expiry took them twenty at a time, each time searching the
+  shard from its start, so it slowed as the keyspace grew: under a steady
+  load of `SET ... EX 20` at about 90,000 a second on 8 vCPUs, 1.1.1 held
+  17.6 million keys where 1.8 million were live, and its memory grew without
+  end (6.5 GB after three minutes, against Redis's 271 MB). Reads never
+  returned an expired key, but the memory was not given back. Each shard is
+  now gone through once a cycle, its expired keys deleted in batches under
+  one lock, and a cycle that runs out of time is followed straight away
+  instead of 100 ms later. Under the same load the keyspace stays at the
+  live 1.8 million keys and memory is flat. The same code was in 1.1.0.
+
 - **`error()` and `assert` leave the table they raise as the script made
   it (#84).** Since 1.1.1 a table with a metatable of its own replied
   `ERR user_script:1: table: 0x...`, or what its own `__tostring` gave,
