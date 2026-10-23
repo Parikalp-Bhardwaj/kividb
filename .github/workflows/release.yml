@@ -640,7 +640,10 @@ jobs:
       # before this one, and for a stable release that is its last release
       # candidate: v1.1.0's page listed one PR. A stable release lists what
       # was merged since the previous *stable* release; a candidate, since
-      # the tag before it. With no earlier stable release, everything.
+      # the tag before it. With no earlier stable release, everything. A
+      # release withdrawn after it was published (.github/withdrawn-releases)
+      # is passed over: its successor lists everything since the release
+      # before it.
       - name: List the merged pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -654,7 +657,9 @@ jobs:
             | awk -v t="${RELEASE_TAG}" '$0 == t { exit } { print }')
           case "${RELEASE_TAG}" in
             *-*) previous=$(printf '%s\n' "$older" | tail -n 1) ;;
-            *)   previous=$(printf '%s\n' "$older" | grep -v -- - | tail -n 1 || true) ;;
+            *)   withdrawn=$(grep -v -e '^#' -e '^[[:space:]]*$' .github/withdrawn-releases 2>/dev/null || true)
+                 previous=$(printf '%s\n' "$older" | grep -v -- - \
+                   | grep -vxF -f <(printf '%s\n' "${withdrawn:-//none//}") | tail -n 1 || true) ;;
           esac
           {
             echo

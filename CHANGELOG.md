@@ -5,23 +5,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.2]
 
-### Fixed
-
-- **Expired keys are removed as fast as they come due** (#87). The
-  background expiry took them twenty at a time, each time searching the
-  shard from its start, so it slowed as the keyspace grew: under a steady
-  load of `SET ... EX 20` at about 90,000 a second on 8 vCPUs, 1.1.1 held
-  17.6 million keys where 1.8 million were live, and its memory grew without
-  end (6.5 GB after three minutes, against Redis's 271 MB). Reads never
-  returned an expired key, but the memory was not given back. Each shard is
-  now gone through once a cycle, its expired keys deleted in batches under
-  one lock, and a cycle that runs out of time is followed straight away
-  instead of 100 ms later. Under the same load the keyspace stays at the
-  live 1.8 million keys and memory is flat. The same code was in 1.1.0.
-
-## [1.1.1]
+A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
 
 ### Added
 
@@ -127,6 +113,18 @@ written against an earlier KiviDB may notice them.
   `ARGREP`, `XCFGSET`, the slowlog settings).
 
 ### Fixed
+
+- **Expired keys are removed as fast as they come due** (#87). The
+  background expiry took them twenty at a time, each time searching the
+  shard from its start, so it slowed as the keyspace grew: under a steady
+  load of `SET ... EX 20` at about 90,000 a second on 8 vCPUs, the server held
+  17.6 million keys where 1.8 million were live, and its memory grew without
+  end (6.5 GB after three minutes, against Redis's 271 MB). Reads never
+  returned an expired key, but the memory was not given back. Each shard is
+  now gone through once a cycle, its expired keys deleted in batches under
+  one lock, and a cycle that runs out of time is followed straight away
+  instead of 100 ms later. Under the same load the keyspace stays at the
+  live 1.8 million keys and memory is flat. This was in 1.1.0 too.
 
 - **Packages: the service is enabled and started whenever the package
   brings the unit.** An upgrade from the 1.1.0 `.deb`/`.rpm`, which had no
@@ -449,6 +447,12 @@ written against an earlier KiviDB may notice them.
   symlink already at the temporary path is replaced, not written through.
   Redis resets the mode to `0644` less the umask on every rewrite, so this
   differs from it on purpose.
+
+## [1.1.1] - 2026-10-23 [YANKED]
+
+Withdrawn: under a high rate of writes with a TTL, background expiry fell
+behind and memory grew without bound (#87). Its changes are all in 1.1.2,
+with the fix; use 1.1.2.
 
 ## [1.1.0]
 
