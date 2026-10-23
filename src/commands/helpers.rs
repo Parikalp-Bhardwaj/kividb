@@ -215,6 +215,11 @@ const ACTIVE_EXPIRE_BATCH: usize = 1024;
 /// Redis. Reads expire keys lazily whatever this does.
 const ACTIVE_EXPIRE_BUDGET: Duration = Duration::from_millis(25);
 
+/// A cycle whose time runs out while more than this percentage of the keys
+/// it looked at were past their time is behind, and the next starts at once:
+/// Redis's `ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE`.
+const ACTIVE_EXPIRE_STALE_PERCENT: usize = 10;
+
 /// Where the active expiry cycle has got to. A cycle that runs out of time
 /// is taken up from here by the next.
 #[derive(Default)]
@@ -227,8 +232,12 @@ pub struct ExpireCursor {
 /// has passed, in every database, without waiting for them to be read.
 ///
 /// It goes round every shard of every database once, and stops when it has,
-/// or when its time is up; it returns whether it stopped with shards still
-/// to go, so the caller can come back sooner. In a shard it finds every key
+/// or when its time is up. It returns whether it is behind: its time ran out
+/// while more than a tenth of the keys it looked at were past their time
+/// ([`ACTIVE_EXPIRE_STALE_PERCENT`]), so the caller should come back at once
+/// rather than in 100 ms. Running out of time with few expired keys found is
+/// not being behind: the next cycle takes up where this one stopped. In a
+/// shard it finds every key
 /// past its time in one pass over the shard's expiry times, and deletes them
 /// in batches of [`ACTIVE_EXPIRE_BATCH`], each under one lock of the expiry
 /// shard and one of the value shard.
@@ -238,6 +247,12 @@ pub struct ExpireCursor {
 /// keys a shard held the slower it went. Under a steady stream of `SET ...
 /// EX`, keys came due faster than that removed them (about 80,000 a second at
 /// 17 million keys), and memory grew without end (#87).
+///
+/// Coming back at once whenever its time ran out, as #87's fix first did,
+/// kept it scanning without a pause under steady TTL traffic: a pass over
+/// 1.8 million live keys takes more than its 25 ms, and each found only the
+/// few that had come due since. That was a whole core of eight, taken from
+/// the workers, with its shard locks in their way.
 pub fn active_expire_cycle(
     store: &Store,
     expiry_store: &ExpiryStore,
@@ -250,6 +265,9 @@ pub fn active_expire_cycle(
     }
     let started = std::time::Instant::now();
     let mut visited = 0usize;
+    // Keys looked at, and of them those past their time.
+    let (mut seen, mut due_total) = (0usize, 0usize);
+    let behind = stale;
     while visited < shards {
         if cursor.db >= expiry_store.len() {
             cursor.db = 0;
@@ -264,27 +282,38 @@ pub fn active_expire_cycle(
         let cell = &db_exp[shard];
         if !cell.holds_nothing() {
             let now = crate::script_clock::wall_system_time_now();
-            let due: Vec<Key> = read_lock!(cell)
-                .iter()
-                .filter(|(_, exp)| **exp < now)
-                .map(|(k, _)| k.clone())
-                .collect();
+            let due: Vec<Key> = {
+                let times = read_lock!(cell);
+                seen += times.len();
+                times
+                    .iter()
+                    .filter(|(_, exp)| **exp < now)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
+            due_total += due.len();
             for batch in due.chunks(ACTIVE_EXPIRE_BATCH) {
                 expire_batch(store, expiry_store, index_store, db, shard, batch, now);
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
                     // This shard is gone through again next time: what is
                     // left of it, and what has come due since.
-                    return true;
+                    return behind(seen, due_total);
                 }
             }
         }
         cursor.shard += 1;
         visited += 1;
         if visited.is_multiple_of(64) && started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
-            return visited < shards;
+            return visited < shards && behind(seen, due_total);
         }
     }
     false
+}
+
+/// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
+/// were `due`: a cycle whose time ran out with this true is behind.
+fn stale(seen: usize, due: usize) -> bool {
+    due > 0 && due * 100 > seen * ACTIVE_EXPIRE_STALE_PERCENT
 }
 
 /// Delete the keys of `batch`, all in shard `shard` of database `db`, that
@@ -400,9 +429,9 @@ pub fn spawn_active_expire_task(
     crate::field_expiry::rescan(&store);
     std::thread::spawn(move || {
         let mut cursor = ExpireCursor::default();
-        // Every 100 ms, as Redis's `hz 10`; straight after a cycle that ran
-        // out of time with keys still to go, as Redis goes on while it keeps
-        // finding expired keys.
+        // Every 100 ms, as Redis's `hz 10`; straight after a cycle that is
+        // behind (its time ran out while more than a tenth of what it looked
+        // at was expired), as Redis goes on while it keeps finding them.
         let mut wait = Duration::from_millis(100);
         loop {
             std::thread::sleep(wait);
@@ -1139,7 +1168,8 @@ mod active_expiry_tests {
 
         let mut cursor = ExpireCursor::default();
         let mut cycles = 0;
-        while active_expire_cycle(&store, &expiry, &index, &mut cursor) {
+        while keys(&store) > 20_001 {
+            active_expire_cycle(&store, &expiry, &index, &mut cursor);
             cycles += 1;
             assert!(cycles < 1000, "the cycle never caught up");
         }
@@ -1175,5 +1205,35 @@ mod active_expiry_tests {
         );
         assert_eq!(keys(&store), 1);
         assert_eq!(times(&expiry), 1);
+    }
+
+    /// Behind only when more than a tenth of what was seen was due: the few
+    /// keys that come due between passes under steady TTL traffic do not
+    /// keep the thread from resting.
+    #[test]
+    fn behind_takes_more_than_a_tenth_due() {
+        assert!(!stale(1_800_000, 9_000));
+        assert!(!stale(1_000, 100));
+        assert!(stale(1_000, 101));
+        assert!(stale(40_000, 20_000));
+        assert!(!stale(0, 0));
+    }
+
+    /// A cycle that goes round every shard within its time is not behind,
+    /// whatever it removed, and keeps what is live.
+    #[test]
+    fn a_full_round_is_not_behind() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        for i in 0..2_000 {
+            put(&store, &expiry, &format!("kept:{i}"), future);
+        }
+        put(&store, &expiry, "gone", past);
+        let mut cursor = ExpireCursor::default();
+        assert!(!active_expire_cycle(&store, &expiry, &index, &mut cursor));
+        assert_eq!(keys(&store), 2_000);
     }
 }
