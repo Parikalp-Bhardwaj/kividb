@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  # A stable release opens an Announcements discussion (Publish GitHub Release).
+  discussions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -686,6 +688,10 @@ jobs:
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           generate_release_notes: false
           body_path: release-body.md
+          # A stable release is announced in Discussions (Announcements), with
+          # the release notes as the post and a link both ways; a release
+          # candidate is not.
+          discussion_category_name: ${{ !contains(env.RELEASE_TAG, '-') && 'Announcements' || '' }}
           files: |
             release-assets/*
         env:
