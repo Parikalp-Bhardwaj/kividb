@@ -21,8 +21,18 @@ use crate::store::ValueRef;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Where a HyperLogLog keeps its cached cardinality, if `bytes` is one.
+///
+/// A dense HLL is exactly 16 + 12288 bytes. A sparse one has any other length:
+/// Redis's default maximum is 3000, but the setting can raise it.
 fn hll_cache(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
-    (bytes.len() == 16 + 12288 && bytes.starts_with(b"HYLL")).then_some(8..16)
+    let is_hll = bytes.len() >= 16
+        && bytes.starts_with(b"HYLL")
+        && match bytes[4] {
+            0 => bytes.len() == 16 + 12288,
+            1 => true,
+            _ => false,
+        };
+    is_hll.then_some(8..16)
 }
 
 fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
@@ -189,6 +199,22 @@ mod tests {
         put(&b, hll(7, 1));
         assert_eq!(dataset_digest(&a), dataset_digest(&b));
         put(&b, hll(7, 2));
+        assert_ne!(dataset_digest(&a), dataset_digest(&b));
+
+        let sparse = |cache: u8, register: u8| {
+            let mut blob = vec![0u8; 18];
+            blob[..4].copy_from_slice(b"HYLL");
+            blob[4] = 1;
+            blob[8] = cache;
+            blob[15] = if cache == 0 { 0x80 } else { 0 };
+            blob[16] = 0x7f;
+            blob[17] = register;
+            KiviDBValue::String(crate::types::SharedBytes::from(blob.as_slice()))
+        };
+        put(&a, sparse(0, 0xff));
+        put(&b, sparse(7, 0xff));
+        assert_eq!(dataset_digest(&a), dataset_digest(&b));
+        put(&b, sparse(7, 0xfe));
         assert_ne!(dataset_digest(&a), dataset_digest(&b));
     }
 }
