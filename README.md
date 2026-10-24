@@ -30,6 +30,11 @@ client at that port, or pass `--port 6379`.
 
 Repository: [github.com/kividbio/kividb](https://github.com/kividbio/kividb) · Website: [kividb.io](https://kividb.io)
 
+**Moving from Redis?** [Migration guide](docs/MIGRATING_FROM_REDIS.md) ·
+[Compatibility and differences](docs/COMPATIBILITY.md) · [Benchmarks](#performance) ·
+[Releases](https://github.com/kividbio/kividb/releases) ·
+[Kubernetes operator](https://github.com/kividbio/kividb-operator)
+
 ### How it compares
 
 | | KiviDB | Redis 8 | Valkey 8 | Dragonfly | KeyDB |
@@ -104,6 +109,29 @@ glove-25-angular (1.18M vectors, 25 dimensions): HNSW with M=16 and EF_CONSTRUCT
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/vector-ingest-dark.png">
   <img src="assets/benchmarks/vector-ingest-light.png" alt="Vector ingest time" width="720">
 </picture>
+
+### Load rising to saturation
+
+A second setup, on Azure, in the manner of a latency/throughput/saturation test: rather
+than one fixed load, clients are added every 30 seconds, 40 to 1,600 per database, until
+each server can take no more. Each client sends 10 pipelined `SET`+`GET` pairs over 10
+million keys, then sleeps 10 ms. Every single server ran on its own 8 vCPU arm64 VM
+(D8ps_v5); the Redis Cluster had four 2 vCPU VMs, 8 vCPUs in all. KiviDB 1.1.2, October
+2026.
+
+| | Peak throughput | p50 / p99 at 1,600 clients | Errors |
+|---|------:|------:|------:|
+| KiviDB 1.1.2 | **2.08M req/s** | **4.3 / 13.9 ms** | 0 |
+| Dragonfly 2.0.2 | 1.56M req/s | 10.1 / 33.9 ms | 0 |
+| Redis 8.10.2 Cluster (4 × 2 vCPU) | 0.97M req/s | 26.8 / 44.9 ms | 0 |
+| Redis 8.10.2 | 0.49M req/s | 55.2 / 72.1 ms | 0 |
+
+Latency is per pipelined batch. Without pipelining, KiviDB measured about 20% below
+Dragonfly on these machines (about 8% below on the bare-metal run above). The harness, the run's raw data and its
+video are in
+[kivi-benchmark/ramp-saturation](https://github.com/kividbio/kivi-benchmark/tree/main/ramp-saturation);
+the run's dashboard is a
+[Grafana snapshot](https://snapshots.raintank.io/dashboard/snapshot/AheJ35tyvNmMmRx3ExXOe2bbsebZIvWg).
 
 - Methodology and scripts: [kivi-benchmark](https://github.com/kividbio/kivi-benchmark)
 - The most recent automated run: [benchmarks/LATEST.md](benchmarks/LATEST.md)
