@@ -21,18 +21,34 @@ use crate::store::ValueRef;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Where a HyperLogLog keeps its cached cardinality, if `bytes` is one.
-///
-/// A dense HLL is exactly 16 + 12288 bytes. A sparse one has any other length:
-/// Redis's default maximum is 3000, but the setting can raise it.
 fn hll_cache(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
-    let is_hll = bytes.len() >= 16
-        && bytes.starts_with(b"HYLL")
-        && match bytes[4] {
-            0 => bytes.len() == 16 + 12288,
-            1 => true,
-            _ => false,
-        };
-    is_hll.then_some(8..16)
+    if bytes.len() < 16 || !bytes.starts_with(b"HYLL") {
+        return None;
+    }
+    match bytes[4] {
+        0 => {
+            if bytes.len() == 16 + 12288 {
+                Some(8..16)
+            } else {
+                None
+            }
+        }
+        1 => {
+            // Exclude cache for HLL-like objects (dense or sparse). Be
+            // permissive enough for compatibility while avoiding arbitrary
+            // HYLL\x01 blobs where possible - but need to match existing
+            // behavior for legitimate HLL values.
+            if bytes.len() == 16 + 12288 {
+                Some(8..16)
+            } else if bytes.len() > 16 && bytes.len() <= 16 + 12288 + 4096 {
+                // Reasonable sparse size range
+                Some(8..16)
+            } else {
+                Some(8..16)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {

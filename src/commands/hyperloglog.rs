@@ -4,6 +4,21 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::{read_lock, write_lock};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static HLL_WRITE_REDIS: AtomicBool = AtomicBool::new(false);
+
+pub fn get_hll_write_format() -> String {
+    if HLL_WRITE_REDIS.load(Ordering::Relaxed) {
+        "redis".to_string()
+    } else {
+        "legacy".to_string()
+    }
+}
+
+pub fn set_hll_write_format(v: &str) {
+    HLL_WRITE_REDIS.store(v == "redis", Ordering::Relaxed);
+}
 
 // ── HyperLogLog constants ─────────────────────────────────────────────────────
 //
@@ -17,8 +32,10 @@ use crate::{read_lock, write_lock};
 // long. Sparse HLLs have encoding 1 and a variable length.
 //
 // KiviDB before 1.1.2 wrote a dense HLL of the same size with encoding 1 and a
-// different hash. Those are still read, and are written back in their old
-// format, so an old value does not lose elements when it is next changed.
+// different hash. 1.1.2 still writes the old (legacy) format by default
+// for rolling-upgrade compatibility. Those values are still read, and an old
+// value that is updated is written back in its original format, so an old
+// value does not lose elements when it is next changed.
 
 const HLL_P: u32 = 14;
 const HLL_Q: u32 = 64 - HLL_P; // 50 bits left for the leading-zero rank
@@ -44,7 +61,7 @@ enum HllFormat {
     Dense,
     /// Redis sparse: encoding 1, anything but the legacy dense size.
     Sparse,
-    /// KiviDB before 1.1.2: encoding 1, exactly 12304 bytes, FNV-1a hash.
+    /// KiviDB before 1.1.2/1.1.2: encoding 1, exactly 12304 bytes, FNV-1a hash.
     LegacyDense,
 }
 
@@ -54,13 +71,11 @@ enum HllFormat {
 /// exactly 12304 bytes, and KiviDB's pre-1.1.2 dense format is also encoding 1
 /// at that size. The old format left no marker to tell them apart, so use the
 /// only validation available: a Redis sparse payload must decode completely
-/// and cover exactly 16384 registers. If it does, it is sparse; otherwise it
-/// is kept as legacy dense.
+/// and cover exactly 16384 registers with canonical sparse encoding. If it does,
+/// it is sparse; otherwise it is kept as legacy dense.
 ///
-/// A legacy payload whose registers happen to form a valid sparse stream is
-/// indistinguishable from Redis sparse. There is no checksum or marker to
-/// resolve that case; preferring the validated sparse reading keeps Redis
-/// values usable without changing the old fallback for real legacy values.
+/// When in doubt, prefer the legacy dense interpretation for 12304-byte
+/// encoding-1 blobs to be safe for rolling upgrades from old KiviDB builds.
 fn hll_format(blob: &[u8]) -> Option<HllFormat> {
     if blob.len() < HLL_HEADER_SIZE || blob[0..4] != *HLL_MAGIC {
         return None;
@@ -68,12 +83,15 @@ fn hll_format(blob: &[u8]) -> Option<HllFormat> {
     match blob[4] {
         HLL_DENSE_ENCODING if blob.len() == HLL_TOTAL_SIZE => Some(HllFormat::Dense),
         HLL_SPARSE_ENCODING if blob.len() == HLL_TOTAL_SIZE => {
-            match sparse_to_dense(&blob[HLL_HEADER_SIZE..]) {
+            match sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]) {
                 Ok(_) => Some(HllFormat::Sparse),
                 Err(()) => Some(HllFormat::LegacyDense),
             }
         }
-        HLL_SPARSE_ENCODING => Some(HllFormat::Sparse),
+        HLL_SPARSE_ENCODING => match sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]) {
+            Ok(_) => Some(HllFormat::Sparse),
+            Err(()) => None,
+        },
         _ => None,
     }
 }
@@ -184,10 +202,18 @@ fn cached_count(blob: &[u8]) -> Option<u64> {
     (count != 0 && blob[15] & 0x80 == 0).then_some(count)
 }
 
+fn hll_write_redis() -> bool {
+    HLL_WRITE_REDIS.load(Ordering::Relaxed)
+}
+
 fn make_empty_hll() -> Vec<u8> {
     let mut blob = vec![0u8; HLL_TOTAL_SIZE];
     blob[0..4].copy_from_slice(HLL_MAGIC);
-    blob[4] = HLL_DENSE_ENCODING;
+    if hll_write_redis() {
+        blob[4] = HLL_DENSE_ENCODING;
+    } else {
+        blob[4] = HLL_LEGACY_ENCODING;
+    }
     blob
 }
 
@@ -231,13 +257,27 @@ fn incompatible_hash_formats() -> Vec<u8> {
 //   01xxxxxx yyyyyyyy    XZERO: run length (x << 8 | y) + 1 (1..16384)
 //   1vvvvvxx             VAL:   value v + 1 (1..32), run length x + 1 (1..4)
 
+#[allow(dead_code)]
 fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
+    sparse_to_dense_canonical(body)
+}
+
+fn is_zero_run_opcode(opcode: u8) -> bool {
+    (opcode & 0xC0) == 0x00 || (opcode & 0xC0) == 0x40
+}
+
+fn sparse_to_dense_canonical(body: &[u8]) -> Result<Vec<u8>, ()> {
     let mut registers = vec![0u8; HLL_DENSE_SIZE];
     let mut index = 0usize;
     let mut at = 0usize;
+    let mut last_was_zero_run = false;
 
     while at < body.len() {
         let opcode = body[at];
+        let is_zero = is_zero_run_opcode(opcode);
+        if is_zero && last_was_zero_run {
+            return Err(());
+        }
         match opcode & 0xC0 {
             0x00 => {
                 let run = ((opcode & 0x3F) as usize) + 1;
@@ -246,6 +286,7 @@ fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
                     return Err(());
                 }
                 at += 1;
+                last_was_zero_run = true;
             }
             0x40 => {
                 if at + 1 >= body.len() {
@@ -257,10 +298,14 @@ fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
                     return Err(());
                 }
                 at += 2;
+                last_was_zero_run = true;
             }
             _ => {
                 let run = ((opcode & 0x03) as usize) + 1;
                 let value = ((opcode >> 2) & 0x1F) + 1;
+                if value == 0 || value > 32 {
+                    return Err(());
+                }
                 if index + run > HLL_REGISTERS {
                     return Err(());
                 }
@@ -269,6 +314,7 @@ fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
                 }
                 index += run;
                 at += 1;
+                last_was_zero_run = false;
             }
         }
     }
@@ -318,7 +364,9 @@ fn sparse_description(body: &[u8]) -> Result<String, ()> {
 fn registers_from_blob(blob: &[u8], format: HllFormat) -> Result<Vec<u8>, Vec<u8>> {
     match format {
         HllFormat::Dense | HllFormat::LegacyDense => Ok(blob[HLL_HEADER_SIZE..].to_vec()),
-        HllFormat::Sparse => sparse_to_dense(&blob[HLL_HEADER_SIZE..]).map_err(|_| corrupt_hll()),
+        HllFormat::Sparse => {
+            sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]).map_err(|_| corrupt_hll())
+        }
     }
 }
 
@@ -536,6 +584,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
         let encoding = if legacy {
             HLL_LEGACY_ENCODING
         } else {
+            // Existing Redis/dense format keys keep their format
             HLL_DENSE_ENCODING
         };
         let mut new_blob = dense_blob(encoding, &blob[8..16], &registers);
@@ -718,7 +767,11 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
     // the old hash, and must keep being read with it. The checks above ensure
     // every source shares that hash space, so no incompatible registers reach
     // the destination.
-    let legacy = legacy_space == Some(true);
+    let legacy = if let Some(blob) = &destination {
+        hll_format(blob).expect("get_optional_hll validates the header") == HllFormat::LegacyDense
+    } else {
+        legacy_space == Some(true) || !hll_write_redis()
+    };
     let encoding = if legacy {
         HLL_LEGACY_ENCODING
     } else {

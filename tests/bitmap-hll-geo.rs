@@ -798,6 +798,10 @@ fn pfadd_writes_redis_dense_layout() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
 
     c.cmds(&["PFADD", "hll", "a", "b", "c"]);
     assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
@@ -813,6 +817,10 @@ fn reads_redis_sparse_hll_and_converts_it_when_added_to() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
 
     assert!(c.cmd(&[b"SET", b"hll", REDIS_HLL_SPARSE]).is_ok());
     assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
@@ -897,6 +905,10 @@ fn pfmerge_writes_a_redis_sparse_source_as_dense() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
 
     assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
     assert!(c.cmds(&["PFMERGE", "dest", "sparse"]).is_ok());
@@ -1012,6 +1024,10 @@ fn pure_redis_pfmerge_stays_redis() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
 
     assert!(c.cmd(&[b"SET", b"abc", REDIS_HLL_DENSE_ABC]).is_ok());
     assert!(c.cmd(&[b"SET", b"abcd", REDIS_HLL_DENSE_ABCD]).is_ok());
@@ -1031,6 +1047,41 @@ fn rejects_corrupt_sparse_hll_without_panicking() {
     assert!(c.cmd(&[b"SET", b"hll", &corrupt]).is_ok());
     assert!(c.cmds(&["PFCOUNT", "hll"]).is_error());
     assert!(c.cmds(&["PFDEBUG", "GETREG", "hll"]).is_error());
+}
+
+#[test]
+fn legacy_small_hlls_with_few_elements_are_not_misclassified_as_sparse() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // 2 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 2);
+    assert_eq!(c.cmds(&["PFADD", "h", "x"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 3);
+
+    // 3 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "1", "2", "3"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 3);
+    assert_eq!(c.cmds(&["PFADD", "h", "4"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 4);
+
+    // 4 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b", "c", "d"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 4);
+    assert_eq!(c.cmds(&["PFADD", "h", "e"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 5);
+
+    // 5 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b", "c", "d", "e"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 5);
+    assert_eq!(c.cmds(&["PFADD", "h", "f"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 6);
 }
 
 // PFDEBUG ENCODING — dense for new/dense values, sparse for Redis sparse ones
@@ -1934,6 +1985,10 @@ fn pfcount_caches_the_count_in_the_value_and_pfadd_marks_it_stale() {
         other => panic!("{other:?}"),
     };
 
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
     c.cmds(&["PFADD", "hll", "a", "b", "c"]);
     assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
     assert_eq!(byte(&mut c, "15"), b"\x00");

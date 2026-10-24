@@ -1610,6 +1610,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             "search-min-stem-len",
             crate::commands::search_tools::config_value("MINSTEMLEN"),
         ),
+        (
+            "hll-write-format",
+            crate::commands::hyperloglog::get_hll_write_format(),
+        ),
     ];
     for (name, value) in in_effect {
         if !rows.iter().any(|(known, _)| known == name) {
