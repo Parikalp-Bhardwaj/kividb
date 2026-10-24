@@ -41,7 +41,8 @@ client at that port, or pass `--port 6379`.
 Repository: [github.com/kividbio/kividb](https://github.com/kividbio/kividb) · Website: [kividb.io](https://kividb.io)
 
 **Moving from Redis?** [Migration guide](docs/MIGRATING_FROM_REDIS.md) ·
-[Compatibility and differences](docs/COMPATIBILITY.md) · [Benchmarks](#performance) ·
+[Compatibility and differences](docs/COMPATIBILITY.md) · [Client examples](examples/clients/) ·
+[Benchmarks](#performance) ·
 [Releases](https://github.com/kividbio/kividb/releases) ·
 [Kubernetes operator](https://github.com/kividbio/kividb-operator)
 
