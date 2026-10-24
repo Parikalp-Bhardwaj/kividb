@@ -4,6 +4,16 @@
   <img src="assets/kiwi.png" alt="KiviDB" width="180">
 </p>
 
+<p align="center">
+  <a href="https://github.com/kividbio/kividb/actions/workflows/ci.yml"><img src="https://github.com/kividbio/kividb/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI"></a>
+  <a href="https://github.com/kividbio/kividb/releases/latest"><img src="https://img.shields.io/github/v/release/kividbio/kividb?sort=semver" alt="Latest release"></a>
+  <a href="https://hub.docker.com/r/kividb/kividb"><img src="https://img.shields.io/docker/pulls/kividb/kividb" alt="Docker pulls"></a>
+  <a href="https://artifacthub.io/packages/helm/kividb-operator/kividb-operator-chart"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/kividb-operator" alt="Artifact Hub"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/kividbio/kividb" alt="License: AGPL-3.0"></a>
+  <a href="https://github.com/kividbio/kividb/discussions"><img src="https://img.shields.io/github/discussions/kividbio/kividb" alt="Discussions"></a>
+  <a href="https://github.com/kividbio/kividb/stargazers"><img src="https://img.shields.io/github/stars/kividbio/kividb?style=flat" alt="GitHub stars"></a>
+</p>
+
 **KiviDB** is a fast, multi-threaded alternative to Redis® and Valkey, written in Rust. It
 speaks the Redis protocol (RESP2 and RESP3), so existing Redis clients, `redis-cli` and
 libraries work unchanged, and it has full-text and vector search built in. It runs every
