@@ -119,6 +119,12 @@ million keys, then sleeps 10 ms. Every single server ran on its own 8 vCPU arm64
 (D8ps_v5); the Redis Cluster had four 2 vCPU VMs, 8 vCPUs in all. KiviDB 1.1.2, October
 2026.
 
+<a href="https://github.com/kividbio/kivi-benchmark/blob/main/ramp-saturation/results/2026-10-24-pipelined/kividb-vs-dragonfly-vs-redis.mp4">
+  <img src="assets/benchmarks/ramp-saturation.webp" alt="KiviDB vs Dragonfly vs Redis vs Redis Cluster as the load rises: throughput, p50 and p99 latency, errors, CPU and memory" width="720">
+</a>
+
+*The whole run, 20 minutes at 60× speed. Click for the full-resolution video.*
+
 | | Peak throughput | p50 / p99 at 1,600 clients | Errors |
 |---|------:|------:|------:|
 | KiviDB 1.1.2 | **2.08M req/s** | **4.3 / 13.9 ms** | 0 |
