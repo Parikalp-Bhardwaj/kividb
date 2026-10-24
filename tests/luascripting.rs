@@ -1304,10 +1304,10 @@ fn test_error_with_a_table_is_its_err() {
     assert!(r.as_error().starts_with("ERR X  +INJECTED"), "{r:?}");
     assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
 
-    // pcall still sees the table itself.
+    // `pcall` hands back its `err`, as Redis's does (#90).
     let r = c.cmds(&[
         "EVAL",
-        "local ok, e = pcall(error, {err='ERR caught'}); return e.err",
+        "local ok, e = pcall(error, {err='ERR caught'}); return e",
         "0",
     ]);
     assert_eq!(r.as_str(), "ERR caught");
@@ -1315,8 +1315,8 @@ fn test_error_with_a_table_is_its_err() {
 
 /// `error` and `assert` are Lua's own but for a table they raise (#80):
 /// strings keep the place at the level asked for, `assert` passes its
-/// arguments on, and a table is its `err` from `assert`, and from a function
-/// as from a script.
+/// arguments on and takes only a string for its message (#90), and a table
+/// is its `err` from a function as from a script.
 #[test]
 fn test_error_and_assert_raise_as_lua_does() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
@@ -1347,8 +1347,12 @@ fn test_error_and_assert_raise_as_lua_does() {
         "local x = 1\nassert(false, {err='ERR asserted'})",
         "0",
     ]);
-    assert!(r.as_error().starts_with("ERR asserted script: "), "{r:?}");
-    assert!(r.as_error().ends_with(", on @user_script:2."), "{r:?}");
+    // A table is not a message `assert` takes, as in Redis (#90).
+    assert!(
+        r.as_error()
+            .contains(": bad argument #2 to 'assert' (string expected, got table) script: "),
+        "{r:?}"
+    );
 
     // Level 2 names the caller's line (the reply always says line 1).
     let r = c.cmds(&[
@@ -1360,10 +1364,10 @@ fn test_error_and_assert_raise_as_lua_does() {
 
     let r = c.cmds(&[
         "EVAL",
-        "local ok, e = pcall(assert, false, {err='ERR kept'}); return e.err",
+        "local ok, e = pcall(assert, false, 'kept'); return e",
         "0",
     ]);
-    assert_eq!(r.as_str(), "ERR kept");
+    assert_eq!(r.as_str(), "kept");
 
     let lib = "#!lua name=errlib\nredis.register_function('raise', function() error({err='ERR from fn'}) end)";
     assert_eq!(c.cmds(&["FUNCTION", "LOAD", lib]).as_str(), "errlib");
@@ -1377,7 +1381,7 @@ fn test_error_and_assert_raise_as_lua_does() {
 
 /// A table `error` raises is left as the script made it: one with a
 /// metatable of its own replies with its `err` too, one raised again replies
-/// with its `err` as it is then, and one caught with `pcall` is still a
+/// with its `err` as it is then, and one caught with `xpcall` is still a
 /// plain table to `tostring` and `getmetatable`.
 #[test]
 fn test_error_leaves_the_table_it_raises_alone() {
@@ -1404,7 +1408,7 @@ fn test_error_leaves_the_table_it_raises_alone() {
 
     let r = c.cmds(&[
         "EVAL",
-        "local ok, e = pcall(error, {err='ERR x'})\nreturn {tostring(e):sub(1, 7), getmetatable(e) == nil and 1 or 0}",
+        "local ok, e = xpcall(error, function(m) return m end, {err='ERR x'})\nreturn {tostring(e):sub(1, 7), getmetatable(e) == nil and 1 or 0}",
         "0",
     ]);
     assert_eq!(
@@ -1485,6 +1489,167 @@ fn test_error_leaves_the_table_it_raises_alone() {
         r.as_error().starts_with("ERR meta fn script: raise_meta"),
         "{r:?}"
     );
+}
+
+/// `pcall` hands back what it caught as Redis's does (#90): a table's `err`
+/// if that is a string or a number, and the message of an error from
+/// `redis.call` and the rest of the API. `xpcall` and a table without such an
+/// `err` are left as they are. `assert` takes only a string or a number for
+/// its message, as Lua 5.1's does.
+#[test]
+fn test_pcall_gives_the_err_and_assert_takes_a_string() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let bulk = |s: &str| RespValue::Bulk(s.as_bytes().to_vec());
+    assert_eq!(
+        c.cmds(&["SET", "s", "abc"]),
+        RespValue::SimpleStr("OK".into())
+    );
+
+    // What `pcall` hands back, by what was raised.
+    for (raise, want) in [
+        ("error({err='ERR x'})", vec![bulk("string"), bulk("ERR x")]),
+        (
+            "error(redis.error_reply('MY x'))",
+            vec![bulk("string"), bulk("MY x")],
+        ),
+        ("error({err=42})", vec![bulk("number"), RespValue::Int(42)]),
+        (
+            "error(setmetatable({}, {__index = {err='ERR idx'}}))",
+            vec![bulk("string"), bulk("ERR idx")],
+        ),
+        (
+            "local ok, e = pcall(error, {err='ERR in'}) error({err='ERR out'})",
+            vec![bulk("string"), bulk("ERR out")],
+        ),
+        (
+            "redis.call('INCR', 's')",
+            vec![
+                bulk("string"),
+                bulk("ERR value is not an integer or out of range"),
+            ],
+        ),
+        (
+            "redis.call('NOSUCHCMD')",
+            vec![
+                bulk("string"),
+                bulk("ERR Unknown Redis command called from script"),
+            ],
+        ),
+        ("error({})", vec![bulk("table")]),
+        ("error({err={1}})", vec![bulk("table")]),
+        ("error({err=true})", vec![bulk("table")]),
+    ] {
+        let script = format!(
+            "local ok, e = pcall(function() {raise} end)\nif type(e) == 'table' then return {{type(e)}} end\nreturn {{type(e), e}}"
+        );
+        assert_eq!(
+            c.cmds(&["EVAL", &script, "0"]),
+            RespValue::Array(want),
+            "{raise}"
+        );
+    }
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(function() error({err='ERR l2'}, 2) end) return e",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "ERR l2");
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(cjson.decode, '{bad') return type(e)",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "string");
+    let r = c.cmds(&[
+        "EVAL_RO",
+        "local ok, e = pcall(redis.call, 'SET', 'x', '1') return e",
+        "0",
+    ]);
+    assert_eq!(
+        r.as_str(),
+        "ERR Write commands are not allowed from read-only scripts."
+    );
+    // A table whose `err` is neither comes back with that `err` after it, as
+    // Redis's `pcall` leaves it.
+    let r = c.cmds(&[
+        "EVAL",
+        "return {select('#', pcall(error, {})), select('#', pcall(error, {err='x'}))}",
+        "0",
+    ]);
+    assert_eq!(
+        r,
+        RespValue::Array(vec![RespValue::Int(3), RespValue::Int(2)])
+    );
+    let r = c.cmds(&["EVAL", "return {select(3, pcall(error, {err=true}))}", "0"]);
+    assert_eq!(r, RespValue::Array(vec![RespValue::Int(1)]));
+    // What succeeds comes back as it was.
+    let r = c.cmds(&["EVAL", "return {pcall(function() return 1, 2 end)}", "0"]);
+    assert_eq!(
+        r,
+        RespValue::Array(vec![
+            RespValue::Int(1),
+            RespValue::Int(1),
+            RespValue::Int(2)
+        ])
+    );
+    // `xpcall` is Lua's own.
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = xpcall(function() error({err='ERR x'}) end, function(m) return m end) return type(e)",
+        "0",
+    ]);
+    assert_eq!(r.as_str(), "table");
+    // A coroutine can still yield inside `pcall`.
+    let r = c.cmds(&[
+        "EVAL",
+        "local co = coroutine.wrap(function() pcall(function() coroutine.yield(7) end) end) return co()",
+        "0",
+    ]);
+    assert_eq!(r, RespValue::Int(7));
+
+    // `assert`'s message.
+    for (script, want) in [
+        ("assert(false, 'boom')", "ERR user_script:1: boom script: "),
+        ("assert(false, 42)", "ERR user_script:1: 42 script: "),
+        (
+            "assert(false, nil)",
+            "ERR user_script:1: assertion failed! script: ",
+        ),
+        (
+            "assert(false, {err='ERR asserted'})",
+            "ERR user_script:1: bad argument #2 to 'assert' (string expected, got table) script: ",
+        ),
+    ] {
+        let r = c.cmds(&["EVAL", script, "0"]);
+        assert!(r.as_error().starts_with(want), "{script}: {r:?}");
+    }
+    let r = c.cmds(&[
+        "EVAL",
+        "local ok, e = pcall(assert, false, {err='x'}) return e",
+        "0",
+    ]);
+    assert_eq!(
+        r.as_str(),
+        "bad argument #2 to '?' (string expected, got table)"
+    );
+    let r = c.cmds(&["EVAL", "local ok, e = pcall(assert) return e", "0"]);
+    assert_eq!(r.as_str(), "bad argument #1 to '?' (value expected)");
+    let r = c.cmds(&["EVAL", "assert()", "0"]);
+    assert!(
+        r.as_error().starts_with(
+            "ERR user_script:1: bad argument #1 to 'assert' (value expected) script: "
+        ),
+        "{r:?}"
+    );
+
+    // Functions have the same.
+    let lib = "#!lua name=pcalllib\nredis.register_function('try_incr', function(keys) local ok, e = pcall(redis.call, 'INCR', keys[1]) return e end)";
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", lib]).as_str(), "pcalllib");
+    let r = c.cmds(&["FCALL", "try_incr", "1", "s"]);
+    assert_eq!(r.as_str(), "ERR value is not an integer or out of range");
 }
 
 /// `redis.error_reply` gives a message without a code the code `ERR`, as

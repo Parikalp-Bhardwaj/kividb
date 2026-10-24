@@ -1888,9 +1888,11 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
-    // A table raised by `error` or `assert` is kept with its `err` and the
-    // line, as Redis's error handler reads one: see [`remember_error_table`].
-    // SAFETY: C functions that do what Lua's own `error` and `assert` do.
+    // A table raised by `error` is kept with its `err` and the line, as
+    // Redis's error handler reads one: see [`remember_error_table`]. `pcall`
+    // and `assert` are Redis's (#90).
+    // SAFETY: C functions that do what Lua's own `error`, Lua 5.1's `assert`
+    // and Redis's `pcall` do.
     unsafe {
         let globals = lua.globals();
         globals
@@ -1898,6 +1900,9 @@ end
             .unwrap();
         globals
             .set("assert", lua.create_c_function(script_assert).unwrap())
+            .unwrap();
+        globals
+            .set("pcall", lua.create_c_function(script_pcall).unwrap())
             .unwrap();
     }
 
@@ -3417,8 +3422,8 @@ thread_local! {
     /// What [`remember_error_table`] kept of the table a script raised last
     /// on this thread: what `tostring` makes of it, then its message, marked.
     /// It lasts until the call it was raised in returns ([`table_errors`]),
-    /// or until `error` or `assert` raise another table, or a value that is
-    /// not a string with the place before it. A finalizer's raise is not
+    /// or until `error` raises another table, or a value that is not a
+    /// string with the place before it. A finalizer's raise is not
     /// kept ([`in_finalizer`]).
     static RAISED_TABLE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
     /// Whether [`RAISED_TABLE`] holds anything: a call that succeeds reads
@@ -3445,24 +3450,133 @@ unsafe extern "C-unwind" fn script_error(state: *mut mlua::ffi::lua_State) -> st
     }
 }
 
-/// `assert` in scripts: Lua's own (`luaB_assert`), with a table for its
-/// message kept as `error` keeps one.
+/// `assert` in scripts: Lua 5.1's, which Redis has (#90). Its message is a
+/// string or a number, given the place it was raised at, and
+/// `assertion failed!` without one; a table is refused.
 unsafe extern "C-unwind" fn script_assert(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
     use mlua::ffi;
     unsafe {
         if ffi::lua_toboolean(state, 1) != 0 {
             return ffi::lua_gettop(state);
         }
-        ffi::luaL_checkany(state, 1);
-        ffi::lua_remove(state, 1);
-        ffi::lua_pushstring(state, c"assertion failed!".as_ptr());
-        ffi::lua_settop(state, 1);
-        raise_script_error(state, 1)
+        if ffi::lua_type(state, 1) == ffi::LUA_TNONE {
+            return ffi::luaL_error(
+                state,
+                c"bad argument #1 to '%s' (value expected)".as_ptr(),
+                called_as(state),
+            );
+        }
+        if ffi::lua_type(state, 2) > ffi::LUA_TNIL && ffi::lua_isstring(state, 2) == 0 {
+            return ffi::luaL_error(
+                state,
+                c"bad argument #2 to '%s' (string expected, got %s)".as_ptr(),
+                called_as(state),
+                ffi::luaL_typename(state, 2),
+            );
+        }
+        let message = ffi::luaL_optstring(state, 2, c"assertion failed!".as_ptr());
+        ffi::luaL_error(state, c"%s".as_ptr(), message)
     }
 }
 
-/// Raise the value at 1 as `luaB_error` does: a string with the place at
-/// `level` before it, a table kept.
+/// The name the running C function was called by, as Lua 5.1 gives it in a
+/// bad-argument error: `'?'` when the call gives none, as from `pcall` (5.4
+/// would look for a global of that value).
+unsafe fn called_as(state: *mut mlua::ffi::lua_State) -> *const std::ffi::c_char {
+    use mlua::ffi;
+    unsafe {
+        let mut ar: ffi::lua_Debug = std::mem::zeroed();
+        if ffi::lua_getstack(state, 0, &mut ar) != 0
+            && ffi::lua_getinfo(state, c"n".as_ptr(), &mut ar) != 0
+            && !ar.name.is_null()
+        {
+            ar.name
+        } else {
+            c"?".as_ptr()
+        }
+    }
+}
+
+/// `pcall` in scripts: Lua's own (`luaB_pcall`, so a coroutine can still
+/// yield inside it), but what it catches is handed back as Redis's `pcall`
+/// (`luaRedisPcall`) hands it back (#90): see [`caught_as_redis`].
+unsafe extern "C-unwind" fn script_pcall(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        ffi::luaL_checkany(state, 1);
+        ffi::lua_pushboolean(state, 1);
+        ffi::lua_insert(state, 1);
+        let status = ffi::lua_pcallk(
+            state,
+            ffi::lua_gettop(state) - 2,
+            ffi::LUA_MULTRET,
+            0,
+            0,
+            Some(finish_script_pcall),
+        );
+        finish_script_pcall(state, status, 0)
+    }
+}
+
+/// The rest of [`script_pcall`], as `finishpcall` is of `luaB_pcall`.
+unsafe extern "C-unwind" fn finish_script_pcall(
+    state: *mut mlua::ffi::lua_State,
+    status: std::ffi::c_int,
+    extra: mlua::ffi::lua_KContext,
+) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        if status != ffi::LUA_OK && status != ffi::LUA_YIELD {
+            let caught = caught_as_redis(state);
+            ffi::lua_pushboolean(state, 0);
+            ffi::lua_rotate(state, -(caught + 1), 1);
+            return caught + 1;
+        }
+        ffi::lua_gettop(state) - extra as std::ffi::c_int
+    }
+}
+
+/// What a script's `pcall` hands back for the error at the top of the stack,
+/// left at the top: how many values that is. A table whose `err` is a string
+/// or a number is its `err`, as in Redis, where `redis.call` raises such a
+/// table; a table with any other `err` is followed by it, as Redis leaves it.
+/// An error from Rust (`redis.call`, `cjson`, ...) is mlua's object, whose
+/// `tostring` is `runtime error: ` and the message, then a traceback: it is
+/// the message, as Redis's is. Anything else is left as it is.
+///
+/// The bytes read are Lua's, on the stack until they are copied: a Lua error
+/// here unwinds through no Rust value that needs dropping.
+unsafe fn caught_as_redis(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        match ffi::lua_type(state, -1) {
+            ffi::LUA_TTABLE => {
+                ffi::lua_getfield(state, -1, c"err".as_ptr());
+                if ffi::lua_isstring(state, -1) == 0 {
+                    return 2;
+                }
+                ffi::lua_replace(state, -2);
+            }
+            ffi::LUA_TUSERDATA => {
+                let mut len = 0;
+                let text = ffi::luaL_tolstring(state, -1, &mut len);
+                let text = std::slice::from_raw_parts(text.cast::<u8>(), len);
+                let text =
+                    memchr::memmem::find(text, b"\nstack traceback").map_or(text, |at| &text[..at]);
+                let text = text.strip_prefix(b"runtime error: ").unwrap_or(text);
+                let text = text.trim_ascii_end();
+                ffi::lua_pushlstring(state, text.as_ptr().cast(), text.len());
+                ffi::lua_replace(state, -3);
+                ffi::lua_pop(state, 1);
+            }
+            _ => {}
+        }
+        1
+    }
+}
+
+/// Raise the value at 1 as `luaB_error` does, for `error`: a string with the
+/// place at `level` before it, a table kept.
 unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::c_int) -> ! {
     use mlua::ffi;
     unsafe {
@@ -3490,7 +3604,7 @@ unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::
 /// Here that cost every call about 2,400 instructions (an `EVALSHA` of a
 /// `GET` 11% more) for the rare one that fails (#80); this costs nothing
 /// until a table is raised. The table itself is left alone: a script that
-/// catches it with `pcall` has it as it made it.
+/// catches it with `xpcall` has it as it made it.
 ///
 /// The Lua calls that can fail (out of memory) come before any Rust value
 /// is made, so a Lua error unwinds through none that needs dropping.
@@ -3509,7 +3623,7 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
             forget_raised_table();
             return;
         }
-        // The frame that raised it: past `error` (or `assert`) itself.
+        // The frame that raised it: past `error` itself.
         let mut line = 1;
         let mut ar: ffi::lua_Debug = std::mem::zeroed();
         for level in 1..=3 {
