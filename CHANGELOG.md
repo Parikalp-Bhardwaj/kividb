@@ -9,6 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Script commands in a build without Lua** said "Lua scripting is not
+  supported by KiviDB", which BullMQ and Sidekiq users read as KiviDB not
+  running their queue. `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` and `FCALL`
+  now say this build has no Lua and name the `lua` or `full` variant to
+  use, with the Docker tag (#105).
+
 - **32-bit builds** (i386 and other 32-bit targets) didn't compile (#99):
   the key hash used 64-bit constants in a `usize`, and a time series'
   `CHUNK_SIZE` was read from the snapshot as a `usize` from 8 bytes. Both
