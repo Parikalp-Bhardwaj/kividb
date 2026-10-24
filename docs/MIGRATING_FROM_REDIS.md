@@ -130,11 +130,13 @@ What the RDB reader takes from Redis:
 
 ## 7. Check your application
 
-1. Run your test suite against KiviDB. A command KiviDB lacks returns
+1. Try a client first: [examples/clients/](../examples/clients/) has tested
+   examples for redis-py, ioredis, BullMQ, go-redis and Jedis.
+2. Run your test suite against KiviDB. A command KiviDB lacks returns
    `ERR unknown command`; [ERRORS.md](ERRORS.md) explains every error KiviDB
    adds.
-2. Check [COMPATIBILITY.md](COMPATIBILITY.md) for the commands you rely on.
-3. Measure with your own workload. The published benchmarks are one
+3. Check [COMPATIBILITY.md](COMPATIBILITY.md) for the commands you rely on.
+4. Measure with your own workload. The published benchmarks are one
    controlled setup, not a promise.
 
 Something on this page wrong or missing for your setup?
