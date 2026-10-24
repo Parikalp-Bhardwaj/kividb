@@ -237,6 +237,16 @@ fn config_set_array(param: &str, value: &str) -> Vec<u8> {
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
 
+/// The reply to a script command in a build without Lua. Job queues such as
+/// BullMQ and Sidekiq show it to their users, so it names the build to use.
+#[cfg(not(feature = "lua"))]
+const NO_LUA: &str = concat!(
+    "ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the ",
+    "lua or full variant (Docker image kividb/kividb:v",
+    env!("CARGO_PKG_VERSION"),
+    "-lua, or a kividb-lua release file)"
+);
+
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
     match name {
@@ -4793,10 +4803,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR Lua scripting is not supported by KiviDB. \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4807,10 +4814,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR SCRIPT subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4821,10 +4825,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR FUNCTION subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4835,10 +4836,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR FUNCTION subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
