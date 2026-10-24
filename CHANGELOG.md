@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **32-bit builds** (i386 and other 32-bit targets) didn't compile (#99):
+  the key hash used 64-bit constants in a `usize`, and a time series'
+  `CHUNK_SIZE` was read from the snapshot as a `usize` from 8 bytes. Both
+  are 64-bit on every target now, so a 32-bit server loads a 64-bit one's
+  snapshot. Nothing changes on 64-bit: the same shard for every key, the
+  same snapshot bytes.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
