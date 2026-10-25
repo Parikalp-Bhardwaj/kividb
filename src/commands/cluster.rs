@@ -143,6 +143,12 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
             .stats_messages_received
             .load(std::sync::atomic::Ordering::Relaxed)
     ));
+    out.push_str(&format!(
+        "cluster_stats_bus_connects:{}\r\n",
+        state
+            .stats_bus_connects
+            .load(std::sync::atomic::Ordering::Relaxed)
+    ));
     out.push_str("total_cluster_links_buffer_limit_exceeded:0\r\n");
 
     resp_bulk_str(&out)

@@ -26,6 +26,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **The cluster bus keeps one connection per peer for heartbeats (#112).**
+  Every node pinged every other one each second over a new TCP connection:
+  N x (N - 1) connections a second across the cluster, 552 at 24 nodes.
+  Each peer is now pinged over a connection kept open between heartbeats,
+  replaced when it breaks (a peer that restarts is reached again on the
+  next heartbeat), and dropped on a late reply so that no PONG is read as
+  the answer to the next PING. `CLUSTER INFO` reports
+  `cluster_stats_bus_connects`, the outbound bus connections opened.
+
 - **`pcall` hands back the error's message, and `assert` takes only a
   string, as in Redis (#90).** A table raised with an `err` that is a string
   or a number (`error({err = ...})`, `error(redis.error_reply(...))`) comes

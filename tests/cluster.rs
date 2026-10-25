@@ -956,6 +956,48 @@ fn nodes_announce_a_client_port_of_their_own() {
     );
 }
 
+/// Heartbeats go over one connection per peer, kept open (#112): pinging
+/// every peer every second used to open a new connection each time, N x
+/// (N - 1) a second across the cluster. A peer that restarts is reached
+/// again on a new one.
+#[test]
+fn heartbeats_reuse_one_connection_per_peer() {
+    let (mut nodes, _) = form_cluster(6);
+    let stat = |n: &Node, f: &str| -> u64 { n.cluster_info(f).parse().unwrap_or(0) };
+    // Let every link come up.
+    std::thread::sleep(Duration::from_secs(3));
+    let (connects, sent) = (
+        stat(&nodes[0], "cluster_stats_bus_connects"),
+        stat(&nodes[0], "cluster_stats_messages_sent"),
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    let new_connects = stat(&nodes[0], "cluster_stats_bus_connects") - connects;
+    let new_messages = stat(&nodes[0], "cluster_stats_messages_sent") - sent;
+    // Five peers, five seconds: 25 pings, on connections already open.
+    assert!(new_messages >= 20, "{new_messages} messages sent");
+    assert!(
+        new_connects <= 2,
+        "{new_connects} connections opened in 5 s"
+    );
+
+    nodes[3].restart();
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 6);
+    wait_until(
+        "the restarted node to be heard from again",
+        Duration::from_secs(20),
+        || {
+            let id = nodes[3].id();
+            nodes[0]
+                .conn()
+                .cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .find(|l| l.starts_with(&id))
+                .is_some_and(|l| !l.contains("fail"))
+        },
+    );
+}
+
 /// `cluster-bus-secret`: nodes that share it form a cluster; a node with
 /// another secret, or none, is never let onto the bus, so a MEET with it
 /// goes nowhere. With a secret, protected mode lets a node start.
