@@ -485,7 +485,7 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
             );
             if removed > 0 {
                 log_info!(
-                    "Cluster: deleted {removed} key(s) in {} slot(s) now owned by another node",
+                    "Cluster: deleted {removed} key(s) in {} slot(s) owned by another node",
                     slots.len()
                 );
             }
@@ -946,6 +946,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
         attempt_failed: Arc::new(AtomicBool::new(false)),
     })?;
 
+    save_imports(cluster);
     let task_id = id.clone();
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
@@ -954,6 +955,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     if let Err(e) = spawned {
         env.registry()
             .finish(&id, TaskState::Failed, Some(e.to_string()));
+        save_imports(&env.cluster);
         return Err(format!("could not start the import thread: {e}"));
     }
     Ok(id)
@@ -981,6 +983,98 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
     owner.ok_or_else(|| "no slots given".to_string())
 }
 
+// ── Imports under way, on disk ───────────────────────────────────────────────
+//
+// The keys an import has received are a copy: the source keeps serving the
+// slots, and deletes its own copy only once this node has taken them over.
+// If this node goes down first, the task (kept in memory) is gone, and so is
+// anything that would remove the partial copy: it would stay, unreachable
+// (-MOVED), in DBSIZE, KEYS and snapshots, and come back to life if the slots
+// were ever given to this node (#108). So the ranges of the imports under way
+// are kept in a file next to the cluster config, and at startup the keys in
+// those of them this node does not own are deleted.
+//
+// Only the atomic import's: keys moved here by MIGRATE (key by key) were
+// deleted at the source as they left, and are the only copy. Those Redis
+// keeps, and so does this.
+
+/// `<cluster-config-file>.imports`.
+fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
+    cluster.config_path.as_ref().map(|p| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".imports");
+        std::path::PathBuf::from(name)
+    })
+}
+
+/// Write down the ranges of the imports under way (none: remove the file).
+fn save_imports(cluster: &ClusterState) {
+    let Some(path) = imports_path(cluster) else {
+        return;
+    };
+    let lines: Vec<String> = cluster
+        .slot_migrations
+        .all()
+        .iter()
+        .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
+        .map(|t| format!("{} {}", t.id, ranges_text(&t.ranges)))
+        .collect();
+    let written = if lines.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|()| std::fs::rename(&tmp, &path))
+    };
+    if let Err(e) = written {
+        log_warn!(
+            "Cluster: Could not record the imports under way in {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// At startup: delete the keys of the imports that were under way when this
+/// node went down, in the slots it does not own (#108). Then forget them.
+pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
+    let Some(path) = imports_path(cluster) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let me = cluster.myself();
+    let mut cut_short: Vec<u16> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let _task = words.next();
+        let ranges: Vec<&[u8]> = words
+            .flat_map(|r| r.split('-'))
+            .map(str::as_bytes)
+            .collect();
+        let Ok(ranges) = parse_ranges(&ranges) else {
+            continue;
+        };
+        let slots = cluster.slots.read();
+        cut_short.extend(slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)));
+    }
+    cut_short.sort_unstable();
+    cut_short.dedup();
+    if !cut_short.is_empty() {
+        log_info!(
+            "Cluster: {} slot(s) were being imported when this node stopped; \
+             deleting what had arrived of them",
+            cut_short.len()
+        );
+        drop_lost_slots(cluster, cut_short);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 fn run_import(env: Env, task_id: String) {
     let registry = env.registry();
     loop {
@@ -993,6 +1087,7 @@ fn run_import(env: Env, task_id: String) {
         if task.cancel.load(Ordering::Relaxed) {
             delete_unowned(&env, &task.ranges);
             registry.finish(&task_id, TaskState::Canceled, None);
+            save_imports(&env.cluster);
             return;
         }
 
@@ -1003,6 +1098,7 @@ fn run_import(env: Env, task_id: String) {
                 // Including: the slots are ours already. Either way there is
                 // nothing left to import.
                 registry.finish(&task_id, TaskState::Failed, Some(error));
+                save_imports(&env.cluster);
                 return;
             }
         };
@@ -1074,6 +1170,7 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
             }
             delete_unowned(env, &task.ranges);
             registry.finish(&task.id, TaskState::Canceled, None);
+            save_imports(&env.cluster);
             return None;
         }
         if task.attempt_failed.load(Ordering::Relaxed) {
@@ -1127,10 +1224,26 @@ pub fn take_over(cluster: &ClusterState, task_id: &str) -> Result<(), String> {
     };
     // The source keeps client writes paused until this answer arrives.
     let started = Instant::now();
-    super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)));
+    // Saved before the source is told: it deletes its copy when told, and a
+    // restart of this node with the slots not in its config would delete
+    // this one (#108). Not saved, not taken over: the slots go back to the
+    // source, which keeps serving them.
+    if let Err(e) =
+        super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)))
+    {
+        cluster.hand_over_slots(slots_of(&task.ranges), task.source);
+        log_warn!(
+            "Cluster: Could not save the cluster config while taking over slots {} ({e}); \
+             leaving them with {}",
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.source)
+        );
+        return Err(format!("could not save the cluster config: {e}"));
+    }
     cluster
         .slot_migrations
         .finish(task_id, TaskState::Completed, None);
+    save_imports(cluster);
     log_info!(
         "Cluster: Slots {} imported from {} (taken over in {} ms)",
         ranges_text(&task.ranges),

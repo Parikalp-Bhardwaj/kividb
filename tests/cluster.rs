@@ -1315,6 +1315,85 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
 // ── Atomic slot migration (CLUSTER MIGRATION) ─────────────────────────────────
 
 /// One field of a task from `CLUSTER MIGRATION STATUS`.
+/// The destination of an import goes down before it takes the slots over:
+/// what it had received is deleted when it comes back, and the source still
+/// serves all of it (#108). It used to stay: unreachable (MOVED), but in
+/// DBSIZE, KEYS and snapshots, and live again if the slots came back.
+#[test]
+fn keys_of_an_import_cut_short_by_a_restart_are_dropped() {
+    let (mut nodes, _) = form_cluster(2);
+    let mut s = nodes[0].conn();
+    let big = "x".repeat(20_000);
+    let mut inside: Vec<String> = Vec::new();
+    for i in 0..6000 {
+        let key = format!("big:{i}");
+        if slot_of(&key) <= 4000 {
+            assert!(s.cmd(&["SET", &key, &big]).is_ok());
+            inside.push(key);
+        }
+    }
+
+    // What arrives has to outlive the restart, as it does with an AOF.
+    let mut d = nodes[1].conn();
+    assert!(d.cmd(&["CONFIG", "SET", "appendonly", "yes"]).is_ok());
+    assert!(d.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    wait_until("the AOF to be on", Duration::from_secs(20), || {
+        d.cmd(&["INFO", "persistence"])
+            .text()
+            .contains("aof_rewrite_in_progress:0")
+    });
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "4000"])
+        .text();
+    wait_until("some keys to arrive", Duration::from_secs(20), || {
+        d.cmd(&["DBSIZE"]).int() > 200
+    });
+    // Long enough for the AOF to have them on disk (fsync every second).
+    std::thread::sleep(Duration::from_millis(1500));
+    nodes[1].kill();
+    let first = slot_of(&inside[0]).to_string();
+    if s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &first]).int() == 0 {
+        // Quick enough to take the slots over first: nothing to check.
+        return;
+    }
+    let _ = task_id;
+
+    nodes[1].spawn();
+    let mut d = nodes[1].conn();
+    wait_until(
+        "the restarted destination to drop the partial import",
+        Duration::from_secs(30),
+        || d.cmd(&["DBSIZE"]).int() == 0,
+    );
+    // The source has it all, and the cluster agrees it owns it.
+    for key in inside.iter().step_by(13) {
+        assert_eq!(s.cmd(&["STRLEN", key]).int(), 20_000, "{key}");
+    }
+    let reply = d.cmd(&["GET", &inside[0]]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    // And a later import of the same slots starts from nothing and completes.
+    let again = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "4000"])
+        .text();
+    wait_until(
+        "the second import to complete",
+        Duration::from_secs(60),
+        || {
+            let status = d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &again]);
+            status
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "state").text() == "completed")
+        },
+    );
+    for key in inside.iter().step_by(13) {
+        assert_eq!(d.cmd(&["STRLEN", key]).int(), 20_000, "{key}");
+    }
+}
+
 fn task_field(task: &Resp, name: &str) -> Resp {
     task.array()
         .chunks(2)

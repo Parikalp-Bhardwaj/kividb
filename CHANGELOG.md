@@ -29,6 +29,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **An import cut short by a restart of its destination left its keys behind
+  (#108).** `CLUSTER MIGRATION IMPORT` copies keys to the destination before
+  it takes the slots over; tasks are kept in memory, so if the destination
+  went down first, nothing removed the partial copy when it came back. The
+  keys stayed, unreachable (`MOVED`) but counted by `DBSIZE`, returned by
+  `KEYS` and `SCAN`, saved in snapshots, and live again if the slots were
+  later given to that node. The destination now keeps the ranges of the
+  imports under way in `<cluster-config-file>.imports` and, at startup,
+  deletes the keys it holds in those of them it does not own. Keys moved by
+  `MIGRATE` are not touched (they are the only copy). Also: a takeover whose
+  cluster config could not be saved is refused, and the slots stay with the
+  source, where the save's failure used to be ignored.
+
 - **Script commands in a build without Lua** said "Lua scripting is not
   supported by KiviDB", which BullMQ and Sidekiq users read as KiviDB not
   running their queue. `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` and `FCALL`
