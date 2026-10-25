@@ -148,6 +148,86 @@ fn start_server(port: u16) {
     });
 }
 
+fn used_memory(c: &mut Conn) -> u64 {
+    let RespValue::Bulk(info) = c.cmd(&["INFO", "memory"]) else {
+        panic!("INFO memory");
+    };
+    String::from_utf8(info)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .expect("used_memory")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `cmd key` for each key, pipelined; the replies are read and dropped.
+fn pipeline(c: &mut Conn, cmd: &[&str], keys: impl Iterator<Item = String>) {
+    let keys: Vec<String> = keys.collect();
+    for chunk in keys.chunks(1000) {
+        let mut buf = String::new();
+        for key in chunk {
+            buf.push_str(&format!("*{}\r\n", cmd.len() + 1));
+            buf.push_str(&format!("${}\r\n{}\r\n", cmd[0].len(), cmd[0]));
+            buf.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+            for a in &cmd[1..] {
+                buf.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+        }
+        c.writer.write_all(buf.as_bytes()).unwrap();
+        for _ in chunk {
+            assert!(!c.read_value().is_error());
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TABLES GIVE BACK THE ROOM OF KEYS THAT HAVE GONE (#113)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// After most keys are deleted, `used_memory` falls within a few
+/// seconds, by the room the tables held for them: tables used to keep the
+/// size they had at their largest.
+#[test]
+fn test_tables_shrink_after_most_keys_are_deleted() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let n = 400_000;
+    // `used_memory` is the whole process's, other tests' servers included:
+    // what this test adds is measured from here.
+    let before = used_memory(&mut c);
+    pipeline(&mut c, &["SET", "v"], (0..n).map(|i| format!("k:{i}")));
+    pipeline(
+        &mut c,
+        &["EXPIRE", "100000"],
+        (0..n).map(|i| format!("k:{i}")),
+    );
+    let loaded = used_memory(&mut c).saturating_sub(before);
+    pipeline(
+        &mut c,
+        &["DEL"],
+        (0..n).filter(|i| i % 10 != 0).map(|i| format!("k:{i}")),
+    );
+    // With values this small the tables of values and of times are most of
+    // the memory: on Windows, 42 MB loaded, 39 MB left with the tables kept
+    // at their size after the delete, 5 MB with them shrunk.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = used_memory(&mut c).saturating_sub(before);
+        if now * 3 < loaded {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{now} bytes left after deleting 90% of the keys, {loaded} loaded"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(matches!(c.cmd(&["DBSIZE"]), RespValue::Integer(k) if k == n / 10));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MEMORY USAGE
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -447,6 +447,28 @@ fn expire_batch(
     }
 }
 
+/// How often each expiry thread looks for tables to shrink.
+const SHRINK_PERIOD: Duration = Duration::from_secs(1);
+
+/// Shrink the tables, of values and of expiry times, of `cursor`'s shards
+/// that keys have mostly left ([`store::shrink_if_sparse`], #113).
+fn shrink_sparse_tables(store: &Store, expiry_store: &ExpiryStore, cursor: &ExpireCursor) {
+    for db in store.iter() {
+        for (s, shard) in db.iter().enumerate() {
+            if cursor.owns(s) {
+                store::shrink_if_sparse(shard);
+            }
+        }
+    }
+    for db in expiry_store.iter() {
+        for (s, cell) in db.iter().enumerate() {
+            if cursor.owns(s) {
+                cell.shrink_if_sparse();
+            }
+        }
+    }
+}
+
 /// Lazy TTL: delete an expired key before a read and return true if it was removed.
 #[inline]
 pub fn lazy_expire_key(store: &Store, expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
@@ -511,6 +533,7 @@ pub fn spawn_active_expire_task(
             // looked at was expired), as Redis goes on while it keeps finding
             // them.
             let mut wait = Duration::from_millis(100);
+            let mut shrunk_at = std::time::Instant::now();
             loop {
                 std::thread::sleep(wait);
                 // Nothing expires while writes are paused, as in Redis: the
@@ -522,6 +545,10 @@ pub fn spawn_active_expire_task(
                 let started = std::time::Instant::now();
                 let behind = active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
                 wait = Duration::from_millis(if behind { 1 } else { 100 });
+                if shrunk_at.elapsed() >= SHRINK_PERIOD {
+                    shrink_sparse_tables(&store, &expiry_store, &cursor);
+                    shrunk_at = std::time::Instant::now();
+                }
                 let Some(latency) = &latency else {
                     continue;
                 };
