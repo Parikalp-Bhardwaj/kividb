@@ -103,6 +103,16 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             ctx.config.cluster_announce_port.to_string(),
         ),
         (
+            "cluster-announce-client-port",
+            ctx.cluster
+                .nodes
+                .read()
+                .get(&ctx.cluster.myself())
+                .map(|me| me.announced_client_port)
+                .unwrap_or(ctx.config.cluster_announce_client_port)
+                .to_string(),
+        ),
+        (
             "cluster-announce-bus-port",
             ctx.config.cluster_announce_bus_port.to_string(),
         ),
@@ -509,6 +519,17 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     Some(resp_simple("OK"))
                 }
             }
+            // What clients are told; nodes keep reaching each other at the
+            // client port (#110).
+            "cluster-announce-client-port" => match value.parse::<u16>() {
+                Ok(port) => {
+                    ctx.cluster.set_my_announced_client_port(port);
+                    Some(resp_simple("OK"))
+                }
+                Err(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 65535 inclusive",
+                )),
+            },
             "cluster-preferred-endpoint-type" => match crate::cluster::Endpoint::parse(value) {
                 Some(endpoint) => {
                     ctx.cluster.set_preferred_endpoint(endpoint);

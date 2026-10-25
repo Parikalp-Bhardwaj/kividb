@@ -227,6 +227,7 @@ pub fn process_message(
             sender_flags,
             sender_master_id,
             sender_hostname,
+            sender_announced_client_port,
         } => {
             // A PING from a node we do not know is answered — so it can see
             // we are alive — but it does not get itself added by pinging.
@@ -243,6 +244,7 @@ pub fn process_message(
                     sender_flags,
                     sender_master_id,
                     sender_hostname,
+                    sender_announced_client_port,
                     gossip,
                     &slot_claims,
                 );
@@ -260,6 +262,7 @@ pub fn process_message(
             sender_flags,
             sender_master_id,
             sender_hostname,
+            sender_announced_client_port,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
             // only acceptable as the answer to our own MEET — which the
@@ -275,6 +278,7 @@ pub fn process_message(
                     sender_flags,
                     sender_master_id,
                     sender_hostname,
+                    sender_announced_client_port,
                     gossip,
                     &slot_claims,
                 );
@@ -371,6 +375,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_flags,
         sender_master_id,
         sender_hostname,
+        sender_announced_client_port,
     } = msg
     {
         state.forgotten.write().remove(&sender_id);
@@ -389,6 +394,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
             sender_flags,
             sender_master_id,
             sender_hostname,
+            sender_announced_client_port,
             gossip,
             &slot_claims,
         );
@@ -408,6 +414,7 @@ fn apply_heartbeat(
     sender_flags: NodeFlags,
     sender_master_id: Option<NodeId>,
     sender_hostname: String,
+    sender_announced_client_port: u16,
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
 ) {
@@ -439,6 +446,7 @@ fn apply_heartbeat(
     }
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
+    state.set_peer_client_port(sender_id, sender_announced_client_port, true);
     // It reached us, so whatever we concluded about it deserves a second look.
     state.maybe_clear_fail_on_contact(sender_id);
 
@@ -573,6 +581,7 @@ fn merge_gossip_entry(
     // Second-hand, a hostname only fills in: the sender may be a node that
     // does not carry them.
     state.set_peer_hostname(g.id, &g.hostname, false);
+    state.set_peer_client_port(g.id, g.announced_client_port, false);
 }
 
 /// Build a PONG describing ourselves. Includes our slot claims and a gossip
@@ -597,6 +606,7 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA),
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
+        sender_announced_client_port: me.announced_client_port,
         gossip,
         slot_claims: state.my_slot_claims(),
     }
@@ -631,6 +641,7 @@ pub(super) fn sample_gossip(
             & (NodeFlags::MASTER | NodeFlags::REPLICA | NodeFlags::PFAIL | NodeFlags::FAIL),
         master_id: n.master_id,
         hostname: n.hostname.clone(),
+        announced_client_port: n.announced_client_port,
     };
 
     let mut out = Vec::new();
@@ -690,6 +701,7 @@ mod tests {
             sender_flags: flags,
             sender_master_id: None,
             sender_hostname: String::new(),
+            sender_announced_client_port: 0,
             gossip,
             slot_claims: vec![],
         }
@@ -743,6 +755,7 @@ mod tests {
 
         let about_gone = GossipEntry {
             hostname: String::new(),
+            announced_client_port: 0,
             id: gone,
             ip: "10.0.0.7".into(),
             client_port: 7001,
@@ -782,6 +795,7 @@ mod tests {
             NodeFlags::MASTER,
             None,
             String::new(),
+            0,
             vec![],
             &[SlotClaim {
                 start: 0,
@@ -804,6 +818,7 @@ mod tests {
 
         let b_failed = GossipEntry {
             hostname: String::new(),
+            announced_client_port: 0,
             id: b,
             ip: "10.0.0.8".into(),
             client_port: 7002,
@@ -835,6 +850,7 @@ mod tests {
 
         let target_pfail = || GossipEntry {
             hostname: String::new(),
+            announced_client_port: 0,
             id: target,
             ip: "10.0.0.8".into(),
             client_port: 7002,

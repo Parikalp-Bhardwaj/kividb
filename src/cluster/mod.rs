@@ -276,6 +276,7 @@ impl ClusterState {
                 pong_received_ms: 0,
                 fail_since_ms: 0,
                 hostname: String::new(),
+                announced_client_port: 0,
             },
         );
         Self::build(
@@ -388,6 +389,7 @@ impl ClusterState {
         );
         state.set_require_full_coverage(config.cluster_require_full_coverage);
         state.set_my_hostname(&config.cluster_announce_hostname);
+        state.set_my_announced_client_port(config.cluster_announce_client_port);
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret
@@ -558,6 +560,25 @@ impl ClusterState {
     pub fn set_my_hostname(&self, hostname: &str) {
         if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
             me.hostname = hostname.to_string();
+        }
+    }
+
+    /// Set this node's `cluster-announce-client-port` (0: none). Peers learn
+    /// it from the next heartbeat.
+    pub fn set_my_announced_client_port(&self, port: u16) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            me.announced_client_port = port;
+        }
+    }
+
+    /// Record the client port a peer announces. As for its hostname: its own
+    /// word stands, none included; second-hand it only fills in.
+    pub fn set_peer_client_port(&self, id: NodeId, port: u16, authoritative: bool) {
+        if id == self.myself() || (port == 0 && !authoritative) {
+            return;
+        }
+        if let Some(node) = self.nodes.write().get_mut(&id) {
+            node.announced_client_port = port;
         }
     }
 

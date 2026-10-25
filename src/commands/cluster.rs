@@ -246,7 +246,7 @@ fn cmd_nodes(state: &ClusterState) -> Vec<u8> {
             "{} {}:{}@{}{}",
             node_id_str(&node.id),
             node.ip,
-            node.client_port,
+            node.client_facing_port(),
             node.cluster_port,
             crate::cluster::persist::hostname_suffix(&node.hostname)
         );
@@ -367,7 +367,7 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
             Endpoint::Unknown => resp_null_bulk(),
             _ => resp_bulk_str(&state.endpoint_of(node)),
         },
-        resp_integer(node.client_port as i64),
+        resp_integer(node.client_facing_port() as i64),
         resp_bulk_str(node_id_str(&node.id)),
     ];
     let mut metadata: Vec<Vec<u8>> = Vec::new();
@@ -458,7 +458,7 @@ fn node_description(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
         resp_bulk_str("id"),
         resp_bulk_str(node_id_str(&node.id)),
         resp_bulk_str("port"),
-        resp_integer(node.client_port as i64),
+        resp_integer(node.client_facing_port() as i64),
         resp_bulk_str("ip"),
         resp_bulk_str(&node.ip),
         resp_bulk_str("endpoint"),
@@ -981,7 +981,7 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
                 "{} {}:{}@{}{} {} {} {} {} {} connected",
                 crate::cluster::node_id_str(&n.id),
                 n.ip,
-                n.client_port,
+                n.client_facing_port(),
                 n.cluster_port,
                 crate::cluster::persist::hostname_suffix(&n.hostname),
                 format_flags_for_nodes(n.flags),
