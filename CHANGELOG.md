@@ -50,6 +50,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Memory of deleted keys' table slots was never given back (#113).** A
+  shard's hash table, of values and of expiry times, grew as keys came and
+  kept its size as they went: after a reshard moved half the keys away, or
+  a big delete, every empty slot stayed in memory. Each shard's tables are
+  now looked at about once a second, and one holding under 4/9 of what it
+  has room for is shrunk to its keys and an eighth more, as Redis resizes
+  its tables from its cron. A table just shrunk, or just grown, is never
+  sparse enough to shrink, so a shard does not go back and forth.
+
 - **After a failover, every other replica of the shard resynced in full
   (#109).** A promoted replica started a new replication stream with
   nothing of the old one, so the failed master's other replicas, asking to
