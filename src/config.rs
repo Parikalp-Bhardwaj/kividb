@@ -349,6 +349,13 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_port: u16,
 
+    /// The port clients are told to reach this node on (redirects, `CLUSTER
+    /// SLOTS`, `SHARDS`, `NODES`), where it is not the client port nodes use
+    /// between themselves: a NodePort, a load balancer that maps ports. 0 =
+    /// the client port. Settable at runtime.
+    #[arg(long, default_value_t = 0)]
+    pub cluster_announce_client_port: u16,
+
     /// Bus port announced to the cluster. 0 = `port` + 10000.
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
@@ -496,6 +503,7 @@ impl Default for Config {
             cluster_announce_hostname: String::new(),
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
+            cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
@@ -607,6 +615,7 @@ impl Config {
             cluster_announce_hostname: String::new(),
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
+            cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
@@ -953,6 +962,12 @@ impl Config {
                 self.cluster_announce_port
             ));
         }
+        if self.cluster_announce_client_port != 0 {
+            out.push_str(&format!(
+                "cluster-announce-client-port {}\n",
+                self.cluster_announce_client_port
+            ));
+        }
         if self.cluster_announce_bus_port != 0 {
             out.push_str(&format!(
                 "cluster-announce-bus-port {}\n",
@@ -1287,6 +1302,9 @@ impl Config {
                 set!(cluster_preferred_endpoint_type, kind.to_ascii_lowercase())
             }
             "cluster-announce-port" => set!(cluster_announce_port, number(key, one()?)?),
+            "cluster-announce-client-port" => {
+                set!(cluster_announce_client_port, number(key, one()?)?)
+            }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
             "cluster-bus-secret" => set!(cluster_bus_secret, one()?.to_string()),
             "cluster-bus-port-protected-mode" => {
@@ -1786,7 +1804,8 @@ mod config_file_tests {
             slowlog-max-len 1\nslowlog-entry-max-argc 1\nslowlog-entry-max-string-len 1\n\
             cluster-enabled yes\ncluster-node-timeout 1\ncluster-announce-ip a\n\
             cluster-announce-hostname h\ncluster-preferred-endpoint-type ip\n\
-            cluster-announce-port 1\ncluster-announce-bus-port 1\n\
+            cluster-announce-port 1\ncluster-announce-client-port 1\n\
+            cluster-announce-bus-port 1\n\
             cluster-bus-port-protected-mode no\ncluster-bus-secret s\n\
             cluster-config-file f\n\
             cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\

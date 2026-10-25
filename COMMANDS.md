@@ -1172,6 +1172,7 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-replica-validity-factor <n>` | `10` | A replica out of touch with its master for longer than this many node timeouts (plus `repl-ping-replica-period`) does not stand for election when the master fails. `0`: always stand. Settable at runtime. |
 | `--cluster-announce-ip <addr>` | (observed) | The address this node tells the cluster to reach it on — for NAT, containers and Kubernetes. |
 | `--cluster-announce-port <port>` / `--cluster-announce-bus-port <port>` | client port / +10000 | The ports announced with it. |
+| `--cluster-announce-client-port <port>` | `0` (the client port) | The port *clients* are told: in `MOVED`/`ASK` and `CLUSTER SLOTS`, `SHARDS` and `NODES`. Nodes keep reaching each other at the client port. For a NodePort, or a load balancer that maps ports. Settable at runtime. |
 | `--cluster-bus-port-protected-mode yes\|no` | `no` | Refuse to start as a cluster node while the bus is unauthenticated. |
 | `--cluster-slot-migration-handoff-max-lag-bytes <n>` | `1048576` | Atomic slot migration: how close the destination must be before writes are paused for the handoff. |
 | `--cluster-slot-migration-write-pause-timeout <ms>` | `10000` | Atomic slot migration: the longest writes stay paused for a handoff. |

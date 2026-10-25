@@ -12,6 +12,18 @@ Redis. A script that reads `e.err` from an error `pcall` caught no longer
 finds it there: `e` is now the `err` itself. One that gives `assert` a table
 for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
+### Added
+
+- **`cluster-announce-client-port` (#110):** the port clients are told to
+  reach a node on, in redirects (`MOVED`, `ASK`) and in `CLUSTER SLOTS`,
+  `SHARDS`, `NODES` and `REPLICAS`, where it is not the port the nodes use
+  between themselves. A node reachable from outside on another port (a
+  Kubernetes NodePort, a load balancer that maps ports) can now say so;
+  `cluster-announce-port` could not be used for it, as peers replicate and
+  migrate through that port. It travels to the other nodes in the flags
+  string, as the hostname does (`cport=<port>`): nodes of an older version
+  skip it. Config file, command line, and `CONFIG SET` at runtime.
+
 ### Changed
 
 - **`pcall` hands back the error's message, and `assert` takes only a

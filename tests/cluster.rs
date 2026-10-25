@@ -884,6 +884,78 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
     assert!(text.contains(&format!(",{} ", host(2))), "{text}");
 }
 
+/// `cluster-announce-client-port`: what clients are told to connect to,
+/// where it is not the port nodes reach each other on (a NodePort, a load
+/// balancer that maps ports) (#110). Redirects, `CLUSTER SLOTS`, `SHARDS` and
+/// `NODES` give it; the cluster itself keeps working on the real ports.
+#[test]
+fn nodes_announce_a_client_port_of_their_own() {
+    let (nodes, ranges) = form_cluster(3);
+    let r = nodes[1]
+        .conn()
+        .cmd(&["CONFIG", "SET", "cluster-announce-client-port", "30001"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        nodes[1]
+            .conn()
+            .cmd(&["CONFIG", "GET", "cluster-announce-client-port"])
+            .array()[1]
+            .text(),
+        "30001"
+    );
+    let mut c = nodes[0].conn();
+    let key = key_in(ranges[1].0..=ranges[1].1, "cp");
+    wait_until(
+        "the others to tell clients the new port",
+        Duration::from_secs(15),
+        || {
+            c.cmd(&["GET", &key])
+                .err()
+                .is_some_and(|e| e.ends_with(" 127.0.0.1:30001"))
+        },
+    );
+    fn texts(r: &Resp, out: &mut Vec<String>) {
+        match r {
+            Resp::Array(items) => items.iter().for_each(|i| texts(i, out)),
+            Resp::Bulk(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+            Resp::Int(n) => out.push(n.to_string()),
+            _ => {}
+        }
+    }
+    let mut slots = Vec::new();
+    texts(&c.cmd(&["CLUSTER", "SLOTS"]), &mut slots);
+    assert!(slots.contains(&"30001".to_string()), "{slots:?}");
+    let mut shards = Vec::new();
+    texts(&c.cmd(&["CLUSTER", "SHARDS"]), &mut shards);
+    assert!(shards.contains(&"30001".to_string()), "{shards:?}");
+    let text = c.cmd(&["CLUSTER", "NODES"]).text();
+    assert!(
+        text.contains(&format!("{} 127.0.0.1:30001@", nodes[1].id())),
+        "{text}"
+    );
+    // The cluster itself still reaches it on its real port.
+    assert_eq!(nodes[1].cluster_info("cluster_state"), "ok");
+    assert_eq!(nodes[0].cluster_info("cluster_state"), "ok");
+
+    // Back to none: the client port again.
+    assert!(
+        nodes[1]
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-announce-client-port", "0"])
+            .is_ok()
+    );
+    let real = format!(" 127.0.0.1:{}", nodes[1].port);
+    wait_until(
+        "clients to be sent to the real port again",
+        Duration::from_secs(15),
+        || {
+            c.cmd(&["GET", &key])
+                .err()
+                .is_some_and(|e| e.ends_with(&real))
+        },
+    );
+}
+
 /// `cluster-bus-secret`: nodes that share it form a cluster; a node with
 /// another secret, or none, is never let onto the bus, so a MEET with it
 /// goes nowhere. With a secret, protected mode lets a node start.
