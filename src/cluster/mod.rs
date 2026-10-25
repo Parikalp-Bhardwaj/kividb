@@ -414,6 +414,9 @@ impl ClusterState {
         }
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
+        // The keys of an import this node was receiving when it went down,
+        // which never completed (#108).
+        migration::drop_unfinished_imports(self);
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -1843,7 +1846,7 @@ impl ClusterState {
     /// Take ownership of `slots` at the end of an atomic migration to this
     /// node. One new epoch covers them all, so the claim wins over the
     /// previous owner's wherever the two meet.
-    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) {
+    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let me = self.myself();
@@ -1866,11 +1869,12 @@ impl ClusterState {
         steps.push(("slots", t.elapsed().as_millis()));
         self.refresh_state();
         steps.push(("refresh", t.elapsed().as_millis()));
-        let _ = persist::save_from_state(self);
+        let saved = persist::save_from_state(self);
         steps.push(("save", t.elapsed().as_millis()));
         if t.elapsed() > std::time::Duration::from_millis(100) {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
+        saved
     }
 
     /// Record that `slots` now belong to `new_owner`, at the end of an atomic

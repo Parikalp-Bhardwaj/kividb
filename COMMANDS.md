@@ -1107,6 +1107,16 @@ bounded by `--cluster-slot-migration-write-pause-timeout` (default 10000 ms),
 after which the attempt is abandoned and retried. During the pause all client
 writes to the source wait, not only those for the moving slots.
 
+Until the takeover, what the destination has received is a copy: the source
+still owns and serves the slots. If the destination goes down before taking
+them over, the import is over (tasks are kept in memory), and when it starts
+again it deletes the keys it had received in slots it does not own. It knows
+which imports were under way from `<cluster-config-file>.imports`, which it
+keeps next to its cluster config. The takeover itself is saved to the cluster
+config before the source is told, and if that save fails the slots stay with
+the source. Keys moved here with `MIGRATE`, key by key, are left alone: the
+source deleted them as it sent them.
+
 **The classical workflow**, which `redis-cli --cluster reshard` and
 `rebalance` drive:
 
