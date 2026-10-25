@@ -41,6 +41,29 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `MIGRATE` are not touched (they are the only copy). Also: a takeover whose
   cluster config could not be saved is refused, and the slots stay with the
   source, where the save's failure used to be ignored.
+- **`CONFIG SET` of a cluster setting said OK and changed nothing (#111).**
+  `cluster-slot-migration-handoff-max-lag-bytes` and
+  `cluster-slot-migration-write-pause-timeout` now take effect at runtime,
+  from the next slot migration's handoff, and `CONFIG GET` shows them. A
+  `cluster-*` setting KiviDB does not have (`cluster-allow-reads-when-down`,
+  `cluster-migration-barrier`, ...) is refused with Redis's
+  `Unknown option` error, where it was taken and ignored. Other settings of
+  Redis's that mean nothing here are still taken, as before.
+
+- **Automatic failover could elect the replica with the least data (#107).**
+  When a master failed, each of its replicas waited a random half second and
+  stood for election, however far behind it was: with two replicas, the one
+  that had read less could win, and the writes only the other had were lost.
+  Now each replica asks the others how far they have read (a new `OFFSET`
+  bus message; a node of an older version does not answer, and is not
+  counted) and waits an extra second for each one ahead of it, as Redis
+  does. A replica whose link to its master has been down longer than
+  `cluster-node-timeout × cluster-replica-validity-factor` plus
+  `repl-ping-replica-period` does not stand at all.
+  `cluster-replica-validity-factor` is new (default 10, `0` = always stand),
+  in the config file and with `CONFIG SET`. The election's waiting is also
+  out of the failure detector's loop, which it held up for the length of the
+  delay.
 
 - **Script commands in a build without Lua** said "Lua scripting is not
   supported by KiviDB", which BullMQ and Sidekiq users read as KiviDB not

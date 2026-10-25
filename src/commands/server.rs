@@ -130,6 +130,18 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             yes_no(ctx.config.cluster_require_full_coverage),
         ),
         (
+            "cluster-slot-migration-handoff-max-lag-bytes",
+            crate::cluster::migration::handoff_max_lag_bytes(ctx.config).to_string(),
+        ),
+        (
+            "cluster-slot-migration-write-pause-timeout",
+            crate::cluster::migration::write_pause_timeout_ms(ctx.config).to_string(),
+        ),
+        (
+            "cluster-replica-validity-factor",
+            ctx.cluster.replica_validity_factor().to_string(),
+        ),
+        (
             "slowlog-entry-max-argc",
             ctx.slowlog.entry_max_argc().to_string(),
         ),
@@ -687,6 +699,37 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     )))
                 }
             }
+            // Read at the start of each slot migration's handoff: a
+            // change applies to the next one (#111).
+            "cluster-slot-migration-handoff-max-lag-bytes" => match memory_size(value) {
+                Some(bytes) if bytes <= i64::MAX as usize => {
+                    crate::cluster::migration::set_handoff_max_lag_bytes(bytes as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'cluster-slot-migration-handoff-max-lag-bytes') - argument must be a memory value",
+                )),
+            },
+            "cluster-slot-migration-write-pause-timeout" => match value.parse::<i64>() {
+                Ok(ms) if ms >= 0 => {
+                    crate::cluster::migration::set_write_pause_timeout_ms(ms as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'cluster-slot-migration-write-pause-timeout') - argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
+            "cluster-replica-validity-factor" => match value.parse::<i64>() {
+                Ok(factor) if factor >= 0 => {
+                    ctx.cluster.set_replica_validity_factor(factor as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
             "tracking-table-max-keys" => match value.parse::<usize>() {
                 Ok(max_keys) => {
                     let dropped = ctx.tracking_table.set_max_keys(max_keys);
@@ -800,6 +843,15 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     )))
                 }
             }
+            // A cluster setting this server does not have
+            // (`cluster-replica-validity-factor`,
+            // `cluster-allow-reads-when-down`, ...). It would change how
+            // the cluster behaves, so taking it and doing nothing would
+            // mislead whoever set it: refused, as Redis refuses a setting
+            // it does not know (#111).
+            _ if param.starts_with("cluster-") => Some(resp_error(&format!(
+                "ERR Unknown option or number of arguments for CONFIG SET - '{param}'"
+            ))),
             // A setting of Redis's that means nothing here — how
             // it encodes small values, how it sizes its buffers.
             // It is accepted, so that a client or a tool that
@@ -3660,7 +3712,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
                     for (i, (param, value)) in settings.iter().enumerate() {
                         let mut reply = config_set_one(ctx, param, value);
-                        if reply.starts_with(b"-") && !reply.starts_with(b"-ERR CONFIG SET failed")
+                        // Redis's own reply to a setting it does not know
+                        // is not wrapped either.
+                        if reply.starts_with(b"-")
+                            && !reply.starts_with(b"-ERR CONFIG SET failed")
+                            && !reply.starts_with(b"-ERR Unknown option")
                         {
                             let why = String::from_utf8_lossy(&reply[1..]);
                             let why = why.trim_end().trim_start_matches("ERR ");

@@ -354,6 +354,24 @@ pub fn process_message(
         }
         // Answered by the connection task; see `handle_bus_connection`.
         BusMessage::MfStart { .. } | BusMessage::MfAck { .. } => None,
+        // A fellow member asks how far we have read (an election's rank).
+        BusMessage::OffsetQuery { sender_id } => {
+            if !sender_is_member(state, &sender_id) {
+                return None;
+            }
+            let offset = state
+                .hooks
+                .get()?
+                .replica_starter
+                .repl_state
+                .repl_offset
+                .load(Ordering::Relaxed);
+            Some(encode(&BusMessage::OffsetAck {
+                sender_id: state.myself(),
+                offset,
+            }))
+        }
+        BusMessage::OffsetAck { .. } => None,
     }
 }
 

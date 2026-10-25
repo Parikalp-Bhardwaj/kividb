@@ -1113,6 +1113,44 @@ fn failover_promotes_the_replica_and_the_old_master_rejoins_as_a_replica() {
     assert_eq!(c.cmd(&["GET", &key]).text(), "after-failover");
 }
 
+/// With two replicas, the one that has read further wins the election
+/// (#107). Replica B is stopped while writes go on, the master dies, and B
+/// comes back behind: it asks A how far A has read, and stands a second
+/// later. Before, either could win, and B winning lost the writes it missed.
+#[test]
+fn the_replica_that_read_further_wins_the_election() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let a = add_replica(&nodes, &nodes[0]);
+    let mut b = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain([&a, &b]).collect();
+        wait_cluster_ok(&all, 5);
+    }
+
+    b.kill();
+    let range = ranges[0].0..=ranges[0].1;
+    let keys: Vec<String> = (0..50)
+        .map(|i| key_in(range.clone(), &format!("rank{i}")))
+        .collect();
+    for k in &keys {
+        assert!(nodes[0].conn().cmd(&["SET", k, "v"]).is_ok());
+    }
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    nodes[0].kill();
+    b.spawn();
+    wait_until("a replica to be promoted", Duration::from_secs(40), || {
+        a.is_master() || b.is_master()
+    });
+    assert!(
+        a.is_master() && !b.is_master(),
+        "the replica that had read further must win"
+    );
+    for k in &keys {
+        assert_eq!(a.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+}
+
 /// `CLUSTER FAILOVER` on a replica of a healthy master swaps the two, and no
 /// write the master acknowledged is lost in the handover.
 #[test]

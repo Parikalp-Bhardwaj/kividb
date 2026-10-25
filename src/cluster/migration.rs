@@ -41,6 +41,40 @@ use std::time::{Duration, Instant};
 /// Inclusive slot ranges.
 pub type Ranges = Vec<(u16, u16)>;
 
+// `cluster-slot-migration-handoff-max-lag-bytes` and
+// `cluster-slot-migration-write-pause-timeout` as `CONFIG SET` last made
+// them; `UNSET` until then, and the values the server started with apply.
+// Read at the start of each handoff, so a change applies to the next one.
+const UNSET: u64 = u64::MAX;
+static HANDOFF_MAX_LAG_BYTES: AtomicU64 = AtomicU64::new(UNSET);
+static WRITE_PAUSE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(UNSET);
+
+/// How far behind the stream may be when the handoff starts.
+pub fn handoff_max_lag_bytes(config: &crate::config::Config) -> u64 {
+    match HANDOFF_MAX_LAG_BYTES.load(Ordering::Relaxed) {
+        UNSET => config.cluster_slot_migration_handoff_max_lag_bytes,
+        v => v,
+    }
+}
+
+/// How long the handoff may hold client writes, in milliseconds.
+pub fn write_pause_timeout_ms(config: &crate::config::Config) -> u64 {
+    match WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed) {
+        UNSET => config.cluster_slot_migration_write_pause_timeout,
+        v => v,
+    }
+}
+
+/// `CONFIG SET cluster-slot-migration-handoff-max-lag-bytes`.
+pub fn set_handoff_max_lag_bytes(bytes: u64) {
+    HANDOFF_MAX_LAG_BYTES.store(bytes.min(UNSET - 1), Ordering::Relaxed);
+}
+
+/// `CONFIG SET cluster-slot-migration-write-pause-timeout`.
+pub fn set_write_pause_timeout_ms(ms: u64) {
+    WRITE_PAUSE_TIMEOUT_MS.store(ms.min(UNSET - 1), Ordering::Relaxed);
+}
+
 /// Finished tasks kept for `CLUSTER MIGRATION STATUS`.
 const FINISHED_TASKS_KEPT: usize = 64;
 /// Commands per round trip while sending.
@@ -788,7 +822,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     canceled()?;
 
     // ── Follow the stream until it is nearly caught up ───────────────────
-    let max_lag = env.config.cluster_slot_migration_handoff_max_lag_bytes as usize;
+    let max_lag = handoff_max_lag_bytes(&env.config) as usize;
     // Decode whatever the tap holds right now into the commands that matter.
     let drain = |commands: &mut Vec<Vec<Vec<u8>>>| -> Result<usize, String> {
         let mut bytes = 0usize;
@@ -818,10 +852,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
     // wrote, and hand the slots over.
-    let pause_timeout = env
-        .config
-        .cluster_slot_migration_write_pause_timeout
-        .max(100);
+    let pause_timeout = write_pause_timeout_ms(&env.config).max(100);
     let paused_at = Instant::now();
     crate::pause::set_handoff_pause(pause_timeout as i64);
     let pause = PauseGuard(true);

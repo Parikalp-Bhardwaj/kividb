@@ -567,3 +567,89 @@ fn config_set_port_moves_the_listener_or_changes_nothing() {
     assert!(there.cmds(&["CONFIG", "SET", "port", "0"]).is_error());
     assert!(there.cmds(&["CONFIG", "SET", "port", "x"]).is_error());
 }
+
+/// The slot migration settings take effect at runtime, and `CONFIG GET`
+/// says what they are; a cluster setting this server does not have is
+/// refused, not taken and ignored (#111). Settings of Redis's that mean
+/// nothing here, outside the cluster's, are still taken.
+#[test]
+fn config_set_cluster_settings_take_effect_or_are_refused() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let get = |c: &mut Conn, name: &str| {
+        c.cmds(&["CONFIG", "GET", name]).as_array()[1]
+            .as_str()
+            .to_string()
+    };
+
+    assert_eq!(
+        get(&mut c, "cluster-slot-migration-handoff-max-lag-bytes"),
+        "1048576"
+    );
+    assert_eq!(
+        get(&mut c, "cluster-slot-migration-write-pause-timeout"),
+        "10000"
+    );
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "cluster-slot-migration-handoff-max-lag-bytes",
+            "2mb",
+            "cluster-slot-migration-write-pause-timeout",
+            "500",
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        get(&mut c, "cluster-slot-migration-handoff-max-lag-bytes"),
+        "2097152"
+    );
+    assert_eq!(
+        get(&mut c, "cluster-slot-migration-write-pause-timeout"),
+        "500"
+    );
+    for (name, bad) in [
+        ("cluster-slot-migration-handoff-max-lag-bytes", "lots"),
+        ("cluster-slot-migration-write-pause-timeout", "-1"),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", name, bad]);
+        assert!(reply.is_error(), "{name} {bad}: {reply:?}");
+    }
+    assert_eq!(
+        get(&mut c, "cluster-slot-migration-write-pause-timeout"),
+        "500"
+    );
+
+    for name in [
+        "cluster-allow-reads-when-down",
+        "cluster-migration-barrier",
+        "cluster-no-such-setting",
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", name, "yes"]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == &format!(
+                "ERR Unknown option or number of arguments for CONFIG SET - '{name}'"
+            )),
+            "{name}: {reply:?}"
+        );
+    }
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hash-max-listpack-entries", "256"])
+            .is_ok()
+    );
+
+    // Back to how the server started, for any test after this one.
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "cluster-slot-migration-handoff-max-lag-bytes",
+            "1048576",
+            "cluster-slot-migration-write-pause-timeout",
+            "10000",
+        ])
+        .is_ok()
+    );
+}
