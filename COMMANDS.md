@@ -1068,6 +1068,15 @@ detection algorithm: `node-timeout` (default 15000ms, configurable via
 when a quorum of masters concur via gossip, the flag escalates to `FAIL`
 (cluster opinion).
 
+When a master fails, its replicas do not race blindly: each asks the others
+how far it has read, and waits an extra second for every one that has read
+further, so the most up-to-date replica normally stands first and wins, as in
+Redis. A replica whose link to its master has been down for longer than
+`cluster-node-timeout × cluster-replica-validity-factor` plus
+`repl-ping-replica-period` does not stand at all: its data is too old to take
+over with (`cluster-replica-validity-factor 0` lets it stand anyway).
+`CLUSTER FAILOVER` is not subject to either.
+
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
 is uncovered, or this node cannot see a majority of masters, keyed commands
@@ -1150,6 +1159,7 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-node-timeout <ms>` | `15000` | PFAIL threshold. Lower values detect faster, increase false positives under jitter. |
 | `--cluster-config-file <path>` | `nodes.conf` | Where the topology is persisted. |
 | `--cluster-require-full-coverage yes\|no` | `yes` | Stop serving keyed commands while any slot is unassigned or its owner has failed. |
+| `--cluster-replica-validity-factor <n>` | `10` | A replica out of touch with its master for longer than this many node timeouts (plus `repl-ping-replica-period`) does not stand for election when the master fails. `0`: always stand. Settable at runtime. |
 | `--cluster-announce-ip <addr>` | (observed) | The address this node tells the cluster to reach it on — for NAT, containers and Kubernetes. |
 | `--cluster-announce-port <port>` / `--cluster-announce-bus-port <port>` | client port / +10000 | The ports announced with it. |
 | `--cluster-bus-port-protected-mode yes\|no` | `no` | Refuse to start as a cluster node while the bus is unauthenticated. |

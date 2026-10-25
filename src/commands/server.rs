@@ -138,6 +138,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             crate::cluster::migration::write_pause_timeout_ms(ctx.config).to_string(),
         ),
         (
+            "cluster-replica-validity-factor",
+            ctx.cluster.replica_validity_factor().to_string(),
+        ),
+        (
             "slowlog-entry-max-argc",
             ctx.slowlog.entry_max_argc().to_string(),
         ),
@@ -715,6 +719,15 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 _ => Some(resp_error(
                     "ERR CONFIG SET failed (possibly related to argument \
                                  'cluster-slot-migration-write-pause-timeout') - argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
+            "cluster-replica-validity-factor" => match value.parse::<i64>() {
+                Ok(factor) if factor >= 0 => {
+                    ctx.cluster.set_replica_validity_factor(factor as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
                 )),
             },
             "tracking-table-max-keys" => match value.parse::<usize>() {

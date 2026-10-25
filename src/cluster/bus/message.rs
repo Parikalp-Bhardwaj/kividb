@@ -25,6 +25,11 @@
 //   MFSTART <sender_id>  /  MFACK <sender_id> <offset>
 //     Manual-failover handshake between a replica and its master.
 //
+//   OFFSET <sender_id>  /  OFFSET_ACK <sender_id> <offset>
+//     A replica whose master failed asks its fellow replicas how far each has
+//     read, to rank itself before it stands for election. A node that does not
+//     know OFFSET drops the connection: the asker counts it as unknown.
+//
 // <sender_endpoint> is a colon-packed string:
 //     "<ip>:<client_port>:<cluster_port>:<config_epoch>"
 // Yes, this means an IPv6 address would break the parser. We use IPv4 only
@@ -154,6 +159,13 @@ pub enum BusMessage {
         sender_id: NodeId,
         target_offset: u64,
     },
+
+    /// A replica asks another replica of the same master for its replication
+    /// offset, to rank itself before an election.
+    OffsetQuery { sender_id: NodeId },
+
+    /// The answer: the replica's replication offset.
+    OffsetAck { sender_id: NodeId, offset: u64 },
 }
 
 impl BusMessage {
@@ -167,7 +179,9 @@ impl BusMessage {
             | BusMessage::Fail { sender_id, .. }
             | BusMessage::Publish { sender_id, .. }
             | BusMessage::MfStart { sender_id }
-            | BusMessage::MfAck { sender_id, .. } => sender_id,
+            | BusMessage::MfAck { sender_id, .. }
+            | BusMessage::OffsetQuery { sender_id }
+            | BusMessage::OffsetAck { sender_id, .. } => sender_id,
         }
     }
 }
@@ -313,6 +327,14 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             resp_bulk_str("MFACK"),
             resp_bulk(sender_id),
             resp_bulk_str(&target_offset.to_string()),
+        ]),
+        BusMessage::OffsetQuery { sender_id } => {
+            resp_array(vec![resp_bulk_str("OFFSET"), resp_bulk(sender_id)])
+        }
+        BusMessage::OffsetAck { sender_id, offset } => resp_array(vec![
+            resp_bulk_str("OFFSET_ACK"),
+            resp_bulk(sender_id),
+            resp_bulk_str(&offset.to_string()),
         ]),
     }
 }
@@ -599,6 +621,27 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_id,
                     target_offset,
                 },
+                consumed,
+            )))
+        }
+        "OFFSET" => {
+            if parts.len() < 2 {
+                return Err(format!("OFFSET expects 2 fields, got {}", parts.len()));
+            }
+            let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            Ok(Some((BusMessage::OffsetQuery { sender_id }, consumed)))
+        }
+        "OFFSET_ACK" => {
+            if parts.len() < 3 {
+                return Err(format!("OFFSET_ACK expects 3 fields, got {}", parts.len()));
+            }
+            let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            let offset: u64 = std::str::from_utf8(&parts[2])
+                .map_err(|_| "bad offset utf8")?
+                .parse()
+                .map_err(|_| "bad offset parse")?;
+            Ok(Some((
+                BusMessage::OffsetAck { sender_id, offset },
                 consumed,
             )))
         }
@@ -1316,5 +1359,24 @@ mod tests {
             }
             other => panic!("expected FailoverAuthAck, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn offset_query_and_answer_round_trip() {
+        let me = generate_node_id();
+        let ask = BusMessage::OffsetQuery { sender_id: me };
+        let (decoded, consumed) = decode(&encode(&ask)).unwrap().unwrap();
+        assert_eq!(consumed, encode(&ask).len());
+        assert!(matches!(decoded, BusMessage::OffsetQuery { sender_id } if sender_id == me));
+
+        let ack = BusMessage::OffsetAck {
+            sender_id: me,
+            offset: u64::MAX - 1,
+        };
+        let (decoded, _) = decode(&encode(&ack)).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            BusMessage::OffsetAck { sender_id, offset } if sender_id == me && offset == u64::MAX - 1
+        ));
     }
 }
