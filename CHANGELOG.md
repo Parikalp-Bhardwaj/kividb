@@ -29,6 +29,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`CONFIG SET` of a cluster setting said OK and changed nothing (#111).**
+  `cluster-slot-migration-handoff-max-lag-bytes` and
+  `cluster-slot-migration-write-pause-timeout` now take effect at runtime,
+  from the next slot migration's handoff, and `CONFIG GET` shows them. A
+  `cluster-*` setting KiviDB does not have (`cluster-allow-reads-when-down`,
+  `cluster-migration-barrier`, ...) is refused with Redis's
+  `Unknown option` error, where it was taken and ignored. Other settings of
+  Redis's that mean nothing here are still taken, as before.
+
 - **Script commands in a build without Lua** said "Lua scripting is not
   supported by KiviDB", which BullMQ and Sidekiq users read as KiviDB not
   running their queue. `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` and `FCALL`
