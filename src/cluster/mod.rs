@@ -191,9 +191,14 @@ pub struct ClusterState {
     /// Bus traffic counters for `CLUSTER INFO`.
     pub stats_messages_sent: AtomicU64,
     pub stats_messages_received: AtomicU64,
+    /// Outbound bus connections opened (`cluster_stats_bus_connects`).
+    pub stats_bus_connects: AtomicU64,
     /// Long-lived outbound bus links, by `ip:bus_port`. See
     /// `bus::dialer::send_frame`.
     pub(crate) links: parking_lot::Mutex<AHashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    /// The connection each peer is pinged over, by `ip:bus_port`, kept open
+    /// between heartbeats. See `bus::dialer::send_ping`.
+    pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
 }
 
 impl ClusterState {
@@ -238,7 +243,9 @@ impl ClusterState {
             last_saved_fingerprint: AtomicU64::new(0),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
+            stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
+            ping_links: parking_lot::Mutex::new(AHashMap::new()),
         };
         state.refresh_state();
         state

@@ -60,6 +60,11 @@ pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
             .collect()
     };
 
+    let pinged: Vec<String> = peers
+        .iter()
+        .map(|(_, ip, port)| format!("{ip}:{port}"))
+        .collect();
+    dialer::prune_ping_links(state, &pinged);
     for (peer_id, ip, bus_port) in peers {
         let state = Arc::clone(state);
         tokio::spawn(async move {
