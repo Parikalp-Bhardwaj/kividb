@@ -179,6 +179,7 @@ impl Conn {
 
 #[test]
 fn test_config_set_requirepass_updates_auth() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -207,6 +208,7 @@ fn test_config_set_requirepass_updates_auth() {
 /// is let in all the same.
 #[test]
 fn protected_mode_can_be_read_and_set_and_lets_local_clients_in() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -226,6 +228,7 @@ fn protected_mode_can_be_read_and_set_and_lets_local_clients_in() {
 
 #[test]
 fn test_config_get_requirepass_redacted() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -412,7 +415,9 @@ fn test_config_rewrite_keeps_the_file_mode() {
 }
 
 /// `maxmemory` and the remembered settings are the process's, not a
-/// server's: the tests that set them take turns.
+/// server's, and a server starting sets them: the tests that start one in
+/// this process take turns. One starting while another test had just set
+/// `maxmemory` put it back to 0 under it.
 fn maxmemory_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
@@ -574,6 +579,7 @@ fn config_set_port_moves_the_listener_or_changes_nothing() {
 /// nothing here, outside the cluster's, are still taken.
 #[test]
 fn config_set_cluster_settings_take_effect_or_are_refused() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
