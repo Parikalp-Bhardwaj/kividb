@@ -650,6 +650,19 @@ async fn run_replication_session(
             len
         };
         offset = point.offset + prelude_len as u64;
+        // A master that was this one's sibling, promoted since, continues the
+        // old stream under its own id: follow that id from here on (#109).
+        if let Some(id) = tok
+            .get(1)
+            .filter(|id| id.len() == 40 && **id != point.repl_id)
+            && let Some(current) = repl_state.resync_point.lock().as_mut()
+        {
+            log_info!(
+                "Replication: The master continues {} as {id}",
+                current.repl_id
+            );
+            current.repl_id = id.to_string();
+        }
         log_info!(
             "Replication: Partial resync: continuing from offset {} — no dataset transfer",
             point.offset
@@ -1071,6 +1084,7 @@ async fn run_replication_session(
                 parse_pos += consumed;
                 applied_commands = true;
             }
+            let read: Vec<u8> = repl_buf[..parse_pos].to_vec();
             if parse_pos > 0 {
                 repl_buf.drain(0..parse_pos);
             }
@@ -1080,6 +1094,9 @@ async fn run_replication_session(
                 point.offset = applied;
                 point.db = selected_db;
             }
+            // Kept in this node's backlog, in the master's numbering: if it
+            // is promoted, the master's other replicas carry on from it (#109).
+            repl_state.record_received(read, applied);
         }
 
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the

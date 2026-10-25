@@ -1452,3 +1452,85 @@ fn test_promotion_during_a_full_sync_keeps_the_promoted_nodes_dataset() {
     assert_eq!(c.cmds(&["GET", "mine:0"]).as_str(), "v");
     assert!(c.cmds(&["SET", "after-promotion", "1"]).is_ok());
 }
+
+/// `REPLICAOF NO ONE` on one of a master's replicas, then its sibling
+/// pointed at it: the sibling is continued from where it was, not resynced
+/// in full (#109). The promoted replica keeps the stream it followed as its
+/// second id, and kept, as a replica, what it read of it.
+#[test]
+fn test_a_promoted_replica_continues_its_sibling() {
+    let (m, a, b) = (free_port(), free_port(), free_port());
+    start_server(m);
+    start_server(a);
+    start_server(b);
+    let field = |c: &mut Conn, section: &str, name: &str| -> String {
+        let info = c.cmds(&["INFO", section]).as_str().to_string();
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let wait = |what: &str, mut ok: Box<dyn FnMut() -> bool>| {
+        for _ in 0..200 {
+            if ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    };
+
+    let mut mc = Conn::connect(m);
+    for i in 0..100 {
+        assert!(mc.cmds(&["SET", &format!("k:{i}"), "v"]).is_ok());
+    }
+    for port in [a, b] {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["REPLICAOF", "127.0.0.1", &m.to_string()]).is_ok());
+    }
+    let master_offset = field(&mut mc, "replication", "master_repl_offset");
+    let old_id = field(&mut mc, "replication", "master_replid");
+    for port in [a, b] {
+        let want = master_offset.clone();
+        wait(
+            "a replica to catch up",
+            Box::new(move || {
+                let mut c = Conn::connect(port);
+                field(&mut c, "replication", "master_link_status") == "up"
+                    && field(&mut c, "replication", "slave_repl_offset") == want
+            }),
+        );
+    }
+
+    let mut ac = Conn::connect(a);
+    assert!(ac.cmds(&["REPLICAOF", "NO", "ONE"]).is_ok());
+    assert_eq!(field(&mut ac, "replication", "master_replid2"), old_id);
+    assert_eq!(
+        field(&mut ac, "replication", "master_repl_offset"),
+        master_offset
+    );
+    // A write on the new master before its sibling arrives.
+    assert!(ac.cmds(&["SET", "k:0", "after"]).is_ok());
+
+    let mut bc = Conn::connect(b);
+    assert!(bc.cmds(&["REPLICAOF", "127.0.0.1", &a.to_string()]).is_ok());
+    wait(
+        "the sibling to follow the promoted replica",
+        Box::new(move || {
+            let mut c = Conn::connect(b);
+            field(&mut c, "replication", "master_link_status") == "up"
+                && field(&mut c, "replication", "master_port") == a.to_string()
+        }),
+    );
+    assert_eq!(field(&mut ac, "stats", "sync_full"), "0");
+    assert_eq!(field(&mut ac, "stats", "sync_partial_ok"), "1");
+    wait(
+        "the write to reach the sibling",
+        Box::new(move || {
+            let mut c = Conn::connect(b);
+            c.cmds(&["GET", "k:0"]).as_str() == "after"
+        }),
+    );
+    assert_eq!(bc.cmds(&["GET", "k:99"]).as_str(), "v");
+}

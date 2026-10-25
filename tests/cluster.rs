@@ -1113,6 +1113,78 @@ fn failover_promotes_the_replica_and_the_old_master_rejoins_as_a_replica() {
     assert_eq!(c.cmd(&["GET", &key]).text(), "after-failover");
 }
 
+/// After a failover, the failed master's other replica carries on from the
+/// new master by a partial resync, not a full one (#109): the new master
+/// keeps the old stream's id as its second, and has kept, as a replica, the
+/// stream it read.
+#[test]
+fn after_a_failover_the_other_replica_is_continued_not_resynced() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let a = add_replica(&nodes, &nodes[0]);
+    let b = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain([&a, &b]).collect();
+        wait_cluster_ok(&all, 5);
+    }
+    let range = ranges[0].0..=ranges[0].1;
+    let keys: Vec<String> = (0..200)
+        .map(|i| key_in(range.clone(), &format!("cont{i}")))
+        .collect();
+    for k in &keys {
+        assert!(nodes[0].conn().cmd(&["SET", k, "before"]).is_ok());
+    }
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+    let old_id = nodes[0].repl_info("master_replid").unwrap();
+
+    nodes[0].kill();
+    wait_until("a replica to be promoted", Duration::from_secs(40), || {
+        a.is_master() || b.is_master()
+    });
+    let (winner, other) = if a.is_master() { (&a, &b) } else { (&b, &a) };
+    // The cluster view says master a moment before replication does.
+    wait_until(
+        "the new master to keep the old stream's id",
+        Duration::from_secs(10),
+        || winner.repl_info("master_replid2").as_deref() == Some(old_id.as_str()),
+    );
+    // Writes on the new master before the other replica is back with it.
+    assert!(winner.conn().cmd(&["SET", &keys[0], "after"]).is_ok());
+
+    wait_until(
+        "the other replica to follow the new master",
+        Duration::from_secs(40),
+        || {
+            other.repl_info("master_link_status").as_deref() == Some("up")
+                && other.my_row()[3] == winner.id()
+        },
+    );
+    let stats = winner.conn().cmd(&["INFO", "stats"]).text();
+    assert_eq!(
+        info_field(&stats, "sync_full").as_deref(),
+        Some("0"),
+        "{stats}"
+    );
+    assert_eq!(
+        info_field(&stats, "sync_partial_ok").as_deref(),
+        Some("1"),
+        "{stats}"
+    );
+    wait_until(
+        "the write after the failover to arrive",
+        Duration::from_secs(10),
+        || {
+            let mut c = other.conn();
+            c.cmd(&["READONLY"]);
+            c.cmd(&["GET", &keys[0]]).text() == "after"
+        },
+    );
+    let mut c = other.conn();
+    assert!(c.cmd(&["READONLY"]).is_ok());
+    for k in &keys[1..] {
+        assert_eq!(c.cmd(&["GET", k]).text(), "before", "{k}");
+    }
+}
+
 /// With two replicas, the one that has read further wins the election
 /// (#107). Replica B is stopped while writes go on, the master dies, and B
 /// comes back behind: it asks A how far A has read, and stands a second
