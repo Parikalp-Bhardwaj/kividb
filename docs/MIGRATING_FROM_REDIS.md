@@ -117,7 +117,10 @@ What the RDB reader takes from Redis:
 
 ## 6. Replication and cluster
 
-- Replication uses `REPLICAOF` / `--replicaof`, with partial resync. A
+- Replication uses `REPLICAOF` / `--replicaof`, with partial resync, also
+  after a failover: a promoted replica keeps the old master's stream as
+  its second replication id (`master_replid2`), so the old master's other
+  replicas continue from it rather than resync in full. A
   KiviDB replica of a KiviDB master is the usual setup. A replica of a Redis
   master is the migration path above.
 - Cluster mode (`--cluster-enabled yes`) uses Redis's cluster protocol: hash

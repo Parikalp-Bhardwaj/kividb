@@ -29,6 +29,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **After a failover, every other replica of the shard resynced in full
+  (#109).** A promoted replica started a new replication stream with
+  nothing of the old one, so the failed master's other replicas, asking to
+  continue the old master's stream, were sent the whole dataset again,
+  just as the shard had lost a node. Now, as Redis does with `replid2`:
+  - a replica keeps a backlog of the stream it reads (`repl-backlog-size`),
+    in its master's numbering;
+  - when it is promoted (election, `CLUSTER FAILOVER`, `REPLICAOF NO ONE`),
+    its new stream carries on from where it had read, and it keeps the
+    old stream's id as its second, valid up to that point
+    (`master_replid2`, `second_repl_offset` in `INFO replication`);
+  - a `PSYNC` under that id is continued from the backlog, and `+CONTINUE`
+    names the new id, which the replica follows from then on.
+  A replica that had read further than the new master still resyncs in
+  full: it has writes the new master never saw.
+
 - **An import cut short by a restart of its destination left its keys behind
   (#108).** `CLUSTER MIGRATION IMPORT` copies keys to the destination before
   it takes the slots over; tasks are kept in memory, so if the destination

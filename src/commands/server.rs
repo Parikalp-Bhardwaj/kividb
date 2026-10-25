@@ -3269,6 +3269,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         v.load(std::sync::atomic::Ordering::Relaxed)
                     };
                     out.push_str(&format!("master_replid:{repl_id}\r\n"));
+                    let (replid2, second) = match ctx.repl_state.repl_id2.read().as_ref() {
+                        Some((id, until)) => (id.clone(), *until as i64),
+                        None => ("0".repeat(40), -1),
+                    };
+                    out.push_str(&format!("master_replid2:{replid2}\r\n"));
+                    out.push_str(&format!("second_repl_offset:{second}\r\n"));
                     out.push_str(&format!("master_repl_offset:{offset}\r\n"));
                     out.push_str(&format!(
                         "repl_backlog_active:{}\r\n",
