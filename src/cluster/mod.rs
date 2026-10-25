@@ -170,6 +170,9 @@ pub struct ClusterState {
     state_ok: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
+    /// `cluster-replica-validity-factor`: how stale a replica's data may be
+    /// for it to stand for election, in node timeouts; 0 = always stand.
+    replica_validity_factor: AtomicU64,
     /// True while our own IP is the loopback placeholder used when binding to
     /// a wildcard address with no `cluster-announce-ip`. While set, we send an
     /// empty address so peers record the one they observe instead.
@@ -226,6 +229,7 @@ impl ClusterState {
             bus_runtime: std::sync::OnceLock::new(),
             state_ok: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
             background_save: std::sync::OnceLock::new(),
@@ -387,6 +391,7 @@ impl ClusterState {
             bus_port,
         );
         state.set_require_full_coverage(config.cluster_require_full_coverage);
+        state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
@@ -630,6 +635,16 @@ impl ClusterState {
             self.self_ip_is_guess.store(false, Ordering::Relaxed);
             log_info!("Cluster: Learned own address from an outgoing link: {local_ip}");
         }
+    }
+
+    /// `cluster-replica-validity-factor`.
+    pub fn replica_validity_factor(&self) -> u64 {
+        self.replica_validity_factor.load(Ordering::Relaxed)
+    }
+
+    pub fn set_replica_validity_factor(&self, factor: u64) {
+        self.replica_validity_factor
+            .store(factor, Ordering::Relaxed);
     }
 
     pub fn set_require_full_coverage(&self, yes: bool) {

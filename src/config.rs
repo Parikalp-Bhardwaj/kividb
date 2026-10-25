@@ -377,6 +377,13 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub cluster_require_full_coverage: bool,
 
+    /// A replica whose link to its master has been down longer than this
+    /// many node timeouts (plus `repl-ping-replica-period`) does not stand
+    /// for election when the master fails; 0 = always stand (Redis
+    /// `cluster-replica-validity-factor`).
+    #[arg(long, default_value_t = 10)]
+    pub cluster_replica_validity_factor: u64,
+
     /// Arguments kept per slowlog entry (Redis 8.8 `slowlog-entry-max-argc`).
     #[arg(long, default_value_t = 32)]
     pub slowlog_entry_max_argc: usize,
@@ -496,6 +503,7 @@ impl Default for Config {
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
+            cluster_replica_validity_factor: 10,
             slowlog_entry_max_argc: 32,
             slowlog_entry_max_string_len: 128,
             stream_idmp_duration: 100,
@@ -606,6 +614,7 @@ impl Config {
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
+            cluster_replica_validity_factor: 10,
             slowlog_entry_max_argc: 32,
             slowlog_entry_max_string_len: 128,
             stream_idmp_duration: 100,
@@ -966,6 +975,10 @@ impl Config {
             self.cluster_config_file
         ));
         out.push_str(&format!(
+            "cluster-replica-validity-factor {}\n",
+            self.cluster_replica_validity_factor
+        ));
+        out.push_str(&format!(
             "cluster-require-full-coverage {}\n",
             if self.cluster_require_full_coverage {
                 "yes"
@@ -1282,6 +1295,9 @@ impl Config {
             "cluster-config-file" => set!(cluster_config_file, one()?.to_string()),
             "cluster-require-full-coverage" => {
                 set!(cluster_require_full_coverage, yes_no(key, one()?)?)
+            }
+            "cluster-replica-validity-factor" => {
+                set!(cluster_replica_validity_factor, number(key, one()?)?)
             }
             "cluster-slot-migration-handoff-max-lag-bytes" => set!(
                 cluster_slot_migration_handoff_max_lag_bytes,
@@ -1773,7 +1789,8 @@ mod config_file_tests {
             cluster-announce-port 1\ncluster-announce-bus-port 1\n\
             cluster-bus-port-protected-mode no\ncluster-bus-secret s\n\
             cluster-config-file f\n\
-            cluster-require-full-coverage no\ncluster-slot-migration-handoff-max-lag-bytes 1\n\
+            cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\
+            cluster-slot-migration-handoff-max-lag-bytes 1\n\
             cluster-slot-migration-write-pause-timeout 1\nrepl-replica-max-backlog-bytes 1\n\
             masterauth a\nmasteruser u\nrepl-timeout 1\nrepl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\
