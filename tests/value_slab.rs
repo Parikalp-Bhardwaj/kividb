@@ -124,24 +124,26 @@ fn values_counted_in_used_memory_by_their_block() {
     let (made, sent) = mpsc::channel();
     let (done, finished) = mpsc::channel::<()>();
     let maker = thread::spawn(move || {
-        let start = kividb::memory_use::allocated();
+        let start = kividb::memory_use::allocated() as isize;
         let values: Vec<SharedBytes> = (0..10_000)
             .map(|i| SharedBytes::from(&bytes(100, i)[..]))
             .collect();
-        let held = kividb::memory_use::allocated() - start;
+        let held = kividb::memory_use::allocated() as isize - start;
         made.send(held).unwrap();
-        finished.recv().unwrap();
+        // Let go of the values even if the test has failed: the next test
+        // counts slabs.
+        let _ = finished.recv();
         drop(values);
-        kividb::memory_use::allocated() as isize - start as isize
+        kividb::memory_use::allocated() as isize - start
     });
     let held = sent.recv().unwrap();
-    // 10,000 blocks of 112 bytes, and the Vec of 80,000 that holds them.
-    assert!(
-        (10_000 * 112 + 80_000..=10_000 * 112 + 100_000).contains(&held),
-        "{held}"
-    );
     done.send(()).unwrap();
     let left = maker.join().unwrap();
+    // 10,000 blocks of 112 bytes, and the Vec of 80,000 that holds them. The
+    // count is the process's: threads of the tests before can still be
+    // letting go of a few hundred bytes of their own (CI saw 124 fewer).
+    let want = 10_000 * 112 + 80_000;
+    assert!((want - 4_096..=want + 20_000).contains(&held), "{held}");
     assert!(left.abs() < 4_096, "{left} bytes left counted");
 }
 
