@@ -1588,10 +1588,76 @@ fn new_lua_vm() -> Lua {
         .set("REDIS_VERSION_NUM", (8i64 << 16) | (10 << 8))
         .unwrap();
 
+    // To the server's log, at Redis's level for it; it did nothing (#154).
     let log_fn = lua
-        .create_function(|_, _args: LuaMultiValue| Ok(()))
+        .create_function(|_, args: LuaMultiValue| {
+            let mut args = args.into_iter();
+            let (Some(level), Some(first)) = (args.next(), args.next()) else {
+                return Err(LuaError::RuntimeError(
+                    "redis.log() requires two arguments or more.".into(),
+                ));
+            };
+            let level = match level {
+                LuaValue::Integer(0) => crate::loglevel::DEBUG,
+                LuaValue::Integer(1) => crate::loglevel::VERBOSE,
+                LuaValue::Integer(2) => crate::loglevel::INFO,
+                LuaValue::Integer(3) => crate::loglevel::WARN,
+                LuaValue::Number(n) if n.fract() == 0.0 && (0.0..=3.0).contains(&n) => [
+                    crate::loglevel::DEBUG,
+                    crate::loglevel::VERBOSE,
+                    crate::loglevel::INFO,
+                    crate::loglevel::WARN,
+                ][n as usize],
+                _ => return Err(LuaError::RuntimeError("Invalid debug level.".into())),
+            };
+            if !crate::loglevel::enabled(level) {
+                return Ok(());
+            }
+            // The arguments joined by spaces, as Redis writes them.
+            let text = |value: LuaValue| match value {
+                LuaValue::String(s) => s.to_string_lossy().to_string(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                LuaValue::Boolean(b) => b.to_string(),
+                LuaValue::Nil => "nil".into(),
+                other => other.type_name().to_string(),
+            };
+            let line: Vec<String> = std::iter::once(first).chain(args).map(text).collect();
+            crate::log_at!(level, "{}", line.join(" "));
+            Ok(())
+        })
         .unwrap();
     redis_table.set("log", log_fn).unwrap();
+
+    // Before Redis 7, how a script asked to be replicated as its effects:
+    // here every script is, so it is true, as in Redis 7 (#154). A script
+    // that opens with it failed before doing anything.
+    let replicate_commands = lua.create_function(|_, _: LuaMultiValue| Ok(true)).unwrap();
+    redis_table
+        .set("replicate_commands", replicate_commands)
+        .unwrap();
+    redis_table.set("REPL_NONE", 0i64).unwrap();
+    redis_table.set("REPL_AOF", 1i64).unwrap();
+    redis_table.set("REPL_SLAVE", 2i64).unwrap();
+    redis_table.set("REPL_REPLICA", 2i64).unwrap();
+    redis_table.set("REPL_ALL", 3i64).unwrap();
+    // What a script's writes go to: everything, which is what KiviDB does.
+    // Keeping them from the AOF or the replicas is not supported, and is
+    // refused rather than ignored.
+    let set_repl = lua
+        .create_function(|_, flags: LuaValue| match flags {
+            LuaValue::Integer(3) => Ok(()),
+            LuaValue::Number(3.0) => Ok(()),
+            LuaValue::Integer(0..=2) | LuaValue::Number(_) => Err(LuaError::RuntimeError(
+                "redis.set_repl() other than REDIS.REPL_ALL is not supported by KiviDB".into(),
+            )),
+            _ => Err(LuaError::RuntimeError(
+                "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE."
+                    .into(),
+            )),
+        })
+        .unwrap();
+    redis_table.set("set_repl", set_repl).unwrap();
 
     let placeholder = lua
         .create_function(|_, _: LuaMultiValue| {
