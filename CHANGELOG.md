@@ -120,6 +120,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`WAITAOF` said a write was on disk with the AOF off (#137).** It replied
+  `[1, 0]`, one local fsync, when nothing is written to an AOF. With the AOF
+  off, `WAITAOF` with `numlocal` above 0 is now refused, as in Redis
+  (`ERR WAITAOF cannot be used when numlocal is set but appendonly is
+  disabled.`), and `WAITAOF 0 ...` replies `[0, 0]`. With the AOF on, the
+  first number is 1 once the write is fsynced, whatever `numlocal` asked
+  for, as in Redis; it was 0 for `numlocal` 0.
+
 - **`ACL HELP` answers; `COMMAND` with an unknown subcommand is an error
   (#134).** `ACL HELP` was an unknown subcommand, in an error that said to
   try `ACL HELP`; it now lists ACL's subcommands, as Redis does. `COMMAND

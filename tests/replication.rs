@@ -258,10 +258,16 @@ fn test_waitaof() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let r = c.cmds(&["WAITAOF", "1", "0", "0"]);
+    // With the AOF off, nothing is on disk by one: asking for a local fsync
+    // is an error, as in Redis, and none is reported. It reported one (#137).
+    assert!(matches!(
+        c.cmds(&["WAITAOF", "1", "0", "0"]),
+        RespValue::Error(_)
+    ));
+    let r = c.cmds(&["WAITAOF", "0", "0", "0"]);
     let arr = r.as_array();
     assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0].as_int(), 1);
+    assert_eq!(arr[0].as_int(), 0);
     assert_eq!(arr[1].as_int(), 0);
 }
 

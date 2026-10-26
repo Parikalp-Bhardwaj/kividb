@@ -1870,14 +1870,23 @@ where
                 "WAITAOF" => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
-                    } else if !aof_enabled {
-                        b"*2\r\n:1\r\n:0\r\n".to_vec()
+                    } else if !aof_enabled
+                        && !crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Nothing goes to an AOF, so nothing is on disk by
+                        // one: it answered that the write was (#137). On at
+                        // the start, or turned on since by `CONFIG SET`.
+                        let num_local = std::str::from_utf8(cmd[1])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if num_local != 0 {
+                            b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n"
+                                .to_vec()
+                        } else {
+                            b"*2\r\n:0\r\n:0\r\n".to_vec()
+                        }
                     } else {
-                        let num_local: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
                         let timeout_ms: u64 =
                             std::str::from_utf8(cmd.get(3).copied().unwrap_or(b"0"))
                                 .ok()
@@ -1899,12 +1908,10 @@ where
                         loop {
                             let fsynced =
                                 crate::aof::AOF_FSYNCED.load(std::sync::atomic::Ordering::Relaxed);
+                            // As Redis: 1 once the write is on disk here,
+                            // whatever `numlocal` asked for.
                             if fsynced >= target {
-                                if num_local > 0 {
-                                    break b"*2\r\n:1\r\n:0\r\n".to_vec();
-                                } else {
-                                    break b"*2\r\n:0\r\n:0\r\n".to_vec();
-                                }
+                                break b"*2\r\n:1\r\n:0\r\n".to_vec();
                             }
                             if tokio::time::Instant::now() >= deadline {
                                 break b"*2\r\n:0\r\n:0\r\n".to_vec();
