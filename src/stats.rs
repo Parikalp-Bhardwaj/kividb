@@ -323,10 +323,12 @@ pub fn reset_rdb_changes() {
 pub fn spawn_instantaneous_ops_sampler() {
     std::thread::spawn(|| {
         let (mut last_in, mut last_out) = (0u64, 0u64);
-        for tick in 1u64.. {
+        let mut tick = 0u64;
+        loop {
+            tick += 1;
             std::thread::sleep(std::time::Duration::from_millis(100));
             crate::commands::memory::used_and_peak();
-            if tick % 10 != 0 {
+            if !tick.is_multiple_of(10) {
                 continue;
             }
             let current = TOTAL_COMMANDS_PROCESSED.total();
