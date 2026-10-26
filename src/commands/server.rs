@@ -566,10 +566,18 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
             "notify-keyspace-events" => {
-                let new_flags = crate::keyspace_events::parse_ks_flags(value);
-                crate::keyspace_events::KS_FLAGS
-                    .store(new_flags, std::sync::atomic::Ordering::Relaxed);
-                Some(resp_simple("OK"))
+                match crate::keyspace_events::parse_ks_flags_strict(value) {
+                    Some(new_flags) => {
+                        crate::keyspace_events::KS_FLAGS
+                            .store(new_flags, std::sync::atomic::Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                     'notify-keyspace-events') - {}",
+                        crate::keyspace_events::BAD_FLAGS
+                    ))),
+                }
             }
             "repl-backlog-size" => match value.parse::<u64>() {
                 Ok(v) if v >= 1 => {

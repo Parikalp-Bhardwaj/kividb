@@ -120,6 +120,24 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Keyspace notifications: Redis's event names, events from the commands
+  that sent none, and `keymiss` (#160).**
+  - Named as in Redis: `INCR`, `DECR` and `DECRBY` send `incrby` (they sent
+    `incr`, `decr`, `decrby`); `GETDEL` `del`; `GETSET` and `SETNX` `set`;
+    `GETEX` `expire` or `persist`; `LMOVE` `lpop` or `rpop` on the source and
+    `lpush` or `rpush` on the destination (it sent `lmove` on both). A
+    listener on `__keyevent@0__:incrby` or `:set` missed these.
+  - Sent now: `setrange` (`SETRANGE`), `setbit` (`SETBIT`, a `BITFIELD` that
+    writes), `set` or `del` (`BITOP`'s destination), `pfadd` (`PFADD`,
+    `PFMERGE`), `zadd` (`GEOADD`), `move_from` and `move_to` (`MOVE`), and the
+    JSON, time series and vector set commands' own (`json.set`, `ts.add`,
+    `vadd`, ...), under a new `d` class, which `A` includes, as in Redis.
+  - `m`: a read that looks for a key and does not find it sends `keymiss`.
+    It never fired.
+  - A `notify-keyspace-events` with a character that is not a flag is
+    refused, by `CONFIG SET` and in the config file; `KEAQ!` was taken as
+    `AKE`.
+
 - **The script cache had no limit (#155).** Every distinct script sent with
   `EVAL` stayed cached until `SCRIPT FLUSH`, so a client that wrote its
   values into the script (rather than passing them as arguments) grew it for

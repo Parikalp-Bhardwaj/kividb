@@ -1018,6 +1018,21 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
     } else {
         Vec::new()
     };
+    // `notify-keyspace-events m`: the keys a read looks for and does not
+    // find. It never fired (#160). `EXISTS` and `TYPE` only ask, as in Redis.
+    let missed: Vec<usize> = if !writes_operation
+        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
+            & crate::keyspace_events::KS_KEY_MISS
+            != 0
+        && !matches!(name, "EXISTS" | "TYPE" | "TOUCH" | "OBJECT")
+    {
+        crate::keyspec::key_positions(name, &ctx.cmd)
+            .iter()
+            .filter(|pos| std::str::from_utf8(ctx.cmd[*pos]).is_ok_and(|key| !exists(ctx, key)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // `notify-keyspace-events o` / `c` (see `replace_watch_begin`). With
     // neither on, which is the default, this is a load and a branch on a
@@ -1052,6 +1067,35 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
                 "new",
                 key,
             );
+        }
+    }
+    for pos in missed {
+        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                *ctx.selected_db,
+                crate::keyspace_events::KS_KEY_MISS,
+                "keymiss",
+                key,
+            );
+        }
+    }
+    // The events of the commands that announce none of their own (#160).
+    if writes_operation
+        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && !result.starts_with(b"-")
+        && !crate::commands::blocking::parked(ctx)
+    {
+        for event in crate::keyspace_events::command_events(name, &ctx.cmd, &result) {
+            if let Some(Ok(key)) = ctx.cmd.get(event.key).map(|key| std::str::from_utf8(key)) {
+                crate::keyspace_events::notify(
+                    ctx.pubsub,
+                    event.db.unwrap_or(*ctx.selected_db),
+                    event.class,
+                    &event.event,
+                    key,
+                );
+            }
         }
     }
 
