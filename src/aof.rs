@@ -604,7 +604,20 @@ pub fn checkpoint_noting(
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
     REWRITE_ACTIVE.store(true, Ordering::Release);
+    let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
+    let started = std::time::Instant::now();
     let result = checkpoint_inner(store, expiry_store, index_store, at_cut);
+    // With the AOF on, a checkpoint is its rewrite (#149): these were never
+    // set.
+    if aof_on {
+        AOF_LAST_REWRITE_OK.store(result.is_ok(), Ordering::Relaxed);
+        if result.is_ok() {
+            AOF_LAST_REWRITE_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+    if result.is_ok() {
+        crate::stats::record_save();
+    }
     REWRITE_ACTIVE.store(false, Ordering::Release);
     result
 }

@@ -98,6 +98,34 @@ static RDB_CHANGES: parking_lot::Mutex<Vec<std::sync::Arc<AtomicU64>>> =
 /// `INFO persistence`. `LASTSAVE` counts in seconds, so two saves within one
 /// second look like one; this does not.
 pub static RDB_SAVES: AtomicU64 = AtomicU64::new(0);
+/// When the dataset was last written to disk whole, in Unix seconds:
+/// `LASTSAVE` and `rdb_last_save_time` (#149). A `SAVE` or `BGSAVE`, the
+/// save at shutdown, a replica's after a full sync, and a checkpoint of the
+/// AOF (`BGREWRITEAOF`, an automatic rewrite, `CONFIG SET appendonly yes`),
+/// which writes `dump.kdb` too. Until the first, the server's start, as in
+/// Redis.
+static LAST_SAVE: AtomicI64 = AtomicI64::new(0);
+
+/// How long the last `BGSAVE` took, in seconds; -1 before the first —
+/// `rdb_last_bgsave_time_sec`.
+pub static LAST_BGSAVE_SECS: AtomicI64 = AtomicI64::new(-1);
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
+/// The dataset has been written to disk whole, or the server has started.
+pub fn record_save() {
+    LAST_SAVE.store(unix_now(), Ordering::Relaxed);
+}
+
+/// See [`LAST_SAVE`].
+pub fn last_save() -> i64 {
+    LAST_SAVE.load(Ordering::Relaxed)
+}
+
 /// A `BGSAVE` is running.
 pub static BGSAVE_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

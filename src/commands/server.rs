@@ -3104,13 +3104,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match result {
                 Ok(_) => {
                     crate::stats::reset_rdb_changes();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-
-                    *ctx.lastsave.write() = now;
-
                     Some(resp_simple("OK"))
                 }
                 Err(e) => Some(resp_error(&format!("ERR save failed : {e}"))),
@@ -3127,9 +3120,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let expiry_store_snap = Arc::clone(ctx.expiry_store);
             let index_store_snap = Arc::clone(ctx.index_store);
             let repl_state = Arc::clone(ctx.repl_state);
-            let lastsave = Arc::clone(ctx.lastsave);
 
             tokio::spawn(async move {
+                let started = std::time::Instant::now();
                 let snap = tokio::task::spawn_blocking(move || {
                     crate::replication::save_dataset(
                         &store,
@@ -3145,11 +3138,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let ok = matches!(snap, Ok(Ok(())));
                 if ok {
                     crate::stats::reset_rdb_changes();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-                    *lastsave.write() = now;
+                    crate::stats::LAST_BGSAVE_SECS
+                        .store(started.elapsed().as_secs() as i64, Ordering::Relaxed);
                 } else {
                     let why = match snap {
                         Ok(Err(e)) => e.to_string(),
@@ -3170,10 +3160,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             Some(resp_simple("Background saving started"))
         }
 
-        "LASTSAVE" => {
-            let t = *ctx.lastsave.read();
-            Some(resp_integer(t))
-        }
+        "LASTSAVE" => Some(resp_integer(crate::stats::last_save())),
 
         "FLUSHDB" => {
             let db = *ctx.selected_db;
@@ -3765,7 +3752,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if want("persistence") {
-                let lastsave = *ctx.lastsave.read();
+                let lastsave = crate::stats::last_save();
                 let chg = crate::stats::rdb_changes_since_save();
                 out.push_str("# Persistence\r\n");
                 // 1 on a replica while a full sync is being loaded: the
@@ -3795,7 +3782,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "rdb_last_bgsave_time_sec:{}\r\n",
-                    if lastsave > 0 { lastsave } else { -1 }
+                    crate::stats::LAST_BGSAVE_SECS.load(Ordering::Relaxed)
                 ));
                 out.push_str(&format!(
                     "rdb_last_bgsave_status:{}\r\n",

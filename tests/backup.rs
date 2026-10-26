@@ -597,6 +597,68 @@ fn an_unsealed_backup_can_be_aborted_and_started_again() {
     assert!(matches!(c.cmd(&["BACKUP", "HELP"]), V::Arr(_)));
 }
 
+fn persistence_field(c: &mut Conn, name: &str) -> i64 {
+    let info = c.cmd(&["INFO", "persistence"]);
+    info.s()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("no {name} in INFO persistence"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn wait_for_field(c: &mut Conn, name: &str, wanted: i64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while persistence_field(c, name) != wanted {
+        assert!(Instant::now() < deadline, "{name} never became {wanted}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `LASTSAVE` was 0 after every start, and moved only for `SAVE` and
+/// `BGSAVE`; the AOF's rewrite fields were never set, and
+/// `rdb_last_bgsave_time_sec` held the time of the save, not how long it
+/// took (#149).
+#[test]
+fn lastsave_starts_at_the_start_and_moves_with_every_save() {
+    let before = unix_now();
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let started = c.cmd(&["LASTSAVE"]).i();
+    assert!(started >= before && started <= unix_now(), "{started}");
+    assert_eq!(persistence_field(&mut c, "aof_last_rewrite_time_ms"), -1);
+    assert_eq!(persistence_field(&mut c, "rdb_last_bgsave_time_sec"), -1);
+
+    // LASTSAVE counts in seconds.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert!(!c.cmd(&["BGREWRITEAOF"]).is_err());
+    wait_for_field(&mut c, "aof_rewrite_in_progress", 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.cmd(&["LASTSAVE"]).i() == started {
+        assert!(
+            Instant::now() < deadline,
+            "BGREWRITEAOF did not move LASTSAVE"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_ms") >= 0);
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_sec") >= 0);
+
+    assert!(c.cmd(&["BGSAVE"]).s().contains("started"));
+    wait_for_field(&mut c, "rdb_bgsave_in_progress", 0);
+    let took = persistence_field(&mut c, "rdb_last_bgsave_time_sec");
+    assert!((0..60).contains(&took), "{took}");
+}
+
 /// A backup's state was only in memory: after a restart, a sealed backup
 /// could not be cleaned up, and no other could start (#150).
 #[test]

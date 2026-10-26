@@ -83,6 +83,8 @@ pub struct Ctx<'a> {
     pub cmd: Vec<&'a [u8]>,
     pub store: &'a Store,
     pub expiry_store: &'a ExpiryStore,
+    /// Not read: `LASTSAVE` is `stats::last_save()`, which every save
+    /// moves (#149). Still passed around by the connection loops.
     pub lastsave: &'a Arc<RwLock<i64>>,
     pub selected_db: &'a mut usize,
     pub aof_tx: &'a dyn AofSender,
