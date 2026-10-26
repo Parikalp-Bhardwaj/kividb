@@ -301,6 +301,7 @@ async fn park_blocking_uring(
         let payload = std::mem::take(out_buf);
         crate::stats::TOTAL_NET_OUTPUT_BYTES
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::record_write();
         let _w = write_guard.lock().await;
         let (res, mut returned) = stream.write_all(payload).await;
         drop(_w);
@@ -497,6 +498,7 @@ fn open_subscriptions(
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
             let (res, _) = stream.write_all(frames).await;
             if res.is_err() {
                 break;
@@ -621,6 +623,7 @@ pub async fn handle_client(
                 let _w = write_guard.lock().await;
                 crate::stats::TOTAL_NET_OUTPUT_BYTES
                     .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::stats::record_write();
                 let (res, _) = stream.write_all(msg).await;
                 if res.is_err() {
                     break;
@@ -816,6 +819,7 @@ pub async fn handle_client(
         }
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::record_read();
         activity.note_read(n);
 
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
@@ -2479,6 +2483,7 @@ pub async fn handle_client(
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(spare_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
             let _w = write_guard.lock().await;
             let (res, returned) = stream.write_all(spare_buf).await;
             drop(_w);

@@ -3350,7 +3350,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "total_commands_processed:{}\r\n",
-                    crate::stats::TOTAL_COMMANDS_PROCESSED.load(Ordering::Relaxed)
+                    crate::stats::TOTAL_COMMANDS_PROCESSED.total()
                 ));
                 out.push_str(&format!(
                     "instantaneous_ops_per_sec:{}\r\n",
@@ -3377,15 +3377,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "rejected_connections:{}\r\n",
                     crate::stats::REJECTED_CONNECTIONS.load(Ordering::Relaxed)
                 ));
-                out.push_str("total_reads_processed:0\r\n");
-                out.push_str("total_writes_processed:0\r\n");
+                out.push_str(&format!(
+                    "total_reads_processed:{}\r\n",
+                    crate::stats::TOTAL_READS_PROCESSED.total()
+                ));
+                out.push_str(&format!(
+                    "total_writes_processed:{}\r\n",
+                    crate::stats::TOTAL_WRITES_PROCESSED.total()
+                ));
                 out.push_str(&format!(
                     "keyspace_hits:{}\r\n",
-                    crate::stats::KEYSPACE_HITS.load(Ordering::Relaxed)
+                    crate::stats::KEYSPACE_HITS.total()
                 ));
                 out.push_str(&format!(
                     "keyspace_misses:{}\r\n",
-                    crate::stats::KEYSPACE_MISSES.load(Ordering::Relaxed)
+                    crate::stats::KEYSPACE_MISSES.total()
                 ));
                 out.push_str(&format!(
                     "expired_keys:{}\r\n",
@@ -4034,9 +4040,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "RESETSTAT" => {
                     crate::cmdstats::reset();
-                    crate::stats::KEYSPACE_HITS.store(0, Ordering::Relaxed);
-                    crate::stats::KEYSPACE_MISSES.store(0, Ordering::Relaxed);
-                    crate::stats::TOTAL_COMMANDS_PROCESSED.store(0, Ordering::Relaxed);
+                    crate::stats::KEYSPACE_HITS.reset();
+                    crate::stats::KEYSPACE_MISSES.reset();
+                    crate::stats::TOTAL_COMMANDS_PROCESSED.reset();
+                    crate::stats::TOTAL_READS_PROCESSED.reset();
+                    crate::stats::TOTAL_WRITES_PROCESSED.reset();
                     crate::stats::TOTAL_CONNECTIONS_RECEIVED.store(0, Ordering::Relaxed);
                     crate::stats::TOTAL_ERROR_REPLIES.store(0, Ordering::Relaxed);
                     crate::stats::TOTAL_NET_INPUT_BYTES.store(0, Ordering::Relaxed);

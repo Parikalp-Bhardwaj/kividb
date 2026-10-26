@@ -111,6 +111,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`INFO stats` reported no commands, hits or misses on a quiet server
+  (#136).** `total_commands_processed`, `keyspace_hits` and
+  `keyspace_misses` were counted in batches of 128 on each thread, and only
+  the full batches reached `INFO`: after a few commands, all three were 0,
+  and a hit-rate panel showed a server doing nothing. Each thread's count is
+  now added up when `INFO` reads it, at the same cost on the hot path.
+  `total_reads_processed` and `total_writes_processed`, always 0, now count
+  reads from and writes to client connections.
+
 - **A backup sealed before a restart could not be cleaned up, and stood in
   the way of the next one (#150).** A backup's state was only in memory:
   after a restart, `BACKUP CLEANUP` said there was no backup and
