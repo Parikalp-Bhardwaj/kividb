@@ -643,6 +643,7 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
+    crate::latency::note_command(ctx.latency, name, elapsed);
     if !crate::commands::blocking::parked(ctx) {
         crate::cmdstats::record(name, &ctx.cmd, &reply, elapsed);
     }

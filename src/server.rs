@@ -138,6 +138,7 @@ where
                 read = waiter.reader.read(&mut temp) => match read {
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
                         waiter.carried.extend_from_slice(&temp[..n]);
                         // The client sent something while it was parked, so it
                         // is not idle: restart its idle clock.
@@ -203,6 +204,7 @@ where
         return Ok(());
     }
     crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(combined.len() as u64, Ordering::Relaxed);
+    crate::stats::record_write();
     let mut g = w.lock().await;
     g.write_all(combined).await?;
     combined.clear();
@@ -233,6 +235,7 @@ where
                 continue;
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frames.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             if g.write_all(&frames).await.is_err() {
                 break;
             }
@@ -277,6 +280,7 @@ where
                 out_buf.extend_from_slice(&r2);
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(out_buf.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             let mut g = writer.lock().await;
             if g.write_all(&out_buf).await.is_err() {
                 break;
@@ -414,6 +418,7 @@ where
         while let Some(msg) = push_rx.recv().await {
             let mut g = writer_for_push.lock().await;
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             if g.write_all(&msg).await.is_err() {
                 break;
             }
@@ -589,6 +594,7 @@ where
             }
             crate::stats::TOTAL_NET_INPUT_BYTES
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_read();
             activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
         } else {
@@ -771,15 +777,6 @@ where
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -947,15 +944,6 @@ where
                     + waited_from.map_or(0, |from| now_us().saturating_sub(from));
 
                 if elapsed_us >= slowlog.threshold_us() {
-                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                    latency.record(
-                        if elapsed_ms < 1 {
-                            "fast-command"
-                        } else {
-                            "command"
-                        },
-                        elapsed_ms,
-                    );
                     let client_name = client_registry
                         .get(client_id)
                         .map(|info| info.name.clone())
@@ -1622,15 +1610,6 @@ where
                                 };
 
                                 if elapsed_us >= slowlog.threshold_us() {
-                                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                                    latency.record(
-                                        if elapsed_ms < 1 {
-                                            "fast-command"
-                                        } else {
-                                            "command"
-                                        },
-                                        elapsed_ms,
-                                    );
                                     slowlog.record(
                                         &raw_cmd,
                                         elapsed_us,
@@ -2166,15 +2145,6 @@ where
                     };
 
                     if elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())

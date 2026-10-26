@@ -1067,6 +1067,7 @@ pub fn save_dataset(
         }
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
+    crate::stats::record_save();
     Ok(())
 }
 

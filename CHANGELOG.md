@@ -14,6 +14,18 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **TLS certificates are loaded again with `CONFIG SET`, without a restart
+  (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
+  `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or
+  `tls-client-key-file` reads the files again, also when the path is the
+  same (a certificate renewed in place by cert-manager or Let's Encrypt), and
+  every handshake from then on uses them: clients', and between the nodes of
+  a cluster or a replica and its master. Connections already open keep
+  theirs. Several in one `CONFIG SET` are loaded together, so that a
+  certificate and its key change as a pair. Files that cannot be loaded
+  change nothing: `Unable to update TLS configuration. Check server logs.`
+  These were answered `OK` and changed nothing.
+
 - **Active defrag (#113): memory freed by deletes goes back to the system.**
   After a reshard or a big delete at random, nearly every page still held
   a key that stayed, and the process kept its memory: 10 million keys of
@@ -45,6 +57,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   skip it. Config file, command line, and `CONFIG SET` at runtime.
 
 ### Changed
+
+- **`CONFIG SET` refuses what it cannot set, as Redis does (#143).** A name
+  that is neither KiviDB's nor Redis's (`bogus-name`, a misspelling) gets
+  `ERR Unknown option or number of arguments for CONFIG SET`; it was taken,
+  kept, and did nothing. A setting read only at startup (`threads`,
+  `io-model`, `aof`, `repl-replica-max-backlog-bytes`, `backupdirname`,
+  `bind`, `dir`, ...) gets `can't set immutable config`, unless set to what
+  it already is; it was answered `OK` and left as it was. Redis's settings
+  that mean nothing here (`maxclients`, `hz`, `timeout`, `tcp-keepalive`,
+  the encodings, ...) are still taken, and `CONFIG GET` now gives back what
+  was set for `hz`, `timeout`, `tcp-keepalive`, `activerehashing` and
+  `lazyfree-lazy-eviction` too, and for `busy-reply-threshold` in a build
+  without Lua. `CONFIG GET *` lists `latency-monitor-threshold`.
 
 - **The image has no OpenSSL.** Its base is now distroless's `base-nossl`
   with `libgcc_s` copied in, rather than `cc`, which ships `libssl3`. KiviDB
@@ -85,6 +110,78 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `bad argument #2 to 'assert' (string expected, got table)`.
 
 ### Fixed
+
+- **Monitoring saw less than Redis shows (#158).** The latency monitor's
+  `command` and `fast-command` events are recorded when a command takes at
+  least `latency-monitor-threshold` (in the config file too), as in Redis;
+  they were recorded by `slowlog-log-slower-than`, so with the defaults
+  `CONFIG SET latency-monitor-threshold` recorded nothing, and
+  `fast-command` was any command under a millisecond rather than a command
+  Redis flags fast. `LATENCY LATEST` gives four fields, the maximum
+  included, which redis_exporter reads; `LATENCY HELP` answers.
+  `INFO latencystats` gives each command's percentiles
+  (`latency-tracking-info-percentiles`), from the same histogram as
+  `LATENCY HISTOGRAM`, so to its power of two. `instantaneous_input_kbps`
+  and `instantaneous_output_kbps` are measured; `INFO server` gives
+  `slowlog_log_slower_than:-1` when the slow log is off, the
+  `multiplexing_api` in use (`io_uring`, `epoll`, ...), the `config_file`
+  and the `executable`; `maxclients` is what was set.
+
+- **`mem_fragmentation_ratio` was virtual size over RSS, so `MEMORY DOCTOR`
+  always warned (#152).** It is now Redis's: RSS over `used_memory`, on
+  every platform (it was a fixed `1.0` on macOS and Windows), with
+  `mem_fragmentation_bytes` their difference. An empty Linux server
+  reported `176.19`, and one with 100,000 keys `56.67`, where the ratio was
+  about 1.8; dashboards and alerts above 1.5 always fired. `MEMORY DOCTOR`
+  follows Redis's rules: nothing to say about an instance using under 5 MB,
+  fragmentation above 1.4 only when it is over 10 MB, and a peak half as
+  large again as now. `used_memory_peak` is the peak of `used_memory`,
+  sampled every 100 ms, not the most RSS seen when `INFO` ran;
+  `used_memory_startup` is measured at startup, not a fixed 1 MB. `CONFIG
+  GET lazyfree-lazy-user-del` answers `no`, which is what `DEL` does.
+
+- **`LASTSAVE` was 0 after a restart, and some persistence fields never
+  changed (#149).** `LASTSAVE` and `rdb_last_save_time` now start at the
+  server's start, as in Redis, and move with every save of the whole
+  dataset: `SAVE`, `BGSAVE`, the save at shutdown, a replica's after a full
+  sync, and a checkpoint of the AOF (`BGREWRITEAOF`, an automatic rewrite,
+  `CONFIG SET appendonly yes`), which writes `dump.kdb` too; they moved only
+  for `SAVE` and `BGSAVE`. `aof_last_rewrite_time_sec`,
+  `aof_last_rewrite_time_ms` and `aof_last_bgrewrite_status` report the last
+  rewrite (they were always `-1` and `ok`), and `rdb_last_bgsave_time_sec`
+  how long the last `BGSAVE` took, not when it ended.
+
+- **`INFO stats` reported no commands, hits or misses on a quiet server
+  (#136).** `total_commands_processed`, `keyspace_hits` and
+  `keyspace_misses` were counted in batches of 128 on each thread, and only
+  the full batches reached `INFO`: after a few commands, all three were 0,
+  and a hit-rate panel showed a server doing nothing. Each thread's count is
+  now added up when `INFO` reads it, at the same cost on the hot path.
+  `total_reads_processed` and `total_writes_processed`, always 0, now count
+  reads from and writes to client connections.
+
+- **A backup sealed before a restart could not be cleaned up, and stood in
+  the way of the next one (#150).** A backup's state was only in memory:
+  after a restart, `BACKUP CLEANUP` said there was no backup and
+  `BACKUP START` that the directory was not empty, until its files were
+  deleted by hand; its `backup-sealed-ttl` never ran out. At startup, a
+  complete backup in `backupdirname` is now taken up again as sealed
+  (`BACKUP LIST`, `BACKUP CLEANUP`, and the TTL, counted from the seal), and
+  what a backup cut short by the restart left there as failed, cleared by
+  `BACKUP CLEANUP` or the next `BACKUP START`.
+
+- **Settings `CONFIG SET` takes stopped the server in the config file
+  (#142).** `tracking-table-max-keys`, `array-slice-size`,
+  `array-sparse-kmax`, `array-sparse-kmin`, `stream-node-max-entries`,
+  `stream-node-max-bytes` and `busy-reply-threshold` (`lua-time-limit`)
+  were unknown directives, and had no flag either: they could only be set
+  after every start. They are now read from the file, checked as
+  `CONFIG SET` checks them. Redis's settings KiviDB has no use for
+  (`maxclients`, `maxmemory-clients`, `client-query-buffer-limit`,
+  `latency-tracking`, the encodings, and any other of Redis 8's) are
+  accepted with a warning, as `hz` and `timeout` already were, so that a
+  `redis.conf` carried over starts. A name that is neither KiviDB's nor
+  Redis's still stops it.
 
 - **Search: scores drifted, `DD` kept the documents, KNN was ignored in
   `FT.AGGREGATE` (#162).**

@@ -597,6 +597,137 @@ fn an_unsealed_backup_can_be_aborted_and_started_again() {
     assert!(matches!(c.cmd(&["BACKUP", "HELP"]), V::Arr(_)));
 }
 
+fn persistence_field(c: &mut Conn, name: &str) -> i64 {
+    let info = c.cmd(&["INFO", "persistence"]);
+    info.s()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("no {name} in INFO persistence"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn wait_for_field(c: &mut Conn, name: &str, wanted: i64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while persistence_field(c, name) != wanted {
+        assert!(Instant::now() < deadline, "{name} never became {wanted}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `LASTSAVE` was 0 after every start, and moved only for `SAVE` and
+/// `BGSAVE`; the AOF's rewrite fields were never set, and
+/// `rdb_last_bgsave_time_sec` held the time of the save, not how long it
+/// took (#149).
+#[test]
+fn lastsave_starts_at_the_start_and_moves_with_every_save() {
+    let before = unix_now();
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let started = c.cmd(&["LASTSAVE"]).i();
+    assert!(started >= before && started <= unix_now(), "{started}");
+    assert_eq!(persistence_field(&mut c, "aof_last_rewrite_time_ms"), -1);
+    assert_eq!(persistence_field(&mut c, "rdb_last_bgsave_time_sec"), -1);
+
+    // LASTSAVE counts in seconds.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert!(!c.cmd(&["BGREWRITEAOF"]).is_err());
+    wait_for_field(&mut c, "aof_rewrite_in_progress", 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.cmd(&["LASTSAVE"]).i() == started {
+        assert!(
+            Instant::now() < deadline,
+            "BGREWRITEAOF did not move LASTSAVE"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_ms") >= 0);
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_sec") >= 0);
+
+    assert!(c.cmd(&["BGSAVE"]).s().contains("started"));
+    wait_for_field(&mut c, "rdb_bgsave_in_progress", 0);
+    let took = persistence_field(&mut c, "rdb_last_bgsave_time_sec");
+    assert!((0..60).contains(&took), "{took}");
+}
+
+/// A backup's state was only in memory: after a restart, a sealed backup
+/// could not be cleaned up, and no other could start (#150).
+#[test]
+fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    c.cmd(&["SET", "k", "v"]);
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let listed = c.cmd(&["BACKUP", "LIST"]).strings();
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    assert_eq!(c.cmd(&["BACKUP", "LIST"]).strings(), listed);
+    assert!(c.cmd(&["BACKUP", "CLEANUP"]).ok());
+    assert_eq!(status(&mut c).0, "idle");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    drop(c);
+
+    // Cut short by the restart: a failed backup, which the next one clears.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "failed");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let files = c.cmd(&["BACKUP", "LIST"]).strings();
+    assert_eq!(files.len(), 3, "{files:?}");
+}
+
+/// A sealed backup's `backup-sealed-ttl` counts from its seal, across a
+/// restart (#150).
+#[test]
+fn a_sealed_backup_from_before_a_restart_still_runs_out() {
+    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    wait_for_state(&mut c, "idle");
+    let left = std::fs::read_dir(server.dir.join("backupdir"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 0);
+}
+
 /// `preload-file` means "start from exactly this". If it cannot be loaded the
 /// server must not come up on some other dataset, or an empty one.
 #[test]
