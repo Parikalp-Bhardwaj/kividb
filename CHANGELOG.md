@@ -78,6 +78,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Search: scores drifted, `DD` kept the documents, KNN was ignored in
+  `FT.AGGREGATE` (#162).**
+  - BM25 counted every write of a TEXT field as a new document, and a
+    delete took nothing away: after documents came and went, a word's
+    rarity and the average length were wrong, and one document's score for
+    a word fell a hundredfold after 200 others were added and deleted. A
+    field written again also still matched the words it had held. What
+    each document's TEXT fields contribute is now kept, and taken back out
+    when a field is written again or the document goes; a delete no longer
+    walks every posting list to find its words.
+  - `FT.DROPINDEX index DD` deletes the documents the index covered, as in
+    Redis; they were kept.
+  - A KNN clause in `FT.AGGREGATE` (`*=>[KNN 10 @v $q AS d]`) keeps the
+    nearest `k` of what the filter left, exactly, with the distance under
+    its name for `LOAD`, `SORTBY` or `GROUPBY`, and in a cluster the
+    nearest of every master's; it was dropped, and every document went on.
+
 - **A JSON document from Redis 8 made a whole snapshot unreadable (#157).**
   RedisJSON 8 saves an array of numbers all of one kind as a CBOR typed
   array (RFC 8746): `[1, 2]` as 8-bit integers, `[1.5, 2.5]` as half
