@@ -881,6 +881,11 @@ impl ReplState {
     pub fn become_slave(&self) {
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
+        // Its own replicas would get nothing from here on: a replica does
+        // not pass its master's stream on.
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::DropReplicas);
+        }
         *self.repl_id2.write() = None;
         // The stream this node wrote as a master ends here. Were it promoted
         // again later under the same id, a replica that had followed the old
@@ -1230,7 +1235,17 @@ pub enum HubMsg {
     Resume {
         offset: u64,
     },
+    /// Let go of every replica: this node has become a replica itself, and
+    /// does not pass its master's stream on (#144). Their connections close,
+    /// and when they connect again they are told why.
+    DropReplicas,
 }
+
+/// What a replica answers a node that asks to replicate from it: KiviDB does
+/// not chain replicas, and one that took the request would send its data
+/// once and nothing after (#144).
+pub const NOT_A_MASTER: &str = "ERR this server is a replica, and KiviDB does not chain replicas: \
+     replicate from its master instead";
 
 /// The most recent part of the write stream, kept by the hub so that a
 /// replica which lost its connection can be sent what it missed instead of
@@ -1509,6 +1524,27 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // Tear down registration (client disconnect / rollback).
                     channel_replicas.retain(|r| r.id != replica_id);
                     forget_replica(&state, replica_id);
+                }
+                HubMsg::DropReplicas => {
+                    // Dropping each `tx` ends its forwarder, and so its
+                    // connection, as an eviction does.
+                    for replica in channel_replicas.drain(..) {
+                        forget_replica(&state, replica.id);
+                        log_info!(
+                            "Replication: Replica {} disconnected: this node is now a replica \
+                             itself",
+                            replica.addr
+                        );
+                    }
+                    if !socket_replicas.is_empty() {
+                        let n = socket_replicas.len();
+                        socket_replicas.clear();
+                        let _ = state.connected_replicas.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |c| Some((c - n as i64).max(0)),
+                        );
+                    }
                 }
                 HubMsg::Register(conn) => {
                     log_info!("Replication: Socket replica registered: {}", conn.addr);

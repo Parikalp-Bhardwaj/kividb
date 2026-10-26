@@ -78,6 +78,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A replica of a replica got one copy of the data and nothing after
+  (#144).** A replica took `PSYNC` from a node of its own, sent it its
+  dataset, and never passed on its master's writes, while the node
+  following it reported its link up. KiviDB does not chain replicas: a
+  replica now answers `PSYNC` and `SYNC` with `ERR this server is a replica,
+  and KiviDB does not chain replicas: replicate from its master instead`,
+  so the would-be replica's link stays down, and says why in its log. A
+  master made a replica (`REPLICAOF host port`) lets go of the replicas it
+  had, rather than keep them connected with nothing to send them.
+
 - **A script on a cluster node could write a key another node owns (#153).**
   `redis.call` was not routed: a script given a key of its own node could
   `SET` one of another node's slots, and the key was stored here, where no
