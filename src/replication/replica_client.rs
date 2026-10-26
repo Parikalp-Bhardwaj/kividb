@@ -453,11 +453,14 @@ async fn run_replication_session(
     // ── Phase 0: AUTH, when the master requires it ───────────────────────
     let (master_user, master_auth) = repl_state.master_credentials();
     if !master_auth.is_empty() {
-        let mut parts = vec!["AUTH"];
-        if !master_user.is_empty() {
-            parts.push(&master_user);
-        }
-        parts.push(&master_auth);
+        // As the default user when no user is given: `AUTH <password>`
+        // is refused by a master that has no password (#135).
+        let user = if master_user.is_empty() {
+            "default"
+        } else {
+            master_user.as_str()
+        };
+        let parts = vec!["AUTH", user, master_auth.as_str()];
         send_command(&mut writer, &parts).await?;
         let reply = guarded(
             read_line(&mut reader),

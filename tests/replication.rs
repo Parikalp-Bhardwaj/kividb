@@ -677,6 +677,36 @@ fn wait_link_up(c: &mut Conn) {
     });
 }
 
+/// A replica given a `masterauth` still replicates a master that has no
+/// password, and one that has that password. `AUTH <password>` is refused
+/// where no password is set (#135): the replica logs in as the default user
+/// by name.
+#[test]
+fn test_masterauth_works_with_and_without_a_password_on_the_master() {
+    for master_pass in ["", "s3cret"] {
+        let master = spawn_server(Config {
+            requirepass: master_pass.to_string(),
+            ..Default::default()
+        });
+        let replica = spawn_server(Config {
+            masterauth: "s3cret".to_string(),
+            ..replica_of(master)
+        });
+        let mut r = Conn::connect(replica);
+        wait_link_up(&mut r);
+        let mut m = Conn::connect(master);
+        if !master_pass.is_empty() {
+            assert!(m.cmds(&["AUTH", master_pass]).is_ok());
+        }
+        assert!(m.cmds(&["SET", "auth:k", "v"]).is_ok());
+        wait_until(
+            "the replica to have auth:k",
+            Duration::from_secs(10),
+            || r.cmds(&["GET", "auth:k"]) == RespValue::Bulk(b"v".to_vec()),
+        );
+    }
+}
+
 /// On a replica, WATCH sees the writes its master sends: an EXEC after the
 /// master changed a watched key runs nothing. It ran (#159).
 #[test]
