@@ -187,6 +187,11 @@ static LUA_HOLD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 /// Unix ms at which the script now holding the VM took it.
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the script now holding the VM has written. `SCRIPT KILL` comes
+/// from another client, on another thread, and the script's own note of it
+/// is in its thread's [`SCRIPT_EVAL`]: read there, it was always no, and a
+/// script that had written was answered OK and ran on (#129).
+static LUA_HOLDER_WROTE: AtomicBool = AtomicBool::new(false);
 /// Bytes the functions' VM held when it was last let go: `INFO`'s
 /// `used_memory_vm_functions`, read without waiting for a running script.
 static FUNCTIONS_VM_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -813,6 +818,7 @@ where
     let prev = LUA_HOLD_DEPTH.fetch_add(1, Ordering::SeqCst);
     if prev == 0 {
         LUA_SCRIPT_STARTED_MS.store(crate::replication::unix_ms(), Ordering::Relaxed);
+        LUA_HOLDER_WROTE.store(false, Ordering::SeqCst);
         LUA_SCRIPT_BUSY_OTHERS.store(true, Ordering::SeqCst);
     }
     struct OuterDepth;
@@ -980,6 +986,10 @@ pub(crate) fn script_note_successful_write() {
             se.wrote = true;
         }
     });
+    // The script holding the shared VM: for `SCRIPT KILL`, from elsewhere.
+    if EXEC_LUA.with(|c| c.borrow().is_some()) {
+        LUA_HOLDER_WROTE.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Commands that run or compile the Lua VM for long stretches — must not block a Tokio worker
@@ -1099,8 +1109,7 @@ fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
         return resp_error("ERR No scripts in execution.");
     }
-    let wrote = SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| s.wrote).unwrap_or(false));
-    if wrote {
+    if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
             "UNKILLABLE Sorry the script already executed write commands against the dataset.",
         );

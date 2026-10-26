@@ -1216,6 +1216,43 @@ impl V {
 
 // ── Scripts ───────────────────────────────────────────────────────────────────
 
+/// `SCRIPT KILL` does not stop a script that has written: half its writes
+/// would stay. It is answered UNKILLABLE, as in Redis, and the script runs
+/// on; it was answered OK and ran on all the same (#129).
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_written_is_unkillable() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SET', 'w', '1') while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["GET", "w"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("UNKILLABLE"),
+        "{reply:?}"
+    );
+    // It runs on: the server is still busy with it.
+    let reply = c.cmd(&["PING"]);
+    assert!(reply.is_err() && reply.s().starts_with("BUSY"), "{reply:?}");
+}
+
 /// While a script runs, other clients wait for it; once it has overrun
 /// `lua-time-limit` they are told BUSY — and SCRIPT KILL still gets through
 /// to stop it. (A process of its own: the script engine, and its time limit,
