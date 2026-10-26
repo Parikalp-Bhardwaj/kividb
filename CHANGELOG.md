@@ -58,6 +58,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`AUTH <password>` is refused when no password is set, as in Redis
+  (#135).** With the `default` user open (no `requirepass`), `AUTH` with a
+  password replied `OK`; it now replies `ERR AUTH <password> called without
+  any password configured for the default user. Are you sure your
+  configuration is correct?`, which is how a client learns that the
+  password it was given is not in use. `AUTH default <password>` still logs
+  in. A client configured with a password for a server that has none now
+  gets this error when it connects.
+
 - **`CONFIG SET` refuses what it cannot set, as Redis does (#143).** A name
   that is neither KiviDB's nor Redis's (`bogus-name`, a misspelling) gets
   `ERR Unknown option or number of arguments for CONFIG SET`; it was taken,

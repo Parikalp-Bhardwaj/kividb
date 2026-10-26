@@ -1857,6 +1857,10 @@ pub async fn handle_client(
                     // nopass users authenticate with any password.
                     if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
+                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
+                        // As Redis: how a client learns that the password it
+                        // was given is not in use. It was answered OK (#135).
+                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
                     } else {
                         let (provided_username, provided_password) = if cmd.len() >= 3 {
                             // AUTH username password

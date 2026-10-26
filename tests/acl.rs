@@ -1003,14 +1003,22 @@ fn test_ping_requires_auth() {
     assert!(result.error_str().contains("NOAUTH"));
 }
 
+/// With no password set, `AUTH <password>` is Redis's error: how a client
+/// finds out that the password it was given is not in use. It was OK (#135).
+/// `AUTH default <anything>` logs in, as a `nopass` user does in Redis.
 #[test]
-fn test_auth_no_password_set_always_ok() {
+fn test_auth_password_when_none_is_set_is_an_error() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // When no requirepass is set, AUTH always succeeds
-    assert!(c.cmds(&["AUTH", "anything"]).is_ok());
+    assert_eq!(
+        c.cmds(&["AUTH", "anything"]).error_str(),
+        "ERR AUTH <password> called without any password configured for the default user. \
+         Are you sure your configuration is correct?"
+    );
+    assert!(c.cmds(&["AUTH", "default", "anything"]).is_ok());
+    assert!(c.cmds(&["PING"]).as_str() == "PONG");
 }
 
 #[test]
