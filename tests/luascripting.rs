@@ -485,6 +485,62 @@ fn redis_function_dump_payloads_restore_and_run() {
     }
 }
 
+/// As Redis 7.4: past 500 scripts sent only with `EVAL`, the least recently
+/// used goes, counted in `evicted_scripts`; a `SCRIPT LOAD`ed one stays. The
+/// cache grew for ever (#155).
+#[test]
+fn the_script_cache_keeps_500_scripts_sent_with_eval() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let stat = |c: &mut Conn, section: &str, name: &str| -> i64 {
+        let info = c.cmds(&["INFO", section]);
+        info.as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(c.cmds(&["SCRIPT", "FLUSH"]).as_str(), "OK");
+    let evicted_before = stat(&mut c, "stats", "evicted_scripts");
+    let loaded = c.cmds(&["SCRIPT", "LOAD", "return 'loaded'"]);
+    let loaded = loaded.as_str().to_string();
+    let first = c.cmds(&["SCRIPT", "LOAD", "return 0"]).as_str().to_string();
+    c.cmds(&["EVAL", "return 0", "0"]);
+    for i in 1..=600 {
+        c.cmds(&["EVAL", &format!("return {i}"), "0"]);
+        if i == 300 {
+            // Used again: the most recent, and kept.
+            c.cmds(&["EVAL", "return 1", "0"]);
+        }
+    }
+    c.cmds(&["EVAL", "return 1", "0"]);
+    assert_eq!(stat(&mut c, "memory", "number_of_cached_scripts"), 502);
+    assert_eq!(
+        stat(&mut c, "stats", "evicted_scripts") - evicted_before,
+        100
+    );
+    let exists = c.cmds(&[
+        "SCRIPT",
+        "EXISTS",
+        &loaded,
+        &first,
+        // `return 1`, `return 2`
+        "e0e1f9fabfc9d4800c877a703b823ac0578ff8db",
+        "7f923f79fe76194c868d7e1d0820de36700eb649",
+    ]);
+    let RespValue::Array(exists) = exists else {
+        panic!("{exists:?}")
+    };
+    let exists: Vec<i64> = exists.iter().map(|v| v.as_int()).collect();
+    // The loaded ones stay (`return 0` was loaded before EVAL sent it); the
+    // one used again stays; one of the oldest went.
+    assert_eq!(exists, [1, 1, 1, 0], "{exists:?}");
+}
+
 #[test]
 fn a_redis_function_dump_with_two_libraries_restores_both() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();

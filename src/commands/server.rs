@@ -3438,6 +3438,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "evicted_keys:{}\r\n",
                     crate::stats::EVICTED_KEYS.load(Ordering::Relaxed)
                 ));
+                out.push_str(&format!(
+                    "evicted_scripts:{}\r\n",
+                    crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
+                ));
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();

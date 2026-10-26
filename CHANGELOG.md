@@ -120,6 +120,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **The script cache had no limit (#155).** Every distinct script sent with
+  `EVAL` stayed cached until `SCRIPT FLUSH`, so a client that wrote its
+  values into the script (rather than passing them as arguments) grew it for
+  ever: 20,000 such `EVAL`s left 20,012 scripts and 4.6 MB. As in Redis 7.4,
+  the cache keeps 500 scripts sent only with `EVAL`, letting the least
+  recently used go (`EVAL` or `EVALSHA` of one counts as a use), and counts
+  them in `evicted_scripts` in `INFO stats`. Scripts loaded with
+  `SCRIPT LOAD` are not counted and stay.
+
 - **Scripts: `redis.log` writes to the log; `redis.replicate_commands()` and
   `redis.set_repl()` exist (#154).** `redis.log` did nothing; it now writes
   its arguments, joined by spaces, at Redis's level for it (`LOG_WARNING`
