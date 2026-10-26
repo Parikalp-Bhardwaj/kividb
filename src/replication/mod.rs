@@ -2515,7 +2515,12 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // `READONLY You can't write against a read only replica.` back, so it
         // could not even read. Redis allows SELECT on a replica.
         "SELECT" => false,
-        "EVAL" | "EVALSHA" | "FCALL" => true,
+        // As Redis: a script runs on a replica, and a write it makes is
+        // refused there (`run_from_script`). One that declares it may write
+        // (a shebang without `no-writes`, a function without it) is refused
+        // before it runs. Every script was, the ones that only read too
+        // (#145).
+        "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
         // MIGRATE removes keys from this node.
         "MIGRATE" => true,
@@ -2541,6 +2546,27 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
             )
         }
         _ => is_write_command(name),
+    }
+}
+
+/// Whether `EVAL`, `EVALSHA` or `FCALL` runs something that has declared it
+/// may write. See [`is_denied_on_readonly_replica`].
+fn script_may_write(name: &str, cmd: &[&[u8]]) -> bool {
+    #[cfg(feature = "lua")]
+    {
+        let Some(target) = cmd.get(1) else {
+            return false;
+        };
+        match name {
+            "EVAL" => crate::commands::script_declares_writes(target),
+            "EVALSHA" => crate::commands::cached_script_declares_writes(target),
+            _ => !crate::commands::function_declares_no_writes(target),
+        }
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        let _ = (name, cmd);
+        false
     }
 }
 

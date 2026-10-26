@@ -39,6 +39,21 @@ pub(crate) fn script_declares_no_writes(source: &[u8]) -> bool {
         })
 }
 
+/// Whether a script says it may write: a shebang without `no-writes`. One
+/// with no shebang says nothing, and runs on a replica until it writes.
+pub(crate) fn script_declares_writes(source: &[u8]) -> bool {
+    source.starts_with(b"#!") && !script_declares_no_writes(source)
+}
+
+/// [`script_declares_writes`] of the cached script with this SHA1.
+pub(crate) fn cached_script_declares_writes(sha: &[u8]) -> bool {
+    let sha = String::from_utf8_lossy(sha).to_ascii_lowercase();
+    script_store()
+        .read()
+        .get(&sha)
+        .is_some_and(|source| script_declares_writes(source.as_bytes()))
+}
+
 /// The same, of the cached script with this SHA1.
 pub(crate) fn cached_script_declares_no_writes(sha: &[u8]) -> bool {
     let sha = String::from_utf8_lossy(sha).to_ascii_lowercase();
