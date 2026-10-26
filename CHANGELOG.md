@@ -78,6 +78,13 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`MEMORY USAGE key SAMPLES 0` panicked (#151).** On a hash, a set or a
+  sorted set it divided by zero: the worker thread panicked and the
+  client's connection closed. `SAMPLES 0` now looks at every element, as
+  in Redis and as `MEMORY HELP` says; a count that is not a number is an
+  error rather than a silent 5, a negative one or an option other than
+  `SAMPLES` a syntax error.
+
 - **An AOF turned on at runtime grew for ever (#146).** The thread that
   rewrites the append-only file once it passes `auto-aof-rewrite-min-size`
   and grows by `auto-aof-rewrite-percentage` was started only by a server
