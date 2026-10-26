@@ -79,6 +79,7 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::protected_mode::set(cfg.protected_mode);
     crate::stats::record_save();
+    crate::commands::memory::note_startup();
     let started_at = std::time::Instant::now();
 
     tokio::runtime::Builder::new_multi_thread()

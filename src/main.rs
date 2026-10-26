@@ -376,6 +376,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     commands::backup::recover(&config);
     // `LASTSAVE` until the first save: the start, as in Redis (#149).
     stats::record_save();
+    crate::commands::memory::note_startup();
 
     #[cfg(target_os = "linux")]
     match config.io_model {
