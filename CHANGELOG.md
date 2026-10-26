@@ -120,6 +120,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Search: synonym groups had no effect (#130).** `FT.SYNUPDATE` kept its
+  groups, and `FT.SEARCH` for one term of a group did not find documents with
+  another. As in RediSearch, a query term now matches every term of the
+  groups it is in, in documents indexed before the group was made as well as
+  after. A quoted phrase is matched as written.
+
 - **Vector sets: `VSIM ... FILTER` filters; `REDUCE` is refused; `VINFO`
   says how vectors are kept (#132).** `FILTER` was taken and ignored, so an
   application that filtered by attribute got elements that did not match. It
