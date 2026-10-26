@@ -1265,6 +1265,14 @@ pub async fn handle_client(
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
             // connection stays a client until it asks again.
+            // A replica does not take replicas of its own (#144).
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+                combined.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::replication::NOT_A_MASTER,
+                ));
+                parse_offset += consumed;
+                continue;
+            }
             if cmd_name == "PSYNC"
                 && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
             {
