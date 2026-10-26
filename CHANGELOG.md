@@ -120,6 +120,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`SCRIPT KILL` replied `OK` to a script that had written, which ran on
+  (#129).** It looked for the script's writes on the thread of the client
+  that sent it, where there were none, so it answered `OK`; the script,
+  knowing it had written, carried on, and the server stayed `BUSY`. As in
+  Redis, it now answers `UNKILLABLE Sorry the script already executed write
+  commands against the dataset.`, and `SHUTDOWN NOSAVE` is the way out.
+  `FUNCTION KILL` is the same.
+
 - **`ACL GENPASS` with 1 to 4 bits returned an empty password (#140).** It
   gives a hex digit per 4 bits, as Redis does: one digit for 1 to 4 bits,
   three for 9 to 12. Whole bytes were taken, so under 8 bits gave none, and
