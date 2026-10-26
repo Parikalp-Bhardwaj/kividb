@@ -681,8 +681,12 @@ pub struct IndexDef {
     /// back out when a field is written again or the document goes. Without
     /// it nothing was: an update added a document's words again, a delete
     /// left them counted, and BM25 scores drifted until a restart (#162).
-    pub forward: Arc<RwLock<AHashMap<String, AHashMap<String, Vec<String>>>>>,
+    pub forward: Arc<RwLock<ForwardIndex>>,
 }
+
+/// By document key, by TEXT field: the words it put in (see
+/// [`IndexDef::forward`]).
+pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
 
 impl IndexDef {
     /// Make `tokens` — stopwords already left out — what TEXT field `field`
