@@ -771,20 +771,23 @@ impl IndexDef {
                 }
             }
         }
+        // Only changed here, under the forward index's lock: a load and a
+        // store do not race.
         match (old_total > 0, new_total > 0) {
             (false, true) => {
                 self.doc_count.fetch_add(1, Relaxed);
             }
             (true, false) => {
-                let _ = self
-                    .doc_count
-                    .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1)));
+                let n = self.doc_count.load(Relaxed);
+                self.doc_count.store(n.saturating_sub(1), Relaxed);
             }
             _ => {}
         }
-        let _ = self.total_tokens.fetch_update(Relaxed, Relaxed, |n| {
-            Some(n.saturating_sub(old_total).saturating_add(new_total))
-        });
+        let tokens = self.total_tokens.load(Relaxed);
+        self.total_tokens.store(
+            tokens.saturating_sub(old_total).saturating_add(new_total),
+            Relaxed,
+        );
         if !new.is_empty() {
             forward.insert(key.to_string(), new);
         }

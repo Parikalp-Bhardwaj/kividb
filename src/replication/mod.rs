@@ -1550,11 +1550,12 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     if !socket_replicas.is_empty() {
                         let n = socket_replicas.len();
                         socket_replicas.clear();
-                        let _ = state.connected_replicas.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |c| Some((c - n as i64).max(0)),
-                        );
+                        let before = state
+                            .connected_replicas
+                            .fetch_sub(n as i64, Ordering::Relaxed);
+                        if before < n as i64 {
+                            state.connected_replicas.store(0, Ordering::Relaxed);
+                        }
                     }
                 }
                 HubMsg::Register(conn) => {

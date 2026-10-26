@@ -1273,7 +1273,7 @@ pub async fn handle_client(
             // connection stays a client until it asks again.
             // A replica does not take replicas of its own (#144).
             if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
-                combined.extend_from_slice(&crate::resp::write::resp_error(
+                out_buf.extend_from_slice(&crate::resp::write::resp_error(
                     crate::replication::NOT_A_MASTER,
                 ));
                 parse_offset += consumed;
