@@ -278,9 +278,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             } else {
                 256
             };
-            let byte_count = bits / 8;
-            let random_bytes: Vec<u8> = (0..byte_count).map(|_| rand::random::<u8>()).collect();
-            let hex: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            // A hex digit per 4 bits, as Redis gives them: 1 to 4 bits are one
+            // digit. Whole bytes were taken, none for under 8 bits, and the
+            // password was empty (#140).
+            let digits = bits.div_ceil(4);
+            let random_bytes: Vec<u8> = (0..digits.div_ceil(2))
+                .map(|_| rand::random::<u8>())
+                .collect();
+            let mut hex: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            hex.truncate(digits);
             Some(resp_bulk_str(&hex))
         }
 

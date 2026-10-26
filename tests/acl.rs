@@ -2111,3 +2111,27 @@ fn acl_help_and_command_s_unknown_subcommand() {
         "ERR unknown subcommand 'NOPE'. Try COMMAND HELP."
     );
 }
+
+/// `ACL GENPASS bits` gives a hex digit per 4 bits, as Redis does: 1 to 4
+/// bits gave an empty password (#140).
+#[test]
+fn acl_genpass_gives_a_digit_per_four_bits() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for (bits, digits) in [
+        (1, 1),
+        (4, 1),
+        (5, 2),
+        (8, 2),
+        (9, 3),
+        (256, 64),
+        (4096, 1024),
+    ] {
+        let pass = c.cmds(&["ACL", "GENPASS", &bits.to_string()]);
+        let pass = pass.as_str();
+        assert_eq!(pass.len(), digits, "{bits} bits: {pass:?}");
+        assert!(pass.chars().all(|ch| ch.is_ascii_hexdigit()), "{pass:?}");
+    }
+    assert_eq!(c.cmds(&["ACL", "GENPASS"]).as_str().len(), 64);
+}

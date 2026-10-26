@@ -120,6 +120,11 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`ACL GENPASS` with 1 to 4 bits returned an empty password (#140).** It
+  gives a hex digit per 4 bits, as Redis does: one digit for 1 to 4 bits,
+  three for 9 to 12. Whole bytes were taken, so under 8 bits gave none, and
+  an empty password matches an empty `AUTH`.
+
 - **`CLUSTER REPLICAS` and `CLUSTER SLAVES` reply with an array (#138).**
   They replied with one string, the replicas' lines joined by newlines; now,
   as in Redis, one bulk string per replica in the `CLUSTER NODES` line
