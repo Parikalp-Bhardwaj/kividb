@@ -799,6 +799,30 @@ fn replica_follows_its_master_and_serves_reads_after_readonly() {
     // Replicas do not count toward the cluster's size.
     assert_eq!(master.cluster_info("cluster_size"), "2");
 
+    // An array with a `CLUSTER NODES` line per replica, as in Redis; it was
+    // one string (#138). A master without replicas has an empty one.
+    let replicas = master.conn().cmd(&["CLUSTER", "REPLICAS", &master.id()]);
+    assert_eq!(replicas.array().len(), 1, "{replicas:?}");
+    let line = replicas.array()[0].text();
+    assert!(
+        line.starts_with(&replica.id()) && !line.ends_with('\n'),
+        "{line:?}"
+    );
+    let none = master.conn().cmd(&["CLUSTER", "SLAVES", &nodes[1].id()]);
+    assert!(none.array().is_empty(), "{none:?}");
+
+    // Busiest slot first by default, as in Redis; it was the emptiest (#139).
+    let stats = master.conn().cmd(&[
+        "CLUSTER",
+        "SLOT-STATS",
+        "ORDERBY",
+        "key-count",
+        "LIMIT",
+        "1",
+    ]);
+    let top = &stats.array()[0].array();
+    assert_eq!(top[0].int(), slot_of(&key) as i64, "{stats:?}");
+
     // Without READONLY, the replica redirects to its master.
     let mut c = replica.conn();
     let reply = c.cmd(&["GET", &key]);
