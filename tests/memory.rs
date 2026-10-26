@@ -229,6 +229,29 @@ fn test_tables_shrink_after_most_keys_are_deleted() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+/// `SAMPLES 0` is every element, as in Redis: it divided by zero for a
+/// hash, a set and a sorted set, and the worker panicked and the
+/// connection closed (#151). A count that is not a number is an error.
+#[test]
+fn test_memory_usage_samples_zero_is_every_element() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmd(&["HSET", "h", "a", "1", "b", "2"]);
+    c.cmd(&["SADD", "s", "a", "b"]);
+    c.cmd(&["ZADD", "z", "1", "a", "2", "b"]);
+    c.cmd(&["RPUSH", "l", "a", "b"]);
+    for key in ["h", "s", "z", "l"] {
+        let all = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).as_int();
+        assert!(all > 0, "{key}: {all}");
+    }
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "SAMPLES", "x"]).is_error());
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "SAMPLES", "-1"]).is_error());
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "BOGUS", "1"]).is_error());
+    // The connection is still there.
+    assert!(matches!(c.cmd(&["PING"]), RespValue::SimpleStr(s) if s == "PONG"));
+}
+
 // MEMORY USAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 

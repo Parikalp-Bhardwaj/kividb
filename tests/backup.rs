@@ -255,6 +255,121 @@ fn copy_backup(c: &mut Conn, to: &Path) -> PathBuf {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Two keys on different shards, as the server will lay them out.
+fn keys_on_two_shards() -> (String, String) {
+    let shards = kividb::store::num_shards();
+    let first = "pair:0".to_string();
+    let other = (1..10_000)
+        .map(|i| format!("pair:{i}"))
+        .find(|k| {
+            kividb::store::shard_index(shards, k) != kividb::store::shard_index(shards, &first)
+        })
+        .expect("a key on another shard");
+    (first, other)
+}
+
+fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
+    match snapshot.dbs[0].get(key) {
+        Some(kividb::types::KiviDBValue::String(b)) => {
+            std::str::from_utf8(b.as_ref()).unwrap().parse().unwrap()
+        }
+        None => 0,
+        Some(_) => panic!("{key} is not a string"),
+    }
+}
+
+/// An AOF turned on with `CONFIG SET appendonly yes` is rewritten on its
+/// own once it has grown, as one turned on at startup is. It grew until the
+/// next restart (#146).
+#[test]
+fn an_aof_turned_on_at_runtime_is_rewritten_on_its_own() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-min-size", "1024"])
+            .ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-percentage", "10"])
+            .ok()
+    );
+    for i in 0..2000 {
+        assert!(c.cmd(&["SET", &format!("key:{i}"), &"x".repeat(50)]).ok());
+    }
+    let aof = server.dir.join("appendonly.aof");
+    let grown = std::fs::metadata(&aof).unwrap().len();
+    assert!(grown > 100_000, "the log should have grown: {grown} bytes");
+    // The check runs every 10 seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&aof).unwrap().len() >= grown {
+        assert!(
+            Instant::now() < deadline,
+            "appendonly.aof was never rewritten"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 2000);
+}
+
+/// A snapshot is the dataset at one moment, with the AOF off as with it on:
+/// a transaction that changes two keys on two shards is in it whole or not
+/// at all. With the AOF off it was copied a shard at a time, and a SAVE
+/// could keep half of one (#148).
+#[test]
+fn a_snapshot_never_holds_half_a_transaction() {
+    for aof in [false, true] {
+        let server = Server::start(if aof { &["--aof"] } else { &[] });
+        let (a, b) = keys_on_two_shards();
+        // Enough keys that copying the dataset takes a while, for a
+        // transaction to land in the middle of it.
+        let mut fill = server.conn();
+        for batch in 0..100 {
+            let mut args = vec!["MSET".to_string()];
+            for i in 0..2000 {
+                args.push(format!("fill:{batch}:{i}"));
+                args.push("x".repeat(32));
+            }
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            assert!(fill.cmd(&refs).ok());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, a, b) = (Arc::clone(&stop), a.clone(), b.clone());
+            let mut c = server.conn();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(c.cmd(&["MULTI"]).ok());
+                    c.cmd(&["INCR", &a]);
+                    c.cmd(&["INCR", &b]);
+                    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 2);
+                }
+            })
+        };
+        let mut c = server.conn();
+        // BGSAVE: it copies the dataset on a thread of its own, beside the
+        // commands (SAVE is a command, and a transaction waits for it).
+        for _ in 0..15 {
+            assert!(!c.cmd(&["BGSAVE"]).is_err());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !c
+                .cmd(&["INFO", "persistence"])
+                .s()
+                .contains("rdb_bgsave_in_progress:0")
+            {
+                assert!(Instant::now() < deadline, "BGSAVE did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let path = server.dir.join("dump.kdb");
+            let snapshot = kividb::snapshot::load_snapshot(path.to_str().unwrap()).unwrap();
+            let (x, y) = (counter(&snapshot, &a), counter(&snapshot, &b));
+            assert_eq!(x, y, "aof {aof}: the snapshot holds half a transaction");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+}
+
 /// A backup taken while writes are running restores to the dataset as it was
 /// at SEAL: everything before START, everything between START and SEAL, and
 /// nothing after — with no write counted twice and none half-applied.

@@ -586,7 +586,8 @@ pub async fn handle_client(
     let mut out_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut spare_buf: Vec<u8> = Vec::with_capacity(65536);
     // Push channel for out-of-band invalidation messages (CLIENT TRACKING).
-    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let (push_tx, mut push_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
     client_registry.register_push_tx(client_id, push_tx.clone());
 
     // Out-of-band pushes (CLIENT TRACKING invalidations, RESP3 pub/sub
@@ -1228,6 +1229,11 @@ pub async fn handle_client(
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
                     acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
+                    // for a command refused for any other reason (#159).
+                    if tx.active {
+                        tx.aborted = true;
+                    }
                     out_buf
                         .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
                     parse_offset += consumed;
@@ -1265,6 +1271,14 @@ pub async fn handle_client(
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
             // connection stays a client until it asks again.
+            // A replica does not take replicas of its own (#144).
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+                out_buf.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::replication::NOT_A_MASTER,
+                ));
+                parse_offset += consumed;
+                continue;
+            }
             if cmd_name == "PSYNC"
                 && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
             {
@@ -1482,6 +1496,10 @@ pub async fn handle_client(
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
                         let _alone = crate::command_gate::enter_alone();
+                        // And as one write: a snapshot, a backup or a full sync cuts
+                        // before it or after it, never between two of its commands
+                        // (#148). The writes it runs are inside this one.
+                        let _whole = crate::write_gate::enter();
                         if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys

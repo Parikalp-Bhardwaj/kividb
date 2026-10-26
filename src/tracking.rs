@@ -273,8 +273,25 @@ pub fn tell(
             if !before {
                 target.activity.push_after_reply(&frame);
             }
-        } else if let Some(tx) = &target.push_tx {
-            let _ = tx.try_send(frame);
+        } else if let Some(tx) = &target.push_tx
+            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(frame)
+        {
+            // Dropped, the message would leave the client serving a key that
+            // has changed, with nothing to tell it so (#161). Closing the
+            // connection makes it drop what it cached, as a client does when
+            // it loses its connection; Redis closes one whose output buffer
+            // passed its limit the same way.
+            // Throttled: until the connection is gone, every write it is told
+            // of finds the queue full again.
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "Client id={} closed: it uses client-side caching and did not read its \
+                 invalidation messages, over {} waiting",
+                target.id,
+                tx.max_capacity()
+            );
+            registry.kill(target.id);
         }
     };
     let (target, redirected) = match info.tracking_redirect {

@@ -13,7 +13,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 fn publish(ctx: &mut Ctx, shard: bool) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
-        return resp_error("ERR wrong number of arguments for 'publish' command");
+        let name = if shard { "spublish" } else { "publish" };
+        return resp_error(&format!(
+            "ERR wrong number of arguments for '{name}' command"
+        ));
     }
     let channel = match std::str::from_utf8(ctx.cmd[1]) {
         Ok(s) => s,

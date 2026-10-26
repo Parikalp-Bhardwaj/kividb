@@ -677,6 +677,79 @@ fn wait_link_up(c: &mut Conn) {
     });
 }
 
+/// On a replica, WATCH sees the writes its master sends: an EXEC after the
+/// master changed a watched key runs nothing. It ran (#159).
+#[test]
+fn test_watch_on_a_replica_sees_its_masters_writes() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "w", "1"]).is_ok());
+    wait_until("the replica to have w", Duration::from_secs(10), || {
+        r.cmds(&["GET", "w"]) == RespValue::Bulk(b"1".to_vec())
+    });
+    assert!(r.cmds(&["WATCH", "w"]).is_ok());
+    assert!(m.cmds(&["SET", "w", "from-master"]).is_ok());
+    wait_until(
+        "the replica to have the new w",
+        Duration::from_secs(10),
+        || {
+            let mut probe = Conn::connect(replica);
+            probe.cmds(&["GET", "w"]) == RespValue::Bulk(b"from-master".to_vec())
+        },
+    );
+    assert!(r.cmds(&["MULTI"]).is_ok());
+    r.cmds(&["GET", "w"]);
+    assert_eq!(r.cmds(&["EXEC"]), RespValue::Nil);
+}
+
+/// A replica does not take replicas of its own. One that did sent its data
+/// once and nothing after, while the replica of it reported its link up
+/// (#144). It now says why, and the would-be replica's link stays down; a
+/// master made a replica lets go of the replicas it had.
+#[test]
+fn test_a_replica_refuses_replicas_of_its_own() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+
+    let mut psync = Conn::connect(replica);
+    let reply = psync.cmds(&["PSYNC", "?", "-1"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e.contains("does not chain replicas")),
+        "PSYNC to a replica: {reply:?}"
+    );
+
+    let sub = spawn_server(replica_of(replica));
+    let mut s = Conn::connect(sub);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        repl_info(&mut s, "master_link_status").as_deref(),
+        Some("down")
+    );
+    assert_eq!(repl_info(&mut r, "connected_slaves"), None);
+
+    // A master with a replica, made a replica itself: the replica it had is
+    // let go, and its link goes down rather than staying up with nothing in it.
+    let other = spawn_server(Config::default());
+    let follower = spawn_server(replica_of(other));
+    let mut f = Conn::connect(follower);
+    wait_link_up(&mut f);
+    let mut o = Conn::connect(other);
+    assert!(
+        o.cmds(&["REPLICAOF", "127.0.0.1", &master.to_string()])
+            .is_ok()
+    );
+    wait_until(
+        "the follower's link to go down",
+        Duration::from_secs(10),
+        || repl_info(&mut f, "master_link_status").as_deref() == Some("down"),
+    );
+}
+
 /// Link liveness, the reported symptom: a replica must not say its link is up when
 /// it has no working connection to the master. Following a master that cannot
 /// be reached at all, the node is a read-only replica with the link down from

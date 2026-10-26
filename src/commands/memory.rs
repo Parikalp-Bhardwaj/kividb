@@ -76,19 +76,23 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => return Some(resp_error("ERR key must be valid UTF-8")),
     };
 
-    // Parse optional SAMPLES count
-    let samples = if cmd.len() >= 5 {
-        let opt = String::from_utf8_lossy(cmd[3]).to_ascii_uppercase();
-        if opt == "SAMPLES" {
-            std::str::from_utf8(cmd[4])
+    // `SAMPLES count`, as Redis reads it: how many elements of a collection
+    // are looked at, 5 by default; 0 is all of them. It divided by zero for
+    // a hash, set or sorted set, and the worker panicked (#151).
+    let samples = match &cmd[3..] {
+        [] => 5,
+        [opt, count] if opt.eq_ignore_ascii_case(b"SAMPLES") => {
+            match std::str::from_utf8(count)
                 .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(5)
-        } else {
-            5
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                None => return Some(resp_error("ERR value is not an integer or out of range")),
+                Some(n) if n < 0 => return Some(resp_error("ERR syntax error")),
+                Some(0) => usize::MAX,
+                Some(n) => n as usize,
+            }
         }
-    } else {
-        5
+        _ => return Some(resp_error("ERR syntax error")),
     };
 
     let db = &ctx.store[*ctx.selected_db];

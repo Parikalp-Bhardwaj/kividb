@@ -86,6 +86,105 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Search: scores drifted, `DD` kept the documents, KNN was ignored in
+  `FT.AGGREGATE` (#162).**
+  - BM25 counted every write of a TEXT field as a new document, and a
+    delete took nothing away: after documents came and went, a word's
+    rarity and the average length were wrong, and one document's score for
+    a word fell a hundredfold after 200 others were added and deleted. A
+    field written again also still matched the words it had held. What
+    each document's TEXT fields contribute is now kept, and taken back out
+    when a field is written again or the document goes; a delete no longer
+    walks every posting list to find its words.
+  - `FT.DROPINDEX index DD` deletes the documents the index covered, as in
+    Redis; they were kept.
+  - A KNN clause in `FT.AGGREGATE` (`*=>[KNN 10 @v $q AS d]`) keeps the
+    nearest `k` of what the filter left, exactly, with the distance under
+    its name for `LOAD`, `SORTBY` or `GROUPBY`, and in a cluster the
+    nearest of every master's; it was dropped, and every document went on.
+
+- **A JSON document from Redis 8 made a whole snapshot unreadable (#157).**
+  RedisJSON 8 saves an array of numbers all of one kind as a CBOR typed
+  array (RFC 8746): `[1, 2]` as 8-bit integers, `[1.5, 2.5]` as half
+  floats. The reader took them for byte strings, `CBOR byte strings have
+  no JSON form`, and refused the file: a `dump.rdb` copied from Redis 8.10,
+  a `--preload-file`, or a replica's full sync from a Redis 8.10 master
+  loaded nothing, and `MIGRATE` of such a document failed with
+  `ERR Bad data format`. Typed arrays of every width and byte order are
+  read.
+
+- **`MEMORY USAGE key SAMPLES 0` panicked (#151).** On a hash, a set or a
+  sorted set it divided by zero: the worker thread panicked and the
+  client's connection closed. `SAMPLES 0` now looks at every element, as
+  in Redis and as `MEMORY HELP` says; a count that is not a number is an
+  error rather than a silent 5, a negative one or an option other than
+  `SAMPLES` a syntax error.
+
+- **An AOF turned on at runtime grew for ever (#146).** The thread that
+  rewrites the append-only file once it passes `auto-aof-rewrite-min-size`
+  and grows by `auto-aof-rewrite-percentage` was started only by a server
+  that had the AOF on at startup; after `CONFIG SET appendonly yes`, the
+  file was never rewritten until a restart or a `BGREWRITEAOF`. It is now
+  started whatever the setting, and waits while the AOF is off.
+
+- **A snapshot could hold half a transaction (#148).** With the AOF off,
+  `BGSAVE` and the save at shutdown copied the dataset a shard at a time
+  while writes went on, so a `MULTI`/`EXEC`, a script or an `MSET` whose
+  keys were in two shards could be saved half applied; and with it on, a
+  checkpoint, a backup or a full sync could cut between two commands of
+  one `EXEC`. A snapshot is now the dataset at one moment with the AOF on
+  or off: it is captured with writes held, strings by reference, and
+  written while they go on, and `EXEC` is one write to every cut.
+
+- **A write of several keys could be seen half done (#159).** Keys are
+  spread over shards that threads work on at once, and only `MSET`,
+  `MSETNX` and `MGET` locked all of theirs together: a reader could find
+  a `DEL` of 200 keys with some gone and some not, a `RENAME` with neither
+  key there, a `SUNIONSTORE`, `SORT ... STORE` or `LMOVE` part way. In
+  Redis every command is one step. A write naming keys of more than one
+  shard now runs alone, as `EXEC` does: other commands wait for it, which
+  costs only those writes, not single-key ones or `MSET`.
+  And three transaction fixes:
+  - a command refused by ACL (`NOPERM`) inside `MULTI` aborts the
+    transaction, as any other refused command does: `EXEC` ran the rest;
+  - a write that changed nothing (`SET ... NX` on a key that exists, `SADD`
+    of a member there already, `EXPIRE` of a missing key) no longer fails
+    a `WATCH` on the key, as in Redis;
+  - on a replica, the writes its master sends fail a `WATCH`, as a client's
+    do; they did not.
+
+- **A client using client-side caching could be left serving changed keys
+  (#161).** Invalidations were queued for a connection with room for 512
+  (256 under io_uring), and one that found the queue full was dropped
+  without a trace: the client kept a value that had changed, and was never
+  told. The queue now holds 65536, which costs nothing until it is used,
+  and a client that falls further behind than that is closed, with a line
+  in the log, so that it drops what it cached, as Redis closes a client
+  past its output buffer limit. `SPUBLISH` with the wrong number of
+  arguments named `publish` in its error.
+
+- **A replica of a replica got one copy of the data and nothing after
+  (#144).** A replica took `PSYNC` from a node of its own, sent it its
+  dataset, and never passed on its master's writes, while the node
+  following it reported its link up. KiviDB does not chain replicas: a
+  replica now answers `PSYNC` and `SYNC` with `ERR this server is a replica,
+  and KiviDB does not chain replicas: replicate from its master instead`,
+  so the would-be replica's link stays down, and says why in its log. A
+  master made a replica (`REPLICAOF host port`) lets go of the replicas it
+  had, rather than keep them connected with nothing to send them.
+
+- **A script on a cluster node could write a key another node owns (#153).**
+  `redis.call` was not routed: a script given a key of its own node could
+  `SET` one of another node's slots, and the key was stored here, where no
+  client would look for it, and copied to this node's replicas and
+  snapshot. As in Redis, a script now uses only keys this node serves
+  (`ERR Script attempted to access a non local key in a cluster node`),
+  and, unless it is flagged `allow-cross-slot-keys`, only keys in its own
+  slot: that of its first key, or of the first key it uses
+  (`ERR Script attempted to access keys that do not hash to the same
+  slot`). The flag, on a script's first line or a function, was accepted
+  and ignored; it now does what it does in Redis.
+
 - **Memory of deleted keys' table slots was never given back (#113).** A
   shard's hash table, of values and of expiry times, grew as keys came and
   kept its size as they went: after a reshard moved half the keys away, or

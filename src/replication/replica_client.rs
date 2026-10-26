@@ -1071,7 +1071,7 @@ async fn run_replication_session(
                             config,
                             compaction_tx,
                             &mut selected_db,
-                            &crate::watch::NoopWatchRegistry,
+                            &crate::watch::ForStore(store),
                             addr.as_str(),
                         )
                         .map_err(|e| {
@@ -1437,7 +1437,7 @@ impl ReplicationApplyEnv {
         config: &Arc<Config>,
         compaction_tx: &CompactionTx,
         selected_db: &mut usize,
-        watch_registry: &crate::watch::NoopWatchRegistry,
+        watch_registry: &dyn crate::watch::WatchNotifier,
         peer_addr: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::commands::ctx::Ctx;

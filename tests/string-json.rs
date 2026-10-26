@@ -2296,3 +2296,27 @@ fn mset_drops_a_time_to_live_and_msetnx_sees_past_an_expired_key() {
     assert_eq!(c.cmds(&["MSETNX", "gone", "x", "third", "x"]).as_int(), 0);
     assert!(c.cmds(&["GET", "third"]).is_nil());
 }
+
+/// `RESTORE` of what Redis 8.10's `DUMP` gives for `{"a":1,"b":[1,2]}`, as
+/// `MIGRATE` from Redis sends it: the array is a CBOR typed array, and was
+/// refused as bad data (#157).
+#[test]
+fn test_restore_of_a_redis_8_10_json_document() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let payload: &[u8] = &[
+        0x07, 0x81, 0x45, 0xe2, 0x52, 0x38, 0xdf, 0x91, 0x2c, 0x04, 0x05, 0x0b, 0xa2, 0x61, 0x61,
+        0x01, 0x61, 0x62, 0xd8, 0x48, 0x42, 0x01, 0x02, 0x00, 0x0f, 0x00, 0x4f, 0x7f, 0x18, 0x31,
+        0xbf, 0x44, 0xd6, 0xe4,
+    ];
+    let r = c.cmd(&[b"RESTORE", b"doc", b"0", payload]);
+    assert!(!r.is_error(), "RESTORE: {r:?}");
+    let got = c.cmds(&["JSON.GET", "doc"]);
+    let text = match &got {
+        RespValue::Bulk(b) => String::from_utf8(b.clone()).unwrap(),
+        other => panic!("JSON.GET: {other:?}"),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value, serde_json::json!({"a": 1, "b": [1, 2]}));
+}

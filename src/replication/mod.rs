@@ -881,6 +881,11 @@ impl ReplState {
     pub fn become_slave(&self) {
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
+        // Its own replicas would get nothing from here on: a replica does
+        // not pass its master's stream on.
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::DropReplicas);
+        }
         *self.repl_id2.write() = None;
         // The stream this node wrote as a master ends here. Were it promoted
         // again later under the same id, a replica that had followed the old
@@ -1014,16 +1019,36 @@ pub fn save_dataset(
             }
         })?;
     } else {
-        let maps: Vec<_> = store
-            .iter()
-            .map(crate::snapshot::collect_snapshot)
-            .collect();
-        crate::snapshot::write_snapshot_with_expiry(
-            "dump.kdb",
-            &maps,
-            Some(index_store),
-            Some(expiry_store),
-        )?;
+        // One instant, as with the AOF on: the dataset is captured with
+        // writes held, then written while they go on. It was copied a shard
+        // at a time, so a transaction, a script or an MSET whose keys were
+        // in two shards could be saved half applied (#148).
+        let frozen = {
+            let _cut = crate::write_gate::cut();
+            crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store))
+        }?;
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!(
+            "dump.kdb.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Err(e) = frozen
+            .write_file(&tmp)
+            .and_then(|()| std::fs::rename(&tmp, "dump.kdb"))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        // As the writer this replaced said it: operators and tests look for it.
+        let shown = std::env::current_dir()
+            .map(|dir| dir.join("dump.kdb"))
+            .unwrap_or_else(|_| "dump.kdb".into());
+        log_info!(
+            "Snapshot saved  → {} ({} databases)",
+            shown.display(),
+            store.len()
+        );
     }
 
     // Best effort: without the file, the next start does a full resync.
@@ -1230,7 +1255,17 @@ pub enum HubMsg {
     Resume {
         offset: u64,
     },
+    /// Let go of every replica: this node has become a replica itself, and
+    /// does not pass its master's stream on (#144). Their connections close,
+    /// and when they connect again they are told why.
+    DropReplicas,
 }
+
+/// What a replica answers a node that asks to replicate from it: KiviDB does
+/// not chain replicas, and one that took the request would send its data
+/// once and nothing after (#144).
+pub const NOT_A_MASTER: &str = "ERR this server is a replica, and KiviDB does not chain replicas: \
+     replicate from its master instead";
 
 /// The most recent part of the write stream, kept by the hub so that a
 /// replica which lost its connection can be sent what it missed instead of
@@ -1509,6 +1544,28 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // Tear down registration (client disconnect / rollback).
                     channel_replicas.retain(|r| r.id != replica_id);
                     forget_replica(&state, replica_id);
+                }
+                HubMsg::DropReplicas => {
+                    // Dropping each `tx` ends its forwarder, and so its
+                    // connection, as an eviction does.
+                    for replica in channel_replicas.drain(..) {
+                        forget_replica(&state, replica.id);
+                        log_info!(
+                            "Replication: Replica {} disconnected: this node is now a replica \
+                             itself",
+                            replica.addr
+                        );
+                    }
+                    if !socket_replicas.is_empty() {
+                        let n = socket_replicas.len();
+                        socket_replicas.clear();
+                        let before = state
+                            .connected_replicas
+                            .fetch_sub(n as i64, Ordering::Relaxed);
+                        if before < n as i64 {
+                            state.connected_replicas.store(0, Ordering::Relaxed);
+                        }
+                    }
                 }
                 HubMsg::Register(conn) => {
                     log_info!("Replication: Socket replica registered: {}", conn.addr);
