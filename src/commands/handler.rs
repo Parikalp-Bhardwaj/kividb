@@ -339,6 +339,30 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether `ctx.cmd` is a write naming keys of more than one shard, which
+/// would be seen half done by another client without the gate alone: a
+/// `DEL` of several keys, `RENAME`, `SUNIONSTORE` and the other `*STORE`
+/// commands, `SORT ... STORE`, `LMOVE`. In Redis every command is one step;
+/// here the shards are worked on at once (#159). `MSET` and `MSETNX` lock
+/// all their shards together, and need no more.
+fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
+    if matches!(name, "MSET" | "MSETNX") || !replication::is_write_command_bytes(cmd0) {
+        return false;
+    }
+    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+    if keys.iter().nth(1).is_none() {
+        return false;
+    }
+    let db = &ctx.store[*ctx.selected_db];
+    let mut shards = keys.iter().map(|pos| {
+        std::str::from_utf8(ctx.cmd[pos])
+            .map(|key| crate::store::shard_index(db.len(), key))
+            .ok()
+    });
+    let first = shards.next().flatten();
+    first.is_none() || shards.any(|shard| shard != first)
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -854,6 +878,7 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         || whole_keyspace
         || crate::tag_locks::is_switch(name, &ctx.cmd)
         || (ordered && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB"))
+        || writes_keys_of_several_shards(ctx, name, cmd0)
     {
         crate::command_gate::enter_alone_unless(SLICE, overrun).map(|alone| (None, Some(alone)))
     } else {
@@ -1084,6 +1109,26 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
 pub(crate) fn apply_write_side_effects(ctx: &Ctx, name: &str, result: &[u8]) {
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     write_side_effects(ctx, name, result, writes_operation);
+}
+
+/// Whether a write's reply says it changed nothing: `SET ... NX` on a key
+/// that exists, `SADD` of members there already, `EXPIRE` of a missing key.
+/// Redis does not touch such a key, and a `WATCH` on it holds (#159). Only
+/// replies that cannot mean a change are listed: `ZADD` and `HSET` answer
+/// `0` for updates too.
+fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
+    let nil = result == b"$-1\r\n" || result == b"_\r\n";
+    let zero = result == b":0\r\n";
+    match name {
+        "SET" => {
+            nil && cmd[3..]
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(b"NX") || a.eq_ignore_ascii_case(b"XX"))
+        }
+        "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
+        | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" => zero,
+        _ => false,
+    }
 }
 
 /// Mark every `WATCH` on a key this write touched as dirty.
@@ -1345,7 +1390,9 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             }
         }
 
-        notify_watchers(ctx, name);
+        if !changed_nothing(name, &ctx.cmd, result) {
+            notify_watchers(ctx, name);
+        }
 
         // An XREADGROUP that only re-read pending entries, or found nothing
         // new, changed nothing Redis counts (#27).

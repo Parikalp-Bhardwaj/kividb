@@ -677,6 +677,34 @@ fn wait_link_up(c: &mut Conn) {
     });
 }
 
+/// On a replica, WATCH sees the writes its master sends: an EXEC after the
+/// master changed a watched key runs nothing. It ran (#159).
+#[test]
+fn test_watch_on_a_replica_sees_its_masters_writes() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "w", "1"]).is_ok());
+    wait_until("the replica to have w", Duration::from_secs(10), || {
+        r.cmds(&["GET", "w"]) == RespValue::Bulk(b"1".to_vec())
+    });
+    assert!(r.cmds(&["WATCH", "w"]).is_ok());
+    assert!(m.cmds(&["SET", "w", "from-master"]).is_ok());
+    wait_until(
+        "the replica to have the new w",
+        Duration::from_secs(10),
+        || {
+            let mut probe = Conn::connect(replica);
+            probe.cmds(&["GET", "w"]) == RespValue::Bulk(b"from-master".to_vec())
+        },
+    );
+    assert!(r.cmds(&["MULTI"]).is_ok());
+    r.cmds(&["GET", "w"]);
+    assert_eq!(r.cmds(&["EXEC"]), RespValue::Nil);
+}
+
 /// A replica does not take replicas of its own. One that did sent its data
 /// once and nothing after, while the replica of it reported its link up
 /// (#144). It now says why, and the would-be replica's link stays down; a

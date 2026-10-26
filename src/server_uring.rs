@@ -1229,6 +1229,11 @@ pub async fn handle_client(
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
                     acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
+                    // for a command refused for any other reason (#159).
+                    if tx.active {
+                        tx.aborted = true;
+                    }
                     out_buf
                         .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
                     parse_offset += consumed;
