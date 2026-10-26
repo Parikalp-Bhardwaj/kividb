@@ -371,6 +371,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // `backupdirname` is relative to `dir`, which is now the working
+    // directory.
+    commands::backup::recover(&config);
+
     #[cfg(target_os = "linux")]
     match config.io_model {
         IoModel::Uring => {
