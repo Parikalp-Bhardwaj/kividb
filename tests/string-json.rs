@@ -386,6 +386,11 @@ fn test_incr_decr_variants() {
 
     c.cmds(&["SET", "strkey", "notanumber"]);
     assert!(c.cmds(&["INCR", "strkey"]).is_error());
+    // At the edge: an error, and the value as it was; INCR wrapped to
+    // i64::MIN (#124).
+    c.cmds(&["SET", "max", "9223372036854775807"]);
+    assert!(c.cmds(&["INCR", "max"]).is_error());
+    assert_eq!(c.cmds(&["GET", "max"]).as_str(), "9223372036854775807");
 }
 
 // Manual test scenario:
