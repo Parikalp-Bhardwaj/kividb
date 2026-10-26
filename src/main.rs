@@ -37,6 +37,7 @@ pub mod node_tls;
 pub mod pause;
 pub mod protected_mode;
 mod pubsub;
+pub mod redis_settings;
 pub mod replication;
 mod resp;
 mod script_clock;

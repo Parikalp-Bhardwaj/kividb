@@ -309,32 +309,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
-            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
-                Some(config_set_array(&param, value))
-            }
-            "stream-node-max-entries" => match value.parse::<i64>() {
-                Ok(v) if v >= 0 => {
-                    crate::commands::stream_extra::NODE_MAX_ENTRIES
-                        .store(v, std::sync::atomic::Ordering::Relaxed);
-                    Some(resp_simple("OK"))
-                }
-                _ => Some(resp_error(
-                    "ERR CONFIG SET failed (possibly related to argument \
-                                 'stream-node-max-entries') - argument must be between 0 and \
-                                 9223372036854775807 inclusive",
-                )),
-            },
-            "stream-node-max-bytes" => match memory_size(value) {
-                Some(v) if v <= i64::MAX as usize => {
-                    crate::commands::stream_extra::NODE_MAX_BYTES
-                        .store(v as i64, std::sync::atomic::Ordering::Relaxed);
-                    Some(resp_simple("OK"))
-                }
-                _ => Some(resp_error(
-                    "ERR CONFIG SET failed (possibly related to argument \
-                                 'stream-node-max-bytes') - argument must be a memory value",
-                )),
-            },
             "slowlog-max-len" => match value.parse::<usize>() {
                 Ok(v) => {
                     ctx.slowlog.set_max_len(v);
@@ -481,23 +455,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                      Valid values: debug, verbose, notice, warning, nothing",
                 )),
             },
-            // Redis's name for it since 7.0; the old one is kept.
-            "lua-time-limit" | "busy-reply-threshold" => {
-                #[cfg(feature = "lua")]
-                {
-                    match value.parse::<u64>() {
-                        Ok(v) => {
-                            crate::commands::lua::lua_time_limit_ms_set(v);
-                            Some(resp_simple("OK"))
-                        }
-                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
-                    }
-                }
-                #[cfg(not(feature = "lua"))]
-                {
-                    Some(resp_simple("OK"))
-                }
-            }
             // Taken with the command gate held alone (`run_command`): no
             // command that went by the old setting is still running.
             "lua-parallel-scripts" => match value.to_ascii_lowercase().as_str() {
@@ -854,6 +811,103 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // What a running Redis cannot be told either.
+            "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
+            | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
+            | "appenddirname" | "aclfile" => {
+                let unchanged = config_rows(ctx)
+                    .iter()
+                    .any(|(name, current)| *name == param && current == value);
+                if unchanged {
+                    Some(resp_simple("OK"))
+                } else {
+                    Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                                     '{param}') - can't set immutable config"
+                    )))
+                }
+            }
+            _ => None,
+        }
+    })();
+    let reply = reply
+        .or_else(|| config_set_global(&param, value))
+        .unwrap_or_else(|| config_set_other(ctx, &param, value));
+    if reply.starts_with(b"+") {
+        let secret = matches!(
+            param.as_str(),
+            "requirepass" | "masterauth" | "tls-key-file-pass"
+        );
+        log_info!(
+            "CONFIG SET {param} {}",
+            if secret { "(hidden)" } else { value }
+        );
+    }
+    reply
+}
+
+/// `CONFIG SET` of a setting that is the server's as a whole, not of a
+/// connection, a store or the replication: what a line of the configuration
+/// file with it does too (#142). `None`: not one of these.
+pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
+    let param = param.to_string();
+    let remembered = REMEMBERED_CONFIG.lock().contains_key(param.as_str())
+        || crate::redis_settings::is_hidden(&param);
+    (|| {
+        match param.as_str() {
+            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
+                Some(config_set_array(&param, value))
+            }
+            "stream-node-max-entries" => match value.parse::<i64>() {
+                Ok(v) if v >= 0 => {
+                    crate::commands::stream_extra::NODE_MAX_ENTRIES
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'stream-node-max-entries') - argument must be between 0 and \
+                                 9223372036854775807 inclusive",
+                )),
+            },
+            "stream-node-max-bytes" => match memory_size(value) {
+                Some(v) if v <= i64::MAX as usize => {
+                    crate::commands::stream_extra::NODE_MAX_BYTES
+                        .store(v as i64, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'stream-node-max-bytes') - argument must be a memory value",
+                )),
+            },
+            // Redis's name for it since 7.0; the old one is kept.
+            "lua-time-limit" | "busy-reply-threshold" => {
+                #[cfg(feature = "lua")]
+                {
+                    match value.parse::<u64>() {
+                        Ok(v) => {
+                            crate::commands::lua::lua_time_limit_ms_set(v);
+                            Some(resp_simple("OK"))
+                        }
+                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                    }
+                }
+                // Nothing runs to a limit here: remembered, for `CONFIG
+                // GET`.
+                #[cfg(not(feature = "lua"))]
+                {
+                    match value.parse::<u64>() {
+                        Ok(v) => {
+                            REMEMBERED_CONFIG
+                                .lock()
+                                .insert("busy-reply-threshold".to_string(), v.to_string());
+                            Some(resp_simple("OK"))
+                        }
+                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                    }
+                }
+            }
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -885,56 +939,74 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
                 None => Some(resp_error("ERR argument must be a memory value")),
             },
-            // What a running Redis cannot be told either.
-            "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
-            | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
-            | "appenddirname" | "aclfile" => {
-                let unchanged = config_rows(ctx)
-                    .iter()
-                    .any(|(name, current)| *name == param && current == value);
-                if unchanged {
-                    Some(resp_simple("OK"))
-                } else {
-                    Some(resp_error(&format!(
-                        "ERR CONFIG SET failed (possibly related to argument \
-                                     '{param}') - can't set immutable config"
-                    )))
-                }
-            }
-            // A cluster setting this server does not have
-            // (`cluster-replica-validity-factor`,
-            // `cluster-allow-reads-when-down`, ...). It would change how
-            // the cluster behaves, so taking it and doing nothing would
-            // mislead whoever set it: refused, as Redis refuses a setting
-            // it does not know (#111).
-            _ if param.starts_with("cluster-") => Some(resp_error(&format!(
-                "ERR Unknown option or number of arguments for CONFIG SET - '{param}'"
-            ))),
             // A setting of Redis's that means nothing here — how
             // it encodes small values, how it sizes its buffers.
             // It is accepted, so that a client or a tool that
             // sets it does not fail, and remembered, so that
             // `CONFIG GET` answers with what was set.
-            _ => {
+            _ if remembered => {
                 REMEMBERED_CONFIG
                     .lock()
                     .insert(param.clone(), value.to_string());
                 Some(resp_simple("OK"))
             }
+            _ => None,
         }
-    })();
-    let reply = reply.unwrap_or_else(|| resp_simple("OK"));
-    if reply.starts_with(b"+") {
-        let secret = matches!(
-            param.as_str(),
-            "requirepass" | "masterauth" | "tls-key-file-pass"
-        );
-        log_info!(
-            "CONFIG SET {param} {}",
-            if secret { "(hidden)" } else { value }
-        );
+    })()
+}
+
+/// `CONFIG SET` of a name no arm of [`config_set_one`] or
+/// [`config_set_global`] takes (#143).
+fn config_set_other(ctx: &Ctx, param: &str, value: &str) -> Vec<u8> {
+    let immutable = || {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{param}') - can't set \
+             immutable config"
+        ))
+    };
+    // One `CONFIG GET` reports, read only at startup
+    // (`repl-replica-max-backlog-bytes`, `backupdirname`, ...): to what it
+    // already is, is no change.
+    if let Some((_, current)) = config_rows(ctx).into_iter().find(|(name, _)| name == param) {
+        return if current == value {
+            resp_simple("OK")
+        } else {
+            immutable()
+        };
     }
-    reply
+    // A command-line flag (`threads`, `io-model`, `aof`, ...).
+    if is_startup_flag(param) {
+        return immutable();
+    }
+    // A cluster setting this server does not have
+    // (`cluster-allow-reads-when-down`, ...) would change how the cluster
+    // behaves, so taking it and doing nothing would mislead whoever set it
+    // (#111); a name that is not Redis's either is most likely misspelt.
+    // Both are refused, as Redis refuses a setting it does not know.
+    if param.starts_with("cluster-") || !crate::redis_settings::is_redis_setting(param) {
+        return resp_error(&format!(
+            "ERR Unknown option or number of arguments for CONFIG SET - '{param}'"
+        ));
+    }
+    // Any other setting of Redis's: remembered, as above.
+    remember_config(param, value);
+    resp_simple("OK")
+}
+
+/// Whether `name` is one of the server's command-line flags.
+fn is_startup_flag(name: &str) -> bool {
+    use clap::CommandFactory;
+    crate::config::Config::command()
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some(name))
+}
+
+/// Remember a setting of Redis's that means nothing here (see
+/// [`REMEMBERED_CONFIG`]).
+pub(crate) fn remember_config(name: &str, value: &str) {
+    REMEMBERED_CONFIG
+        .lock()
+        .insert(name.to_string(), value.to_string());
 }
 
 /// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
@@ -978,6 +1050,12 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("lazyfree-lazy-expire", "yes"),
             ("lazyfree-lazy-server-del", "yes"),
             ("close-on-replica-write", "yes"),
+            ("hz", "10"),
+            ("activerehashing", "yes"),
+            ("lazyfree-lazy-eviction", "no"),
+            ("timeout", "0"),
+            ("tcp-keepalive", "300"),
+            ("latency-monitor-threshold", "0"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -1002,7 +1080,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     #[cfg(feature = "lua")]
     let lua_time_limit = crate::commands::lua::lua_time_limit_ms().to_string();
     #[cfg(not(feature = "lua"))]
-    let lua_time_limit = "5000".to_string();
+    let lua_time_limit =
+        remembered_config("busy-reply-threshold").unwrap_or_else(|| "5000".to_string());
     let in_effect: Vec<(&str, String)> = vec![
         ("bind", ctx.config.bind.clone()),
         (
@@ -1073,9 +1152,6 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             "loglevel",
             crate::loglevel::log::level_str(LOG_LEVEL.load(Relaxed)).to_string(),
         ),
-        ("hz", "10".to_string()),
-        ("activerehashing", "yes".to_string()),
-        ("lazyfree-lazy-eviction", "no".to_string()),
         (
             "repl-backlog-size",
             ctx.repl_state.backlog_size.load(Relaxed).to_string(),
@@ -1094,8 +1170,6 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             .to_string(),
         ),
         ("tcp-backlog", "511".to_string()),
-        ("timeout", "0".to_string()),
-        ("tcp-keepalive", "300".to_string()),
         ("lua-time-limit", lua_time_limit.clone()),
         (
             "lua-parallel-scripts",
@@ -1157,9 +1231,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             rows.push((name.to_string(), master.clone()));
         }
     }
-    const HIDDEN: [&str; 2] = ["key-load-delay", "rdb-key-save-delay"];
     for (name, value) in REMEMBERED_CONFIG.lock().iter() {
-        if !rows.iter().any(|(known, _)| known == name) && !HIDDEN.contains(&name.as_str()) {
+        if !rows.iter().any(|(known, _)| known == name) && !crate::redis_settings::is_hidden(name) {
             rows.push((name.clone(), value.clone()));
         }
     }
@@ -3750,14 +3823,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     // Redis's debugging settings: not listed by a pattern,
                     // and answered when asked for by name.
-                    for hidden in ["key-load-delay", "rdb-key-save-delay"] {
+                    for (hidden, default) in crate::redis_settings::HIDDEN_SETTINGS {
                         if patterns.iter().any(|pattern| pattern == hidden) {
                             pairs.push(resp_bulk_str(hidden));
                             pairs.push(resp_bulk_str(
                                 REMEMBERED_CONFIG
                                     .lock()
-                                    .get(hidden)
-                                    .map_or("0", |value| value.as_str()),
+                                    .get(*hidden)
+                                    .map_or(*default, |value| value.as_str()),
                             ));
                         }
                     }

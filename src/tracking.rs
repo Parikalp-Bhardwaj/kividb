@@ -65,6 +65,10 @@ impl Default for TrackingTableInner {
 /// A key the table has let go of, and the clients that were tracking it.
 pub type Dropped = (String, AHashSet<u64>);
 
+/// `tracking-table-max-keys` of a table made from now on: the configuration
+/// file's, else Redis's default (#142). `CONFIG SET` changes the table's own.
+pub static DEFAULT_MAX_KEYS: AtomicUsize = AtomicUsize::new(1_000_000);
+
 impl TrackingTableInner {
     pub fn new() -> Self {
         Self {
@@ -73,7 +77,7 @@ impl TrackingTableInner {
             broadcasting: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(Vec::new()),
             has_pending: std::sync::atomic::AtomicBool::new(false),
-            max_keys: AtomicUsize::new(1_000_000),
+            max_keys: AtomicUsize::new(DEFAULT_MAX_KEYS.load(Ordering::Relaxed)),
             acl: std::sync::OnceLock::new(),
         }
     }
