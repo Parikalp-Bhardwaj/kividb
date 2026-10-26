@@ -1,5 +1,5 @@
+use crate::store;
 use crate::store::Key;
-use crate::store::{self, Db};
 use crate::types::SharedBytes;
 use crate::types::{
     ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamEntry, StreamId, StreamInner,
@@ -365,25 +365,15 @@ macro_rules! read_lock {
     };
 }
 
-pub fn collect_snapshot(db: &Db) -> HashMap<String, KiviDBValue> {
-    let mut merged = HashMap::new();
-    for shard in db.iter() {
-        let map = read_lock!(shard);
-        merged.extend(map.iter().map(|(k, v)| (k.to_string(), v.clone())));
-    }
-    merged
-}
-
 /// Leading bytes of every KDB image, snapshot file or AOF preamble alike.
 pub const KDB_MAGIC: &[u8; 8] = b"KIVIDB01";
 
 // ── Streaming KDB writer ─────────────────────────────────────────────────────
 //
 // Split out of `write_snapshot` so the AOF rewrite can emit the same image
-// without going through `collect_snapshot` first. That matters: a snapshot
-// taken for the AOF preamble would otherwise clone the entire dataset into
-// intermediate `HashMap`s before a byte reaches the file, doubling peak memory
-// during a rewrite. Driving the writer shard by shard costs nothing extra.
+// without cloning the dataset into intermediate `HashMap`s first, which
+// would double peak memory during a rewrite. Driving the writer shard by
+// shard costs nothing extra.
 //
 // The pieces must be called in this order — header, then per db (entries, db
 // end), then the index sections — because that is the order `load_snapshot`

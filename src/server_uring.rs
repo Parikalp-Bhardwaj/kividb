@@ -1496,6 +1496,10 @@ pub async fn handle_client(
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
                         let _alone = crate::command_gate::enter_alone();
+                        // And as one write: a snapshot, a backup or a full sync cuts
+                        // before it or after it, never between two of its commands
+                        // (#148). The writes it runs are inside this one.
+                        let _whole = crate::write_gate::enter();
                         if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
