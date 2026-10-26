@@ -78,6 +78,13 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **An AOF turned on at runtime grew for ever (#146).** The thread that
+  rewrites the append-only file once it passes `auto-aof-rewrite-min-size`
+  and grows by `auto-aof-rewrite-percentage` was started only by a server
+  that had the AOF on at startup; after `CONFIG SET appendonly yes`, the
+  file was never rewritten until a restart or a `BGREWRITEAOF`. It is now
+  started whatever the setting, and waits while the AOF is off.
+
 - **A snapshot could hold half a transaction (#148).** With the AOF off,
   `BGSAVE` and the save at shutdown copied the dataset a shard at a time
   while writes went on, so a `MULTI`/`EXEC`, a script or an `MSET` whose

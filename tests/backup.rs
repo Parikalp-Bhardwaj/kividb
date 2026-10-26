@@ -278,6 +278,40 @@ fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
     }
 }
 
+/// An AOF turned on with `CONFIG SET appendonly yes` is rewritten on its
+/// own once it has grown, as one turned on at startup is. It grew until the
+/// next restart (#146).
+#[test]
+fn an_aof_turned_on_at_runtime_is_rewritten_on_its_own() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-min-size", "1024"])
+            .ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-percentage", "10"])
+            .ok()
+    );
+    for i in 0..2000 {
+        assert!(c.cmd(&["SET", &format!("key:{i}"), &"x".repeat(50)]).ok());
+    }
+    let aof = server.dir.join("appendonly.aof");
+    let grown = std::fs::metadata(&aof).unwrap().len();
+    assert!(grown > 100_000, "the log should have grown: {grown} bytes");
+    // The check runs every 10 seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&aof).unwrap().len() >= grown {
+        assert!(
+            Instant::now() < deadline,
+            "appendonly.aof was never rewritten"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 2000);
+}
+
 /// A snapshot is the dataset at one moment, with the AOF off as with it on:
 /// a transaction that changes two keys on two shards is in it whole or not
 /// at all. With the AOF off it was copied a shard at a time, and a SAVE
