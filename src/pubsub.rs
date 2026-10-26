@@ -515,7 +515,8 @@ impl Subscriptions {
     }
 
     /// Run one subscription command; the replies go out with the
-    /// connection's other replies, in order.
+    /// connection's other replies, in order. (In a cluster, see
+    /// [`shard_subscribe_refusal`] first.)
     pub fn handle(&mut self, cmd: &[&[u8]], resp: u8) -> Vec<u8> {
         let mut out = Vec::new();
         let Some(first) = cmd.first() else {
@@ -683,6 +684,41 @@ impl Batch {
         }
         out
     }
+}
+
+/// In a cluster, `SSUBSCRIBE` is routed as a command for its channels' slot
+/// is: `MOVED` to the node that has it, `CROSSSLOT` for channels of more than
+/// one slot. A replica of the slot's master takes it, as in Redis. It
+/// succeeded on any node, which only had the slot's messages if it was the
+/// slot's (#161).
+pub fn shard_subscribe_refusal(
+    name: &str,
+    cmd: &[&[u8]],
+    cluster: &crate::cluster::ClusterState,
+) -> Option<Vec<u8>> {
+    if name != "SSUBSCRIBE" || !cluster.enabled {
+        return None;
+    }
+    // Channels are not keys to the key specs: their slots are taken here,
+    // and the first is routed as a read of it would be.
+    let channels = cmd.get(1..)?;
+    let first = *channels.first()?;
+    let slot = crate::cluster::key_hash_slot(first);
+    if channels
+        .iter()
+        .any(|channel| crate::cluster::key_hash_slot(channel) != slot)
+    {
+        return Some(crate::cluster::routing::crossslot_error());
+    }
+    crate::cluster::routing::route_named(
+        "GET",
+        &[b"GET", first],
+        cluster,
+        false,
+        || true,
+        |_| false,
+    )
+    .refusal()
 }
 
 #[cfg(test)]

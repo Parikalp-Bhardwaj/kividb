@@ -1452,8 +1452,9 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     // other stream content.
     // In cluster mode the bus forwards it to every node instead, replicas
     // included (see `commands::pubsub`), so it is one or the other.
+    // `SPUBLISH` as well: standalone, a shard channel is a channel (#161).
     if !writes_operation
-        && name == "PUBLISH"
+        && matches!(name, "PUBLISH" | "SPUBLISH")
         && !ctx.cluster.enabled
         && !ctx.apply_replication
         && !ctx.repl_state.is_slave()
