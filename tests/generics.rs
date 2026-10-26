@@ -1799,6 +1799,50 @@ fn resp3(c: &mut Conn) {
     assert!(matches!(hello, RespValue::Array(_)), "{hello:?}");
 }
 
+/// A tracking client that does not read its invalidations is closed once
+/// too many wait for it, rather than having them dropped: one dropped would
+/// leave it serving a key that changed, with nothing to tell it so (#161).
+#[test]
+fn test_a_tracking_client_that_does_not_read_is_closed_not_left_stale() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    resp3(&mut tracker);
+    let id = tracker.cmds(&["CLIENT", "ID"]).as_int();
+    assert!(tracker.cmds(&["CLIENT", "TRACKING", "ON", "BCAST"]).is_ok());
+
+    // Every write is an invalidation for the tracker, which reads none of
+    // them: its socket fills, then its queue.
+    let mut writer = Conn::connect(port);
+    let batch = 1000;
+    for round in 0..200 {
+        let mut buf = Vec::new();
+        for i in 0..batch {
+            let key = format!("k{}", round * batch + i);
+            buf.extend_from_slice(
+                format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len()).as_bytes(),
+            );
+        }
+        writer.stream.write_all(&buf).unwrap();
+        for _ in 0..batch {
+            assert!(writer.read_value().is_ok());
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = writer.cmds(&["CLIENT", "LIST"]);
+        if !list.as_str().contains(&format!("id={id} ")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tracker that reads nothing is still connected"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // CLIENT TRACKING ON → returns OK
 #[test]
 fn test_client_tracking_on_returns_ok() {

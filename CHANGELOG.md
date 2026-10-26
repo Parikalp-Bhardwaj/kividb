@@ -78,6 +78,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A client using client-side caching could be left serving changed keys
+  (#161).** Invalidations were queued for a connection with room for 512
+  (256 under io_uring), and one that found the queue full was dropped
+  without a trace: the client kept a value that had changed, and was never
+  told. The queue now holds 65536, which costs nothing until it is used,
+  and a client that falls further behind than that is closed, with a line
+  in the log, so that it drops what it cached, as Redis closes a client
+  past its output buffer limit. `SPUBLISH` with the wrong number of
+  arguments named `publish` in its error.
+
 - **A replica of a replica got one copy of the data and nothing after
   (#144).** A replica took `PSYNC` from a node of its own, sent it its
   dataset, and never passed on its master's writes, while the node

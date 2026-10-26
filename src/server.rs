@@ -406,7 +406,8 @@ where
     // Push notifications (CLIENT TRACKING invalidations, etc.) need a dedicated
     // forwarder task so they are delivered immediately — not held until the next
     // client command arrives.
-    let (push_tx, mut push_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (push_tx, mut push_rx) =
+        mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
     client_registry.register_push_tx(client_id, push_tx.clone());
     let writer_for_push = Arc::clone(&writer);
     let push_forwarder = tokio::spawn(async move {
