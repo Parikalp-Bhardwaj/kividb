@@ -120,6 +120,20 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Vector sets: `VSIM ... FILTER` filters; `REDUCE` is refused; `VINFO`
+  says how vectors are kept (#132).** `FILTER` was taken and ignored, so an
+  application that filtered by attribute got elements that did not match. It
+  now takes Redis's expressions over the elements' JSON attributes
+  (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024,
+  2025]`, arithmetic, `not`, `**`, ...), and only the elements that pass are
+  scored; the search being exact, `FILTER-EF` changes nothing. An element
+  without the field asked for does not pass, as in Redis; an expression that
+  is not one is `ERR syntax error in FILTER expression`. `VADD ... REDUCE`
+  was taken and ignored, and the set kept the dimension given; it is now
+  refused. `Q8` and `BIN` are still taken, with the vectors kept at full
+  precision, and `VINFO` reports `quant-type` `f32`, Redis's name for that,
+  where it said `NOQUANT`.
+
 - **Keyspace notifications: Redis's event names, events from the commands
   that sent none, and `keymiss` (#160).**
   - Named as in Redis: `INCR`, `DECR` and `DECRBY` send `incrby` (they sent

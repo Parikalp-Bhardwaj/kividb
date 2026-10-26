@@ -74,6 +74,7 @@ mod ts;
 mod ts_query;
 mod vector;
 mod vset;
+mod vset_filter;
 mod zset;
 
 pub use handler::execute_command;
