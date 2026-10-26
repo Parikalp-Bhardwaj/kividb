@@ -706,6 +706,9 @@ fn command_describes_where_each_commands_keys_are() {
     let mixed = c.cmd(&["COMMAND", "INFO", "get", "nosuchcommand"]);
     assert_eq!(mixed.array().len(), 2);
     assert_eq!(mixed.array()[1], Resp::Nil);
+    // Listed with no command behind it, and not Redis's (#126).
+    let gone = c.cmd(&["COMMAND", "INFO", "geodelbymember"]);
+    assert_eq!(gone.array(), [Resp::Nil]);
 }
 
 /// A transaction is routed command by command as it is queued. One that

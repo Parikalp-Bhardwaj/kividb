@@ -1212,7 +1212,6 @@ fn can_leave_a_key_empty(name: &str) -> bool {
             | "GEOSEARCHSTORE"
             | "GEORADIUS"
             | "GEORADIUSBYMEMBER"
-            | "GEODELBYMEMBER"
             | "SORT"
             | "HDEL"
             | "HGETDEL"

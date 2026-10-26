@@ -111,6 +111,10 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`COMMAND` no longer lists `GEODELBYMEMBER` (#126).** It was in the
+  command tables with nothing behind it, and answered `unknown command`;
+  Redis has no such command either (`ZREM` removes a member of a geo set).
+
 - **`INCR` at the largest integer wrapped to the smallest (#124).** `INCR` on
   `9223372036854775807` stored `-9223372036854775808` (and a debug build
   panicked); it now answers `ERR increment or decrement would overflow` and

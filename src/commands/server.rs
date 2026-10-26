@@ -1620,7 +1620,6 @@ const ALL_COMMANDS: &[&str] = &[
     "GEORADIUSBYMEMBER",
     "GEOSEARCH",
     "GEOSEARCHSTORE",
-    "GEODELBYMEMBER",
     "GET",
     "GETBIT",
     "GETDEL",
@@ -2426,7 +2425,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "GEORADIUSBYMEMBER",
             "GEOSEARCH",
             "GEOSEARCHSTORE",
-            "GEODELBYMEMBER",
             "GEOHASH",
             "GEORADIUSBYMEMBER_RO",
             "GEORADIUS_RO",
@@ -2879,12 +2877,11 @@ pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u
         | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LINSERT" | "LREM" | "LTRIM" | "LMPOP" | "SADD"
         | "SREM" | "SPOP" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "ZMPOP"
         | "XADD" | "XDEL" | "XDELEX" | "XTRIM" | "XSETID" | "XGROUP" | "XACK" | "XAUTOCLAIM"
-        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD"
-        | "GEODELBYMEMBER" | "JSON.SET" | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY"
-        | "JSON.NUMMULTBY" | "JSON.STRAPPEND" | "JSON.ARRAPPEND" | "JSON.ARRINSERT"
-        | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR" | "JSON.TOGGLE" | "JSON.MERGE" | "VADD"
-        | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY" | "TS.DECRBY" | "TS.CREATE" | "TS.DEL"
-        | "TS.ALTER" => {
+        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD" | "JSON.SET"
+        | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.STRAPPEND"
+        | "JSON.ARRAPPEND" | "JSON.ARRINSERT" | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR"
+        | "JSON.TOGGLE" | "JSON.MERGE" | "VADD" | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY"
+        | "TS.DECRBY" | "TS.CREATE" | "TS.DEL" | "TS.ALTER" => {
             if args.len() < 2 {
                 return Err("ERR Invalid arguments specified".into());
             }
