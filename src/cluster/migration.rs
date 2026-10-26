@@ -383,7 +383,10 @@ impl Peer {
         let (user, password) = env.repl_state.master_credentials();
         if !password.is_empty() {
             let auth = if user.is_empty() {
-                command(&[b"AUTH", password.as_bytes()])
+                // As the default user, by name: `AUTH <password>` is refused by a
+                // node that has no password (#135), and with the name it logs in as
+                // before.
+                command(&[b"AUTH", b"default", password.as_bytes()])
             } else {
                 command(&[b"AUTH", user.as_bytes(), password.as_bytes()])
             };
