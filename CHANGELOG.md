@@ -120,6 +120,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Shard channels: `SPUBLISH` reaches a replica's subscribers, and
+  `SSUBSCRIBE` is routed in a cluster (#161).** Standalone, `PUBLISH` went
+  down the replication stream to subscribers on replicas, and `SPUBLISH` did
+  not. In a cluster, `SSUBSCRIBE` succeeded on any node, which got the
+  channel's messages only if it had the channel's slot; as in Redis, it is
+  now answered `MOVED` by a node that does not have the slot (a replica of
+  its master takes it), and `CROSSSLOT` for channels of more than one slot.
+
 - **Search: synonym groups had no effect (#130).** `FT.SYNUPDATE` kept its
   groups, and `FT.SEARCH` for one term of a group did not find documents with
   another. As in RediSearch, a query term now matches every term of the

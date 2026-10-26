@@ -1019,6 +1019,13 @@ where
             // it has subscriptions. Inside MULTI they are queued like any other
             // command, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
+                if let Some(refusal) =
+                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
+                {
+                    combined.extend_from_slice(&refusal);
+                    parse_offset += consumed;
+                    continue;
+                }
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });

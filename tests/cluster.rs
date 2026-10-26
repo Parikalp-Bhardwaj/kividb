@@ -2167,6 +2167,29 @@ fn keys_of_a_slot_lost_to_another_master_are_dropped() {
 // ── Pub/Sub ───────────────────────────────────────────────────────────────────
 
 /// A message published on one node reaches a subscriber connected to another.
+/// `SSUBSCRIBE` is routed by its channel's slot, as in Redis: `MOVED` from a
+/// node that does not have it, `CROSSSLOT` for channels of two slots. It
+/// succeeded anywhere (#161).
+#[test]
+fn ssubscribe_is_routed_by_slot() {
+    let (nodes, ranges) = form_cluster(2);
+    let mine = key_in(ranges[0].0..=ranges[0].1, "chan");
+    let theirs = key_in(ranges[1].0..=ranges[1].1, "chan");
+    let mut c = nodes[0].conn();
+    let reply = c.cmd(&["SSUBSCRIBE", &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine, &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("CROSSSLOT")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine]);
+    assert_eq!(reply.array()[0].text(), "ssubscribe", "{reply:?}");
+}
+
 #[test]
 fn publish_reaches_subscribers_on_other_nodes() {
     let (nodes, _) = form_cluster(3);

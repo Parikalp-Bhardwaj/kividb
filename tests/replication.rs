@@ -737,6 +737,26 @@ fn test_scripts_that_read_run_on_a_replica() {
     assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
 }
 
+/// A shard channel's message reaches a replica's subscribers, as a
+/// channel's does: `SPUBLISH` was not sent down the replication stream
+/// (#161).
+#[test]
+fn test_spublish_reaches_a_replicas_subscribers() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut sub = Conn::connect(replica);
+    let ack = sub.cmds(&["SSUBSCRIBE", "news"]);
+    assert_eq!(ack.as_array()[0].as_str(), "ssubscribe");
+    let mut m = Conn::connect(master);
+    m.cmds(&["SPUBLISH", "news", "hello"]);
+    let message = sub.read_value();
+    let parts = message.as_array();
+    assert_eq!(parts[0].as_str(), "smessage");
+    assert_eq!(parts[2].as_str(), "hello");
+}
+
 /// A replica given a `masterauth` still replicates a master that has no
 /// password, and one that has that password. `AUTH <password>` is refused
 /// where no password is set (#135): the replica logs in as the default user
