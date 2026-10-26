@@ -46,6 +46,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **The image has no OpenSSL.** Its base is now distroless's `base-nossl`
+  with `libgcc_s` copied in, rather than `cc`, which ships `libssl3`. KiviDB
+  never loaded it (TLS is rustls, built into the binary), but image scanners
+  reported its CVEs all the same: 12 of the 15 Trivy reported in October
+  2026, one of them high. The 3 left are Debian's `tzdata` and
+  `ca-certificates` updates, neither of which the binary reads, and go with
+  the next distroless build.
+
 - **String values take less memory (#113).** A value's block no longer
   carries the system allocator's header and rounding: 10 million keys of
   100 bytes take 1753 MB instead of 1898 MB (184 bytes a key instead of
