@@ -892,15 +892,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             .block_on(aof::start_aof_writer(tokio_rx))
     });
 
-    if aof_enabled {
-        aof::spawn_auto_rewrite_thread(
-            Arc::clone(&store),
-            Arc::clone(&expiry_store),
-            Arc::clone(&index_store),
-            config.aof_rewrite_percentage,
-            config.aof_rewrite_min_size,
-        );
-    }
+    // Whether or not the AOF is on now: `CONFIG SET appendonly yes` turns
+    // it on later, and its log is to be rewritten as one turned on at
+    // startup is (#146). With the AOF off, the thread only waits.
+    aof::spawn_auto_rewrite_thread(
+        Arc::clone(&store),
+        Arc::clone(&expiry_store),
+        Arc::clone(&index_store),
+        config.aof_rewrite_percentage,
+        config.aof_rewrite_min_size,
+    );
 
     // Replica client — runs on its own thread and runtime (see
     // `ReplicaStarter::start`), so it never competes with the io_uring workers.
@@ -1541,15 +1542,16 @@ async fn async_main_tokio(
     // occupy every worker thread and the writer would never be polled -- the
     // server would hang holding all locks. A dedicated runtime makes that
     // impossible. (The io_uring path already does this for its own reasons.)
-    if aof_enabled {
-        aof::spawn_auto_rewrite_thread(
-            Arc::clone(&store),
-            Arc::clone(&expiry_store),
-            Arc::clone(&index_store),
-            config.aof_rewrite_percentage,
-            config.aof_rewrite_min_size,
-        );
-    }
+    // Whether or not the AOF is on now: `CONFIG SET appendonly yes` turns
+    // it on later, and its log is to be rewritten as one turned on at
+    // startup is (#146). With the AOF off, the thread only waits.
+    aof::spawn_auto_rewrite_thread(
+        Arc::clone(&store),
+        Arc::clone(&expiry_store),
+        Arc::clone(&index_store),
+        config.aof_rewrite_percentage,
+        config.aof_rewrite_min_size,
+    );
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
