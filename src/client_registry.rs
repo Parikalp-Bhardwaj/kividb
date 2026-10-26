@@ -453,6 +453,13 @@ impl Activity {
     }
 }
 
+/// How many out-of-band messages (invalidations, RESP3 pub/sub, MONITOR
+/// lines) a connection's push queue holds before a client that does not read
+/// them is closed (#161). Generous because it costs nothing until used: the
+/// channel allocates as it fills. Redis puts no limit on a normal client's
+/// output buffer at all.
+pub const PUSH_QUEUE_FRAMES: usize = 65_536;
+
 #[derive(Debug)]
 pub struct ClientInfo {
     pub id: u64,

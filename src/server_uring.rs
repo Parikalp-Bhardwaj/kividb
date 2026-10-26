@@ -586,7 +586,8 @@ pub async fn handle_client(
     let mut out_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut spare_buf: Vec<u8> = Vec::with_capacity(65536);
     // Push channel for out-of-band invalidation messages (CLIENT TRACKING).
-    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let (push_tx, mut push_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
     client_registry.register_push_tx(client_id, push_tx.clone());
 
     // Out-of-band pushes (CLIENT TRACKING invalidations, RESP3 pub/sub
