@@ -1040,6 +1040,15 @@ pub fn save_dataset(
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // As the writer this replaced said it: operators and tests look for it.
+        let shown = std::env::current_dir()
+            .map(|dir| dir.join("dump.kdb"))
+            .unwrap_or_else(|_| "dump.kdb".into());
+        log_info!(
+            "Snapshot saved  → {} ({} databases)",
+            shown.display(),
+            store.len()
+        );
     }
 
     // Best effort: without the file, the next start does a full resync.
