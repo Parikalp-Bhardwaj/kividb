@@ -46,6 +46,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`CONFIG SET` refuses what it cannot set, as Redis does (#143).** A name
+  that is neither KiviDB's nor Redis's (`bogus-name`, a misspelling) gets
+  `ERR Unknown option or number of arguments for CONFIG SET`; it was taken,
+  kept, and did nothing. A setting read only at startup (`threads`,
+  `io-model`, `aof`, `repl-replica-max-backlog-bytes`, `backupdirname`,
+  `bind`, `dir`, ...) gets `can't set immutable config`, unless set to what
+  it already is; it was answered `OK` and left as it was. Redis's settings
+  that mean nothing here (`maxclients`, `hz`, `timeout`, `tcp-keepalive`,
+  the encodings, ...) are still taken, and `CONFIG GET` now gives back what
+  was set for `hz`, `timeout`, `tcp-keepalive`, `activerehashing` and
+  `lazyfree-lazy-eviction` too, and for `busy-reply-threshold` in a build
+  without Lua. `CONFIG GET *` lists `latency-monitor-threshold`.
+
 - **The image has no OpenSSL.** Its base is now distroless's `base-nossl`
   with `libgcc_s` copied in, rather than `cc`, which ships `libssl3`. KiviDB
   never loaded it (TLS is rustls, built into the binary), but image scanners
@@ -85,6 +98,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `bad argument #2 to 'assert' (string expected, got table)`.
 
 ### Fixed
+
+- **Settings `CONFIG SET` takes stopped the server in the config file
+  (#142).** `tracking-table-max-keys`, `array-slice-size`,
+  `array-sparse-kmax`, `array-sparse-kmin`, `stream-node-max-entries`,
+  `stream-node-max-bytes` and `busy-reply-threshold` (`lua-time-limit`)
+  were unknown directives, and had no flag either: they could only be set
+  after every start. They are now read from the file, checked as
+  `CONFIG SET` checks them. Redis's settings KiviDB has no use for
+  (`maxclients`, `maxmemory-clients`, `client-query-buffer-limit`,
+  `latency-tracking`, the encodings, and any other of Redis 8's) are
+  accepted with a warning, as `hz` and `timeout` already were, so that a
+  `redis.conf` carried over starts. A name that is neither KiviDB's nor
+  Redis's still stops it.
 
 - **Search: scores drifted, `DD` kept the documents, KNN was ignored in
   `FT.AGGREGATE` (#162).**

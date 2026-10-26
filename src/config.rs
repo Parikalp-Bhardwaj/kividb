@@ -1539,6 +1539,8 @@ impl Config {
             }
             "active-defrag-cycle-max" => set!(active_defrag_cycle_max, number(key, one()?)?),
             "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
+            "tracking-table-max-keys" => crate::tracking::DEFAULT_MAX_KEYS
+                .store(number(key, one()?)?, std::sync::atomic::Ordering::Relaxed),
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
             "activerehashing"
@@ -1569,10 +1571,41 @@ impl Config {
                 if args.is_empty() {
                     return Err(format!("'{key}' needs a value"));
                 }
+                // For `CONFIG GET`, as `CONFIG SET` remembers it.
+                crate::commands::server::config_set_global(key, &args.join(" "));
                 return no_effect("KiviDB has no such setting");
             }
 
-            _ => return Err(format!("unknown directive '{key}'")),
+            // A setting `CONFIG SET` takes that is the server's as a whole
+            // (`array-slice-size`, `busy-reply-threshold`, ...): set, and
+            // checked, as `CONFIG SET` sets it. One of Redis's that KiviDB has
+            // no use for (`maxclients`, ...) is remembered, as `CONFIG SET`
+            // remembers it, so that a redis.conf carried over starts (#142).
+            _ => {
+                if args.is_empty() {
+                    return Err(format!("'{key}' needs a value"));
+                }
+                let value = args.join(" ");
+                match crate::commands::server::config_set_global(key, &value) {
+                    Some(reply) if reply.starts_with(b"-") => {
+                        let why = String::from_utf8_lossy(&reply[1..]);
+                        let why = why.trim_end();
+                        let why = why.strip_prefix("ERR ").unwrap_or(why);
+                        return Err(format!("invalid value '{value}' for '{key}': {why}"));
+                    }
+                    Some(_) if crate::commands::server::remembered_config(key).is_none() => {}
+                    Some(_) => return no_effect("KiviDB has no such setting"),
+                    None if key.starts_with("cluster-")
+                        || !crate::redis_settings::is_redis_setting(key) =>
+                    {
+                        return Err(format!("unknown directive '{key}'"));
+                    }
+                    None => {
+                        crate::commands::server::remember_config(key, &value);
+                        return no_effect("KiviDB has no such setting");
+                    }
+                }
+            }
         }
         Ok(None)
     }
@@ -1828,6 +1861,38 @@ mod config_file_tests {
                 .apply_config_text("port x\n", &|id| id == "port")
                 .is_err()
         );
+    }
+
+    /// What `CONFIG SET` takes, the file takes too (#142): the settings the
+    /// server keeps for itself are set as `CONFIG SET` sets them, Redis's
+    /// are accepted with a warning, and a misspelt name still stops the
+    /// server. The values are the defaults: the settings are the process's.
+    #[test]
+    fn config_set_settings_are_directives_too() {
+        let (_, warnings) = load(
+            "stream-node-max-entries 100\nstream-node-max-bytes 4kb\n\
+             tracking-table-max-keys 1000000\nbusy-reply-threshold 5000\n",
+        )
+        .unwrap();
+        #[cfg(feature = "lua")]
+        assert!(warnings.is_empty(), "{warnings:?}");
+        #[cfg(not(feature = "lua"))]
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (_, warnings) = load(
+            "maxclients 10000\nlatency-tracking yes\nhash-max-listpack-entries 512\n\
+             proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 6, "{warnings:?}");
+        assert!(warnings[0].contains("'maxclients'"), "{warnings:?}");
+        let err = load("array-slice-size 300\n").unwrap_err();
+        assert!(err.contains("power of two"), "{err}");
+        let err = load("stream-node-max-entries -1\n").unwrap_err();
+        assert!(err.contains("stream-node-max-entries"), "{err}");
+        for typo in ["maxclientz 1\n", "cluster-allow-reads-when-down yes\n"] {
+            let err = load(typo).unwrap_err();
+            assert!(err.contains("unknown directive"), "{typo}: {err}");
+        }
     }
 
     #[test]
