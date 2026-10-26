@@ -555,10 +555,7 @@ pub fn spawn_active_expire_task(
                 // Redis's `expire-cycle` latency event: a cycle that took at
                 // least `latency-monitor-threshold` ms (0, the default, is
                 // off).
-                let threshold =
-                    crate::commands::server::remembered_config("latency-monitor-threshold")
-                        .and_then(|ms| ms.parse::<u64>().ok())
-                        .unwrap_or(0);
+                let threshold = crate::latency::threshold_ms();
                 let took = started.elapsed().as_millis() as u64;
                 if threshold > 0 && took >= threshold {
                     latency.record("expire-cycle", took.min(u32::MAX as u64) as u32);

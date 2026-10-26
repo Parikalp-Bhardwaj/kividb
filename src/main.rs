@@ -612,6 +612,7 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 #[cfg(target_os = "linux")]
 fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
+    stats::IO_URING.store(true, std::sync::atomic::Ordering::Relaxed);
     let store: store::Store = store::new_store(config.databases);
     let expiry_store: store::ExpiryStore = store::new_expiry_store(config.databases);
     let index_store = vector::new_index_store();

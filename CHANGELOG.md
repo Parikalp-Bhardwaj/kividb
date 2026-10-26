@@ -111,6 +111,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Monitoring saw less than Redis shows (#158).** The latency monitor's
+  `command` and `fast-command` events are recorded when a command takes at
+  least `latency-monitor-threshold` (in the config file too), as in Redis;
+  they were recorded by `slowlog-log-slower-than`, so with the defaults
+  `CONFIG SET latency-monitor-threshold` recorded nothing, and
+  `fast-command` was any command under a millisecond rather than a command
+  Redis flags fast. `LATENCY LATEST` gives four fields, the maximum
+  included, which redis_exporter reads; `LATENCY HELP` answers.
+  `INFO latencystats` gives each command's percentiles
+  (`latency-tracking-info-percentiles`), from the same histogram as
+  `LATENCY HISTOGRAM`, so to its power of two. `instantaneous_input_kbps`
+  and `instantaneous_output_kbps` are measured; `INFO server` gives
+  `slowlog_log_slower_than:-1` when the slow log is off, the
+  `multiplexing_api` in use (`io_uring`, `epoll`, ...), the `config_file`
+  and the `executable`; `maxclients` is what was set.
+
 - **`mem_fragmentation_ratio` was virtual size over RSS, so `MEMORY DOCTOR`
   always warned (#152).** It is now Redis's: RSS over `used_memory`, on
   every platform (it was a fixed `1.0` on macOS and Windows), with

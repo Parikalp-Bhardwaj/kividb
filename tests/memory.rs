@@ -563,9 +563,14 @@ fn test_memory_doctor_healthy_on_fresh_server() {
     // free memory in it: any of the doctor's findings can be true.
     let msg = result.as_str();
     assert!(
-        ["fine", "very little memory", "High fragmentation", "Peak memory"]
-            .iter()
-            .any(|finding| msg.contains(finding)),
+        [
+            "fine",
+            "very little memory",
+            "High fragmentation",
+            "Peak memory"
+        ]
+        .iter()
+        .any(|finding| msg.contains(finding)),
         "Expected one of MEMORY DOCTOR's findings, got: {msg}"
     );
 }
