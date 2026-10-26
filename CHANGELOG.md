@@ -78,6 +78,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A JSON document from Redis 8 made a whole snapshot unreadable (#157).**
+  RedisJSON 8 saves an array of numbers all of one kind as a CBOR typed
+  array (RFC 8746): `[1, 2]` as 8-bit integers, `[1.5, 2.5]` as half
+  floats. The reader took them for byte strings, `CBOR byte strings have
+  no JSON form`, and refused the file: a `dump.rdb` copied from Redis 8.10,
+  a `--preload-file`, or a replica's full sync from a Redis 8.10 master
+  loaded nothing, and `MIGRATE` of such a document failed with
+  `ERR Bad data format`. Typed arrays of every width and byte order are
+  read.
+
 - **`MEMORY USAGE key SAMPLES 0` panicked (#151).** On a hash, a set or a
   sorted set it divided by zero: the worker thread panicked and the
   client's connection closed. `SAMPLES 0` now looks at every element, as
