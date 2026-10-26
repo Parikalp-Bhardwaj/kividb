@@ -4299,8 +4299,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Err(e) => Some(resp_error(&e)),
                         };
                     }
+                    // As the other containers answer, and Redis; it was
+                    // nil (#134).
                     _ => {
-                        return Some(resp_null_array());
+                        return Some(resp_error(&format!(
+                            "ERR unknown subcommand '{}'. Try COMMAND HELP.",
+                            String::from_utf8_lossy(cmd[1])
+                        )));
                     }
                 }
             }
