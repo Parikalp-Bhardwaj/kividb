@@ -1443,7 +1443,16 @@ impl Config {
                 }
                 set!(tls_auth_clients, value)
             }
-            "notify-keyspace-events" => set!(notify_keyspace_events, one()?.to_string()),
+            "notify-keyspace-events" => {
+                let flags = one()?;
+                if crate::keyspace_events::parse_ks_flags_strict(flags).is_none() {
+                    return Err(format!(
+                        "invalid value '{flags}' for 'notify-keyspace-events': {}",
+                        crate::keyspace_events::BAD_FLAGS
+                    ));
+                }
+                set!(notify_keyspace_events, flags.to_string())
+            }
 
             // ── Redis directives that name something KiviDB has one way of
             // doing. The value KiviDB already behaves as is accepted quietly;
