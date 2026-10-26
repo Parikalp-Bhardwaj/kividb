@@ -78,6 +78,18 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A script on a cluster node could write a key another node owns (#153).**
+  `redis.call` was not routed: a script given a key of its own node could
+  `SET` one of another node's slots, and the key was stored here, where no
+  client would look for it, and copied to this node's replicas and
+  snapshot. As in Redis, a script now uses only keys this node serves
+  (`ERR Script attempted to access a non local key in a cluster node`),
+  and, unless it is flagged `allow-cross-slot-keys`, only keys in its own
+  slot: that of its first key, or of the first key it uses
+  (`ERR Script attempted to access keys that do not hash to the same
+  slot`). The flag, on a script's first line or a function, was accepted
+  and ignored; it now does what it does in Redis.
+
 - **Memory of deleted keys' table slots was never given back (#113).** A
   shard's hash table, of values and of expiry times, grew as keys came and
   kept its size as they went: after a reshard moved half the keys away, or

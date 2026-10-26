@@ -534,6 +534,90 @@ fn routing_uses_the_real_key_positions() {
     );
 }
 
+/// A script may use only the keys this node serves, and, unless it is
+/// flagged `allow-cross-slot-keys`, only those in its own slot: one that
+/// wrote a key of another node's slot left it here, where no client would
+/// find it (#153).
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_uses_only_keys_this_node_serves() {
+    let (nodes, ranges) = form_cluster(2);
+    let here = &nodes[0];
+    let mine = key_in(ranges[0].0..=ranges[0].1, "mine");
+    let also_mine = (0..100_000)
+        .map(|i| format!("also:{i}"))
+        .find(|k| (ranges[0].0..=ranges[0].1).contains(&slot_of(k)) && slot_of(k) != slot_of(&mine))
+        .expect("another key of node 0");
+    let theirs = key_in(ranges[1].0..=ranges[1].1, "theirs");
+    let write = |key: &str| format!("return redis.call('SET', '{key}', 'v')");
+    let non_local = |reply: &Resp| {
+        reply.err().is_some_and(|e| {
+            e.contains("Script attempted to access a non local key in a cluster node")
+        })
+    };
+    let same_slot = |reply: &Resp| {
+        reply.err().is_some_and(|e| {
+            e.contains("Script attempted to access keys that do not hash to the same slot")
+        })
+    };
+
+    // Its own slot: fine, declared or not.
+    assert!(
+        here.conn()
+            .cmd(&["EVAL", &write(&mine), "1", &mine])
+            .is_ok()
+    );
+    assert!(here.conn().cmd(&["EVAL", &write(&mine), "0"]).is_ok());
+
+    // Another node's key, with keys of its own or none: refused, and not stored.
+    let r = here.conn().cmd(&["EVAL", &write(&theirs), "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    let r = here.conn().cmd(&["EVAL", &write(&theirs), "0"]);
+    assert!(non_local(&r), "{r:?}");
+    let slot = slot_of(&theirs).to_string();
+    assert_eq!(
+        here.conn()
+            .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot])
+            .int(),
+        0
+    );
+
+    // A key of this node in another slot: refused, unless the script says it
+    // may; another node's key is refused all the same.
+    let r = here.conn().cmd(&["EVAL", &write(&also_mine), "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    let flagged = |body: String| format!("#!lua flags=allow-cross-slot-keys\n{body}");
+    assert!(
+        here.conn()
+            .cmd(&["EVAL", &flagged(write(&also_mine)), "1", &mine])
+            .is_ok()
+    );
+    let r = here
+        .conn()
+        .cmd(&["EVAL", &flagged(write(&theirs)), "1", &mine]);
+    assert!(non_local(&r), "{r:?}");
+
+    // A script with no keys takes the slot of the first one it uses.
+    let two =
+        format!("redis.call('SET', '{mine}', 'v') return redis.call('SET', '{also_mine}', 'v')");
+    let r = here.conn().cmd(&["EVAL", &two, "0"]);
+    assert!(same_slot(&r), "{r:?}");
+
+    // A function is held to the same, by its flags.
+    let library = format!(
+        "#!lua name=lib\n\
+         redis.register_function('strict', function(keys) return redis.call('SET', '{theirs}', 'v') end)\n\
+         redis.register_function{{function_name='loose', callback=function(keys) return redis.call('SET', '{also_mine}', 'v') end, flags={{'allow-cross-slot-keys'}}}}"
+    );
+    assert_eq!(
+        here.conn().cmd(&["FUNCTION", "LOAD", &library]).text(),
+        "lib"
+    );
+    let r = here.conn().cmd(&["FCALL", "strict", "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    assert!(here.conn().cmd(&["FCALL", "loose", "1", &mine]).is_ok());
+}
+
 /// Six masters, introduced only to the first: each has to learn of the other
 /// four through gossip. (They did not, where the clock was coarse: gossip
 /// kept mentioning the same three nodes.)

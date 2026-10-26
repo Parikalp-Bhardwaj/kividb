@@ -680,6 +680,12 @@ struct ScriptEval {
     had_shebang: bool,
     /// `#!lua flags=no-writes` — exempt from NOREPLICAS on read-only `redis.call`.
     no_writes_flag: bool,
+    /// `allow-cross-slot-keys`: in a cluster, `redis.call` may use keys of
+    /// other slots than the script's, as long as this node serves them.
+    allow_cross_slot: bool,
+    /// In a cluster, the slot the script works in: its first key's, from
+    /// `KEYS`, or else the first key a `redis.call` used.
+    slot: Option<u16>,
 }
 
 thread_local! {
@@ -714,6 +720,30 @@ pub(crate) fn script_eval_script_resp() -> Option<u8> {
 #[inline]
 pub(crate) fn script_allow_oom() -> bool {
     SCRIPT_EVAL.with(|c| c.borrow().as_ref().is_some_and(|s| s.allow_oom))
+}
+
+/// The running script's slot, and whether it may use keys of other slots
+/// (see [`ScriptEval::slot`]); `None` outside a script.
+pub(crate) fn script_slot() -> Option<(Option<u16>, bool)> {
+    SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| (s.slot, s.allow_cross_slot)))
+}
+
+/// Make `slot` the running script's slot, if it has none yet.
+pub(crate) fn script_settle_slot(slot: u16) {
+    SCRIPT_EVAL.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.slot.get_or_insert(slot);
+        }
+    });
+}
+
+/// The slot of a script's first key, in a cluster: where the command that
+/// runs it was routed.
+fn first_key_slot(ctx: &Ctx, first_key: Option<&[u8]>) -> Option<u16> {
+    if !ctx.cluster.enabled {
+        return None;
+    }
+    first_key.map(crate::cluster::slot::key_hash_slot)
 }
 
 /// Redis `min-slaves-to-write` / `min-replicas-to-write` gate for nested `redis.call`.
@@ -3928,6 +3958,7 @@ fn install_eval_timeout_hook(lua: &Lua) -> Result<(), String> {
 struct EvalShebangFlags {
     allow_oom: bool,
     no_writes: bool,
+    allow_cross_slot: bool,
 }
 
 /// Redis `#lua` / `#!lua flags=…` first line — strip before `lua.load`, validate engine/options.
@@ -3964,7 +3995,8 @@ fn preprocess_eval_script(source: &str) -> Result<(&str, EvalShebangFlags), Stri
                 match f {
                     "allow-oom" => flags.allow_oom = true,
                     "no-writes" => flags.no_writes = true,
-                    "allow-stale" | "no-cluster" | "allow-cross-slot-keys" => {}
+                    "allow-cross-slot-keys" => flags.allow_cross_slot = true,
+                    "allow-stale" | "no-cluster" => {}
                     _ => return Err(format!("Unexpected flag in script shebang: {}", f)),
                 }
             }
@@ -4008,6 +4040,7 @@ fn eval_script(
     }
     let _script_clock_guard = ScriptClockGuard;
 
+    let slot = first_key_slot(ctx, keys.first().copied());
     SCRIPT_EVAL.with(|c| {
         *c.borrow_mut() = Some(ScriptEval {
             ctx_addr: ctx_ptr as usize,
@@ -4017,6 +4050,8 @@ fn eval_script(
             allow_oom,
             had_shebang,
             no_writes_flag: sb.no_writes,
+            allow_cross_slot: sb.allow_cross_slot,
+            slot,
         });
     });
 
@@ -4125,6 +4160,7 @@ fn eval_function_call(
     }
     let _script_clock_guard = ScriptClockGuard;
 
+    let slot = first_key_slot(ctx, keys.first().map(|k| k.as_slice()));
     SCRIPT_EVAL.with(|c| {
         *c.borrow_mut() = Some(ScriptEval {
             ctx_addr: ctx_ptr as usize,
@@ -4135,6 +4171,8 @@ fn eval_function_call(
             // A function is held to what a script with a first line is.
             had_shebang: true,
             no_writes_flag: run.no_writes,
+            allow_cross_slot: run.allow_cross_slot,
+            slot,
         });
     });
 
@@ -4261,6 +4299,7 @@ fn fcall_inner(
             read_only: read_only || no_writes,
             allow_oom,
             no_writes,
+            allow_cross_slot: has("allow-cross-slot-keys"),
         },
     )
 }
@@ -4270,6 +4309,7 @@ struct FunctionRun {
     read_only: bool,
     allow_oom: bool,
     no_writes: bool,
+    allow_cross_slot: bool,
 }
 
 fn fcall(ctx: &mut Ctx, read_only: bool) -> Vec<u8> {
