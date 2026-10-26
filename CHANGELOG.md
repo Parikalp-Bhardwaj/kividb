@@ -120,6 +120,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Scripts that only read run on a replica (#145).** `EVAL`, `EVALSHA` and
+  `FCALL` were refused with `READONLY` on a replica before the script ran,
+  even when it only read, so read/write splitting and cluster clients with
+  `READONLY` failed. As in Redis, a script now runs on a replica and a write
+  it makes is refused there; a script whose shebang declares it may write
+  (no `no-writes` flag), and a function registered without `no-writes`, are
+  refused before they run.
+
 - **`SCRIPT KILL` replied `OK` to a script that had written, which ran on
   (#129).** It looked for the script's writes on the thread of the client
   that sent it, where there were none, so it answered `OK`; the script,
