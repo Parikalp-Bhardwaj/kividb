@@ -1593,7 +1593,10 @@ impl Config {
                         let why = why.strip_prefix("ERR ").unwrap_or(why);
                         return Err(format!("invalid value '{value}' for '{key}': {why}"));
                     }
-                    Some(_) if crate::commands::server::remembered_config(key).is_none() => {}
+                    // Remembered for `CONFIG GET`, and in effect too.
+                    Some(_)
+                        if key == "latency-monitor-threshold"
+                            || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
                         || !crate::redis_settings::is_redis_setting(key) =>
@@ -1883,7 +1886,9 @@ mod config_file_tests {
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
-        assert_eq!(warnings.len(), 6, "{warnings:?}");
+        // All but latency-monitor-threshold, which the latency monitor goes
+        // by (#158).
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
         assert!(warnings[0].contains("'maxclients'"), "{warnings:?}");
         let err = load("array-slice-size 300\n").unwrap_err();
         assert!(err.contains("power of two"), "{err}");

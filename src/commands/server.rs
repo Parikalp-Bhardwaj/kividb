@@ -870,6 +870,20 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                                  9223372036854775807 inclusive",
                 )),
             },
+            // What the latency monitor records (#158): remembered too, for
+            // `CONFIG GET`.
+            "latency-monitor-threshold" => match value.parse::<i64>() {
+                Ok(ms) if ms >= 0 => {
+                    crate::latency::set_threshold_ms(ms as u64);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), ms.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
             "stream-node-max-bytes" => match memory_size(value) {
                 Some(v) if v <= i64::MAX as usize => {
                     crate::commands::stream_extra::NODE_MAX_BYTES
@@ -2008,6 +2022,12 @@ const ADMIN_COMMANDS: &[&str] = &[
 ];
 
 /// The `fast` ACL category.
+/// Whether `name` (upper case) is a command Redis flags `fast`: the latency
+/// monitor's `fast-command` event, not `command`.
+pub(crate) fn is_fast_command(name: &str) -> bool {
+    FAST_COMMANDS.contains(&name)
+}
+
 const FAST_COMMANDS: &[&str] = &[
     "APPEND",
     "ASKING",
@@ -3251,16 +3271,34 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("uptime_in_days:{}\r\n", uptime / 86400));
                 out.push_str("hz:10\r\n");
                 out.push_str("configured_hz:10\r\n");
-                out.push_str("multiplexing_api:epoll\r\n");
+                out.push_str(&format!(
+                    "multiplexing_api:{}\r\n",
+                    crate::stats::multiplexing_api()
+                ));
                 out.push_str("atomicvar_api:atomic-builtin\r\n");
                 out.push_str("gcc_version:0.0.0\r\n");
-                out.push_str("config_file:\r\n");
+                // The file it was started with, if there is one.
+                let config_file = Some(std::path::Path::new(&ctx.config.configfile))
+                    .filter(|path| path.is_file())
+                    .and_then(|path| std::path::absolute(path).ok())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push_str(&format!("config_file:{config_file}\r\n"));
+                // Off is -1, as `CONFIG GET` writes it.
                 out.push_str(&format!(
                     "slowlog_log_slower_than:{}\r\n",
-                    ctx.slowlog.threshold_us()
+                    match ctx.slowlog.threshold_us() {
+                        u64::MAX => -1,
+                        us => us as i64,
+                    }
                 ));
                 out.push_str(&format!("slowlog_max_len:{}\r\n", ctx.slowlog.len_cap()));
-                out.push_str("executable:/usr/local/bin/kividb\r\n");
+                out.push_str(&format!(
+                    "executable:{}\r\n",
+                    std::env::current_exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
                 out.push_str("\r\n");
             }
 
@@ -3359,8 +3397,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "total_net_output_bytes:{}\r\n",
                     crate::stats::TOTAL_NET_OUTPUT_BYTES.load(Ordering::Relaxed)
                 ));
-                out.push_str("instantaneous_input_kbps:0\r\n");
-                out.push_str("instantaneous_output_kbps:0\r\n");
+                out.push_str(&format!(
+                    "instantaneous_input_kbps:{:.2}\r\n",
+                    crate::stats::INSTANTANEOUS_INPUT_BPS.load(Ordering::Relaxed) as f64 / 1024.0
+                ));
+                out.push_str(&format!(
+                    "instantaneous_output_kbps:{:.2}\r\n",
+                    crate::stats::INSTANTANEOUS_OUTPUT_BPS.load(Ordering::Relaxed) as f64 / 1024.0
+                ));
                 out.push_str(&format!(
                     "rejected_connections:{}\r\n",
                     crate::stats::REJECTED_CONNECTIONS.load(Ordering::Relaxed)
@@ -3460,6 +3504,36 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         ));
                     }
                     out.push_str("\r\n");
+                }
+                out.push_str("\r\n");
+            }
+
+            // Each command's percentiles, as Redis 7 gives them
+            // (`latency-tracking`, `latency-tracking-info-percentiles`): the
+            // section was empty (#158).
+            if want("latencystats")
+                && remembered_config("latency-tracking").as_deref() != Some("no")
+            {
+                out.push_str("# Latencystats\r\n");
+                let percentiles: Vec<f64> = remembered_config("latency-tracking-info-percentiles")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
+                for (name, totals) in crate::cmdstats::totals() {
+                    let line: Vec<String> = percentiles
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "p{p}={:.3}",
+                                crate::cmdstats::percentile_usec(&totals.buckets, *p)
+                            )
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "latency_percentiles_usec_{name}:{}\r\n",
+                        line.join(",")
+                    ));
                 }
                 out.push_str("\r\n");
             }
@@ -3748,7 +3822,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let (blocking_keys, on_nokey) = ctx.wait_table.blocking_keys();
                 out.push_str(&format!("total_blocking_keys:{blocking_keys}\r\n"));
                 out.push_str(&format!("total_blocking_keys_on_nokey:{on_nokey}\r\n"));
-                out.push_str("maxclients:10000\r\n");
+                out.push_str(&format!(
+                    "maxclients:{}\r\n",
+                    remembered_config("maxclients").unwrap_or_else(|| "10000".to_string())
+                ));
                 out.push_str("\r\n");
             }
 

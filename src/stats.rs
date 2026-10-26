@@ -216,6 +216,28 @@ pub static RUN_ID: LazyLock<String> = LazyLock::new(|| {
     .collect()
 });
 
+/// Bytes read from and written to clients in the last second:
+/// `instantaneous_input_kbps` and `instantaneous_output_kbps` (#158).
+pub static INSTANTANEOUS_INPUT_BPS: AtomicU64 = AtomicU64::new(0);
+pub static INSTANTANEOUS_OUTPUT_BPS: AtomicU64 = AtomicU64::new(0);
+
+/// The server runs its connections on io_uring.
+pub static IO_URING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `multiplexing_api`: what the server waits on its connections with. It
+/// said `epoll` whatever it was.
+pub fn multiplexing_api() -> &'static str {
+    if IO_URING.load(Ordering::Relaxed) {
+        "io_uring"
+    } else if cfg!(target_os = "linux") {
+        "epoll"
+    } else if cfg!(target_os = "windows") {
+        "iocp"
+    } else {
+        "kqueue"
+    }
+}
+
 // Snapshot pair for instantaneous_ops_per_sec — updated by a 1Hz background task
 pub static INSTANTANEOUS_OPS: AtomicU64 = AtomicU64::new(0);
 // Previous sample of TOTAL_COMMANDS_PROCESSED
@@ -300,6 +322,7 @@ pub fn reset_rdb_changes() {
 /// peak every 100 ms — safe from any startup path.
 pub fn spawn_instantaneous_ops_sampler() {
     std::thread::spawn(|| {
+        let (mut last_in, mut last_out) = (0u64, 0u64);
         for tick in 1u64.. {
             std::thread::sleep(std::time::Duration::from_millis(100));
             crate::commands::memory::used_and_peak();
@@ -309,6 +332,11 @@ pub fn spawn_instantaneous_ops_sampler() {
             let current = TOTAL_COMMANDS_PROCESSED.total();
             let last = LAST_SAMPLE_COMMANDS.swap(current, Ordering::Relaxed);
             INSTANTANEOUS_OPS.store(current.saturating_sub(last), Ordering::Relaxed);
+            let bytes_in = TOTAL_NET_INPUT_BYTES.load(Ordering::Relaxed);
+            let bytes_out = TOTAL_NET_OUTPUT_BYTES.load(Ordering::Relaxed);
+            INSTANTANEOUS_INPUT_BPS.store(bytes_in.saturating_sub(last_in), Ordering::Relaxed);
+            INSTANTANEOUS_OUTPUT_BPS.store(bytes_out.saturating_sub(last_out), Ordering::Relaxed);
+            (last_in, last_out) = (bytes_in, bytes_out);
         }
     });
 }

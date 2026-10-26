@@ -777,15 +777,6 @@ where
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -953,15 +944,6 @@ where
                     + waited_from.map_or(0, |from| now_us().saturating_sub(from));
 
                 if elapsed_us >= slowlog.threshold_us() {
-                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                    latency.record(
-                        if elapsed_ms < 1 {
-                            "fast-command"
-                        } else {
-                            "command"
-                        },
-                        elapsed_ms,
-                    );
                     let client_name = client_registry
                         .get(client_id)
                         .map(|info| info.name.clone())
@@ -1628,15 +1610,6 @@ where
                                 };
 
                                 if elapsed_us >= slowlog.threshold_us() {
-                                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                                    latency.record(
-                                        if elapsed_ms < 1 {
-                                            "fast-command"
-                                        } else {
-                                            "command"
-                                        },
-                                        elapsed_ms,
-                                    );
                                     slowlog.record(
                                         &raw_cmd,
                                         elapsed_us,
@@ -2172,15 +2145,6 @@ where
                     };
 
                     if elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
