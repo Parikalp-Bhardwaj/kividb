@@ -1019,16 +1019,27 @@ pub fn save_dataset(
             }
         })?;
     } else {
-        let maps: Vec<_> = store
-            .iter()
-            .map(crate::snapshot::collect_snapshot)
-            .collect();
-        crate::snapshot::write_snapshot_with_expiry(
-            "dump.kdb",
-            &maps,
-            Some(index_store),
-            Some(expiry_store),
-        )?;
+        // One instant, as with the AOF on: the dataset is captured with
+        // writes held, then written while they go on. It was copied a shard
+        // at a time, so a transaction, a script or an MSET whose keys were
+        // in two shards could be saved half applied (#148).
+        let frozen = {
+            let _cut = crate::write_gate::cut();
+            crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store))
+        }?;
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!(
+            "dump.kdb.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Err(e) = frozen
+            .write_file(&tmp)
+            .and_then(|()| std::fs::rename(&tmp, "dump.kdb"))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
 
     // Best effort: without the file, the next start does a full resync.

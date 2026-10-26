@@ -78,6 +78,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A snapshot could hold half a transaction (#148).** With the AOF off,
+  `BGSAVE` and the save at shutdown copied the dataset a shard at a time
+  while writes went on, so a `MULTI`/`EXEC`, a script or an `MSET` whose
+  keys were in two shards could be saved half applied; and with it on, a
+  checkpoint, a backup or a full sync could cut between two commands of
+  one `EXEC`. A snapshot is now the dataset at one moment with the AOF on
+  or off: it is captured with writes held, strings by reference, and
+  written while they go on, and `EXEC` is one write to every cut.
+
 - **A write of several keys could be seen half done (#159).** Keys are
   spread over shards that threads work on at once, and only `MSET`,
   `MSETNX` and `MGET` locked all of theirs together: a reader could find
