@@ -977,13 +977,12 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR Unknown node");
     }
 
-    // Output format matches CLUSTER NODES — one line per replica as a bulk string.
-    use std::fmt::Write;
-    let mut out = String::new();
+    // An array, as Redis replies: one bulk string per replica, in the format
+    // of a `CLUSTER NODES` line. It was one string of the lines (#138).
+    let mut out = Vec::new();
     for n in nodes.values() {
         if n.flags.contains(crate::cluster::NodeFlags::REPLICA) && n.master_id == Some(master_id) {
-            let _ = writeln!(
-                out,
+            out.push(resp_bulk_str(&format!(
                 "{} {}:{}@{}{} {} {} {} {} {} connected",
                 crate::cluster::node_id_str(&n.id),
                 n.ip,
@@ -995,10 +994,10 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
                 n.ping_sent_ms,
                 n.pong_received_ms,
                 n.config_epoch,
-            );
+            )));
         }
     }
-    resp_bulk_str(&out)
+    resp_array(out)
 }
 
 // ── CLUSTER REPLICATE node-id ────────────────────────────────────────────────
@@ -1947,7 +1946,9 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
                 ));
             }
             let mut limit: usize = 16384;
-            let mut descending = false;
+            // Busiest first unless asked otherwise, as in Redis: the
+            // command is for finding the hot slots. It was ascending (#139).
+            let mut descending = true;
             let mut i = 4;
             while i < cmd.len() {
                 let arg = match std::str::from_utf8(cmd[i]) {

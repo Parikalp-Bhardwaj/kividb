@@ -120,6 +120,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`CLUSTER REPLICAS` and `CLUSTER SLAVES` reply with an array (#138).**
+  They replied with one string, the replicas' lines joined by newlines; now,
+  as in Redis, one bulk string per replica in the `CLUSTER NODES` line
+  format, and an empty array for a master without replicas.
+
+- **`CLUSTER SLOT-STATS ORDERBY` sorts descending by default (#139).** It
+  sorted ascending, so `ORDERBY key-count LIMIT n` returned empty slots;
+  as in Redis, it now returns the busiest first unless `ASC` is given.
+
 - **`WAITAOF` said a write was on disk with the AOF off (#137).** It replied
   `[1, 0]`, one local fsync, when nothing is written to an AOF. With the AOF
   off, `WAITAOF` with `numlocal` above 0 is now refused, as in Redis
