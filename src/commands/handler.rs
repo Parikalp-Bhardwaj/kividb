@@ -281,6 +281,64 @@ pub(crate) fn execute_command_from_script(
 }
 
 /// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
+/// Why a script on a cluster node may not run `ctx.cmd`, or `None` when it
+/// may: as in Redis, its keys must be ones this node serves, and, unless the
+/// script has `allow-cross-slot-keys`, in the script's slot.
+///
+/// The script's own slot, its first key's, was routed with the command that
+/// runs it, ASKING and slots being imported included: a key in it is never
+/// refused here.
+#[cfg(feature = "lua")]
+fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
+    let (script_slot, allow_cross_slot) = crate::commands::lua::script_slot()?;
+    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+    let mut slots = keys
+        .iter()
+        .map(|pos| crate::cluster::slot::key_hash_slot(ctx.cmd[pos]));
+    let first = slots.next()?;
+    if slots.any(|slot| slot != first) {
+        return Some(resp_error(
+            "ERR Script attempted to access keys that do not hash to the same slot",
+        ));
+    }
+    if script_slot == Some(first) {
+        return None;
+    }
+    if script_slot.is_some() && !allow_cross_slot {
+        return Some(resp_error(
+            "ERR Script attempted to access keys that do not hash to the same slot",
+        ));
+    }
+    let store = ctx.store;
+    let db = *ctx.selected_db;
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    let decision = crate::cluster::routing::route_named(
+        name,
+        ctx.cmd.as_slice(),
+        ctx.cluster,
+        false,
+        || registry.get_readonly(client_id),
+        |key| {
+            std::str::from_utf8(key).is_ok_and(|key| {
+                let shard = crate::store::get_shard(&store[db], key);
+                crate::read_lock!(shard).contains_key(key)
+            })
+        },
+    );
+    match decision {
+        crate::cluster::routing::RouteDecision::OwnedSlot(slot) => {
+            crate::commands::lua::script_settle_slot(slot);
+            None
+        }
+        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(),
+        crate::cluster::routing::RouteDecision::Passthrough => None,
+        _ => Some(resp_error(
+            "ERR Script attempted to access a non local key in a cluster node",
+        )),
+    }
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -326,6 +384,15 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
         return resp_error("ERR Write commands are not allowed from read-only scripts.");
+    }
+
+    #[cfg(feature = "lua")]
+    if ctx.cluster.enabled
+        && !ctx.bypass_cluster_check
+        && !ctx.apply_replication
+        && let Some(refusal) = script_key_refusal(ctx, name2)
+    {
+        return refusal;
     }
 
     let repl_is_slave = ctx.repl_state.is_slave();
