@@ -111,6 +111,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`ACL HELP` answers; `COMMAND` with an unknown subcommand is an error
+  (#134).** `ACL HELP` was an unknown subcommand, in an error that said to
+  try `ACL HELP`; it now lists ACL's subcommands, as Redis does. `COMMAND
+  NOPE` replied nil; it now replies `ERR unknown subcommand 'NOPE'. Try
+  COMMAND HELP.`, as the other containers and Redis do.
+
 - **`COMMAND` no longer lists `GEODELBYMEMBER` (#126).** It was in the
   command tables with nothing behind it, and answered `unknown command`;
   Redis has no such command either (`ZREM` removes a member of a geo set).

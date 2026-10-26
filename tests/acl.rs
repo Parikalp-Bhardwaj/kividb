@@ -2083,3 +2083,23 @@ fn a_script_runs_under_its_users_acl() {
         RespValue::Int(0)
     ));
 }
+
+/// `ACL HELP` answers, as every other container's `HELP` does; it was
+/// unknown, in an error that said to try it. `COMMAND` with a subcommand it
+/// does not have is an error, not nil (#134).
+#[test]
+fn acl_help_and_command_s_unknown_subcommand() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let help = c.cmds(&["ACL", "HELP"]);
+    let lines: Vec<&str> = help.as_array().iter().map(|line| line.as_str()).collect();
+    assert!(lines[0].starts_with("ACL <subcommand>"), "{lines:?}");
+    assert!(lines.contains(&"SETUSER <username> <attribute> [<attribute> ...]"));
+
+    let nope = c.cmds(&["COMMAND", "NOPE"]);
+    assert_eq!(
+        nope.error_str(),
+        "ERR unknown subcommand 'NOPE'. Try COMMAND HELP."
+    );
+}
