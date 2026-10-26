@@ -1218,6 +1218,48 @@ impl V {
 
 // ── Scripts ───────────────────────────────────────────────────────────────────
 
+/// What Redis's scripts call that did nothing or was missing (#154):
+/// `redis.log` writes to the server's log, `redis.replicate_commands()` is
+/// true, `redis.set_repl(redis.REPL_ALL)` is taken and the others refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_logs_and_asks_for_effects_replication() {
+    let server = Server::start(&["--logfile", "kividb.log", "--loglevel", "notice"]);
+    let mut c = server.conn();
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.log(redis.LOG_WARNING, 'from', 'a script', 7) \
+         redis.log(redis.LOG_DEBUG, 'not at notice') \
+         return redis.replicate_commands()",
+        "0",
+    ]);
+    assert_eq!(reply.i(), 1, "{reply:?}");
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.set_repl(redis.REPL_ALL) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "k",
+    ]);
+    assert!(reply.ok(), "{reply:?}");
+    for script in [
+        "redis.set_repl(redis.REPL_NONE)",
+        "redis.log(redis.LOG_WARNING)",
+        "redis.log(9, 'x')",
+    ] {
+        assert!(c.cmd(&["EVAL", script, "0"]).is_err(), "{script}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(server.dir.join("kividb.log")).unwrap_or_default();
+        if log.contains("from a script 7") {
+            assert!(!log.contains("not at notice"), "{log}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "not in the log: {log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// `SCRIPT KILL` does not stop a script that has written: half its writes
 /// would stay. It is answered UNKILLABLE, as in Redis, and the script runs
 /// on; it was answered OK and ran on all the same (#129).

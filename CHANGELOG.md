@@ -120,6 +120,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Scripts: `redis.log` writes to the log; `redis.replicate_commands()` and
+  `redis.set_repl()` exist (#154).** `redis.log` did nothing; it now writes
+  its arguments, joined by spaces, at Redis's level for it (`LOG_WARNING`
+  as a warning, `LOG_NOTICE` as info, ...). `redis.replicate_commands()`,
+  how scripts asked before Redis 7 to be replicated as their effects (job
+  queues, rate limiters), returns true, as in Redis 7: KiviDB always does
+  so. Scripts that opened with it failed before doing anything.
+  `redis.set_repl(redis.REPL_ALL)` is taken; keeping a script's writes from
+  the AOF or the replicas is not supported, and is refused rather than
+  ignored. The `struct` library is still missing.
+
 - **A compaction rule wrote its open bucket as samples arrived, and
   `LATEST` changed nothing (#128).** As in RedisTimeSeries, the destination
   now gets a bucket once it has closed (when the first sample of a later one
