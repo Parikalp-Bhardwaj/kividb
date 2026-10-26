@@ -1009,6 +1009,92 @@ pub(crate) fn remember_config(name: &str, value: &str) {
         .insert(name.to_string(), value.to_string());
 }
 
+/// What TLS was set up from before a `CONFIG SET`, to put back.
+#[cfg(feature = "tls")]
+struct TlsBefore {
+    listener: Option<crate::tls::acceptor::Files>,
+    nodes: Option<crate::tls::acceptor::Files>,
+}
+
+/// `CONFIG SET` of TLS's files and `tls-auth-clients` (#156). The
+/// certificate, key and CA files are read again, as Redis reads them, also
+/// when a path is the same (a file renewed in place), and every handshake
+/// from then on, from clients and between nodes, uses them; connections
+/// already open keep theirs. Several are taken together, so that a
+/// certificate and its key can change in one `CONFIG SET`. If they cannot be
+/// loaded, nothing changes.
+#[cfg(feature = "tls")]
+fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, Vec<u8>> {
+    use crate::tls::acceptor;
+    let first = &changes[0].0;
+    let failed = |why: &str| {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{first}') - {why}"
+        ))
+    };
+    if let Some((_, value)) = changes.iter().find(|(name, _)| name == "tls-auth-clients")
+        && !crate::config::TLS_AUTH_CLIENTS.contains(&value.to_ascii_lowercase().as_str())
+    {
+        return Err(failed(
+            "argument(s) must be one of the following: no, yes, optional",
+        ));
+    }
+    let port = ctx.config.tls_port;
+    let before = TlsBefore {
+        listener: acceptor::files(port),
+        nodes: crate::node_tls::files(),
+    };
+    if before.listener.is_none() && before.nodes.is_none() {
+        // Nothing to load them into: what they would be for starts only
+        // with the server.
+        return Err(failed("can't set immutable config"));
+    }
+    let changed = |files: &Option<acceptor::Files>| {
+        files.clone().map(|mut files| {
+            for (name, value) in changes {
+                let value = if name == "tls-auth-clients" {
+                    value.to_ascii_lowercase()
+                } else {
+                    value.clone()
+                };
+                files.set(name, &value);
+            }
+            files
+        })
+    };
+    let unable = |e: String| {
+        log_warn!("TLS: CONFIG SET {first}: {e}");
+        failed("Unable to update TLS configuration. Check server logs.")
+    };
+    if let Some(files) = changed(&before.listener) {
+        acceptor::install(port, &files).map_err(unable)?;
+    }
+    if let Some(files) = changed(&before.nodes)
+        && let Err(e) = crate::node_tls::reload(files)
+    {
+        if let Some(files) = &before.listener {
+            let _ = acceptor::install(port, files);
+        }
+        return Err(unable(e));
+    }
+    for (name, value) in changes {
+        log_info!("CONFIG SET {name} {value}");
+    }
+    log_info!("TLS: certificates loaded again");
+    Ok(before)
+}
+
+/// Put TLS back as it was before [`config_set_tls`].
+#[cfg(feature = "tls")]
+fn config_set_tls_undo(ctx: &Ctx, before: TlsBefore) {
+    if let Some(files) = before.listener {
+        let _ = crate::tls::acceptor::install(ctx.config.tls_port, &files);
+    }
+    if let Some(files) = before.nodes {
+        let _ = crate::node_tls::reload(files);
+    }
+}
+
 /// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
 pub(crate) fn remembered_config(name: &str) -> Option<String> {
     REMEMBERED_CONFIG.lock().get(name).cloned()
@@ -1217,6 +1303,18 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     for (name, value) in in_effect {
         if !rows.iter().any(|(known, _)| known == name) {
             rows.push((name.to_string(), value));
+        }
+    }
+    // TLS's files, as `CONFIG SET` last loaded them.
+    #[cfg(feature = "tls")]
+    {
+        let files = crate::tls::acceptor::files(ctx.config.tls_port)
+            .or_else(crate::node_tls::files)
+            .unwrap_or_else(|| crate::tls::acceptor::Files::of(ctx.config));
+        for name in crate::tls::acceptor::SETTINGS {
+            if !rows.iter().any(|(known, _)| known == name) {
+                rows.push((name.to_string(), files.get(name).unwrap_or_default()));
+            }
         }
     }
     // The master this server replicates, under both of the setting's names.
@@ -3875,6 +3973,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR CONFIG SET failed (possibly related to argument '{twice}') -                              duplicate parameter"
                         )));
                     }
+                    // TLS's files are loaded together, first: a
+                    // certificate and its key are only good as a pair.
+                    #[cfg(feature = "tls")]
+                    let (tls, settings): (Vec<_>, Vec<_>) =
+                        settings.into_iter().partition(|(name, _)| {
+                            crate::tls::acceptor::SETTINGS.contains(&name.as_str())
+                        });
+                    #[cfg(feature = "tls")]
+                    let mut tls_before = if tls.is_empty() {
+                        None
+                    } else {
+                        match config_set_tls(ctx, &tls) {
+                            Ok(before) => Some(before),
+                            Err(reply) => return Some(reply),
+                        }
+                    };
                     // Several at once: all of them, or none. Each is set as
                     // it would be alone, in order; if one is refused, the
                     // ones before it are put back to what they were.
@@ -3899,6 +4013,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             ));
                         }
                         if reply.starts_with(b"-") {
+                            #[cfg(feature = "tls")]
+                            if let Some(before) = tls_before.take() {
+                                config_set_tls_undo(ctx, before);
+                            }
                             for (param, _) in &settings[..i] {
                                 match before.iter().find(|(known, _)| known == param) {
                                     Some((_, old)) => {

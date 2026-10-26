@@ -1186,12 +1186,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         use crate::tls::acceptor;
         use tokio::net::TcpListener;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
+        let tls_acceptor = match acceptor::install(config.tls_port, &acceptor::Files::of(&config)) {
             Ok(a) => a,
             Err(e) => {
                 log_fatal!("TLS: {e}");
@@ -1247,6 +1242,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let tls_aof_enabled = aof_enabled;
 
         let listen_acceptor = tls_acceptor.clone();
+        let tls_port = config.tls_port;
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1281,7 +1277,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             }
                         };
 
-                        let tls_stream = match listen_acceptor.clone().accept(tcp_stream).await {
+                        let tls_stream = match acceptor::current(tls_port)
+                            .unwrap_or_else(|| listen_acceptor.clone())
+                            .accept(tcp_stream)
+                            .await
+                        {
                             Ok(s) => s,
                             Err(e) => {
                                 // Full `Debug` — rustls errors often have empty `Display`; memtier may log "(null)" for the same failure.
@@ -1607,12 +1607,7 @@ async fn async_main_tokio(
     if config.tls_enabled() {
         use crate::tls::acceptor;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
+        let tls_acceptor = match acceptor::install(config.tls_port, &acceptor::Files::of(&config)) {
             Ok(a) => a,
             Err(e) => {
                 log_fatal!("TLS: {e}");
@@ -1665,6 +1660,7 @@ async fn async_main_tokio(
         let tls_tracking_table = Arc::clone(&tracking_table);
 
         let listen_acceptor = tls_acceptor.clone();
+        let tls_port = config.tls_port;
         tokio::spawn(async move {
             loop {
                 let (tcp_stream, peer_addr) = match tls_listener.accept().await {
@@ -1675,7 +1671,11 @@ async fn async_main_tokio(
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
+                let tls_stream = match acceptor::current(tls_port)
+                    .unwrap_or_else(|| listen_acceptor.clone())
+                    .accept(tcp_stream)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");

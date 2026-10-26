@@ -14,6 +14,18 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **TLS certificates are loaded again with `CONFIG SET`, without a restart
+  (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
+  `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or
+  `tls-client-key-file` reads the files again, also when the path is the
+  same (a certificate renewed in place by cert-manager or Let's Encrypt), and
+  every handshake from then on uses them: clients', and between the nodes of
+  a cluster or a replica and its master. Connections already open keep
+  theirs. Several in one `CONFIG SET` are loaded together, so that a
+  certificate and its key change as a pair. Files that cannot be loaded
+  change nothing: `Unable to update TLS configuration. Check server logs.`
+  These were answered `OK` and changed nothing.
+
 - **Active defrag (#113): memory freed by deletes goes back to the system.**
   After a reshard or a big delete at random, nearly every page still held
   a key that stayed, and the process kept its memory: 10 million keys of
