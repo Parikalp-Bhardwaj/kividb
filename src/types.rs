@@ -550,6 +550,10 @@ pub struct TsInner {
 
     /// Max timestamp ever seen (for TS.GET and INCRBY/DECRBY).
     pub last_ts: Option<u64>,
+
+    /// The series this one is a compaction of (`TS.CREATERULE`): `sourceKey`
+    /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
+    pub source: Option<String>,
 }
 
 impl TsInner {
@@ -562,6 +566,7 @@ impl TsInner {
             labels: AHashMap::new(),
             rules: Vec::new(),
             last_ts: None,
+            source: None,
         }
     }
 

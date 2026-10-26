@@ -541,7 +541,9 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
                 .i(),
             1
         );
-        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+"]);
+        // The bucket is still open: with LATEST, from the source the
+        // compaction still knows (#128).
+        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+", "LATEST"]);
         assert_eq!(compacted.arr().len(), 1);
         assert_eq!(compacted.arr()[0].arr()[1].s(), "20", "avg of 10 and 30");
 

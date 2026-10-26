@@ -120,6 +120,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A compaction rule wrote its open bucket as samples arrived, and
+  `LATEST` changed nothing (#128).** As in RedisTimeSeries, the destination
+  now gets a bucket once it has closed (when the first sample of a later one
+  arrives), and again if a sample is added to it later; the bucket still
+  open is reported only with `LATEST`, on `TS.GET`, `TS.MGET`, `TS.RANGE`,
+  `TS.REVRANGE`, `TS.MRANGE` and `TS.MREVRANGE`. Dashboards and downsampling
+  jobs saw partial values as final. A compaction knows its source:
+  `TS.INFO` reports `sourceKey`, and a destination takes one source only
+  (`TSDB: the destination key already has a src rule`). A snapshot with a
+  compaction in it is not readable by 1.1.2 and older.
+
 - **Scripts that only read run on a replica (#145).** `EVAL`, `EVALSHA` and
   `FCALL` were refused with `READONLY` on a replica before the script ran,
   even when it only read, so read/write splitting and cluster clients with
