@@ -111,6 +111,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`LASTSAVE` was 0 after a restart, and some persistence fields never
+  changed (#149).** `LASTSAVE` and `rdb_last_save_time` now start at the
+  server's start, as in Redis, and move with every save of the whole
+  dataset: `SAVE`, `BGSAVE`, the save at shutdown, a replica's after a full
+  sync, and a checkpoint of the AOF (`BGREWRITEAOF`, an automatic rewrite,
+  `CONFIG SET appendonly yes`), which writes `dump.kdb` too; they moved only
+  for `SAVE` and `BGSAVE`. `aof_last_rewrite_time_sec`,
+  `aof_last_rewrite_time_ms` and `aof_last_bgrewrite_status` report the last
+  rewrite (they were always `-1` and `ok`), and `rdb_last_bgsave_time_sec`
+  how long the last `BGSAVE` took, not when it ended.
+
 - **`INFO stats` reported no commands, hits or misses on a quiet server
   (#136).** `total_commands_processed`, `keyspace_hits` and
   `keyspace_misses` were counted in batches of 128 on each thread, and only

@@ -78,6 +78,7 @@ pub fn run_for_test(config: config::Config) {
         panic!("TLS between nodes: {e}");
     }
     crate::protected_mode::set(cfg.protected_mode);
+    crate::stats::record_save();
     let started_at = std::time::Instant::now();
 
     tokio::runtime::Builder::new_multi_thread()

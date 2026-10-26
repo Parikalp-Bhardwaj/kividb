@@ -374,6 +374,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `backupdirname` is relative to `dir`, which is now the working
     // directory.
     commands::backup::recover(&config);
+    // `LASTSAVE` until the first save: the start, as in Redis (#149).
+    stats::record_save();
 
     #[cfg(target_os = "linux")]
     match config.io_model {
