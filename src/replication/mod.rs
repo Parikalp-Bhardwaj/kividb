@@ -2260,7 +2260,6 @@ pub fn is_write_command(name: &str) -> bool {
         14 => matches!(
             name,
             "FT.ALIASUPDATE"
-                | "GEODELBYMEMBER"
                 | "GEOSEARCHSTORE"
                 | "JSON.ARRAPPEND"
                 | "JSON.ARRINSERT"
@@ -2318,7 +2317,6 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "FT.DROPINDEX",
     "FT.SYNUPDATE",
     "GEOADD",
-    "GEODELBYMEMBER",
     "GEOSEARCHSTORE",
     "GETDEL",
     "GETEX",
@@ -2493,7 +2491,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "FT.DICTADD" | "FT.DICTDEL" |
         // Bitmaps / HLL / Geo
         "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFMERGE" |
-        "GEOADD" | "GEODELBYMEMBER" | "GEOSEARCHSTORE" |
+        "GEOADD" | "GEOSEARCHSTORE" |
         // Arrays (Redis 8.8). ARSEEK counts as a write: it moves the insert
         // cursor, which is persisted state a replica must mirror or its
         // ARINSERT/ARNEXT would diverge from the master's.
