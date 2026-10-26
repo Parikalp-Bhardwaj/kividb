@@ -28,6 +28,65 @@ fn script_store() -> &'static RwLock<HashMap<String, Arc<str>>> {
     SCRIPT_STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
+/// past this, the least recently used goes. A client that writes its values
+/// into the script, rather than passing them as arguments, grew the cache
+/// for ever (#155). `SCRIPT LOAD`ed scripts are not counted, and stay.
+const EVAL_SCRIPTS_MAX: usize = 500;
+
+/// The scripts sent only with `EVAL`, by when they were last run.
+#[derive(Default)]
+struct EvalScripts {
+    by_use: std::collections::BTreeMap<u64, String>,
+    last_used: HashMap<String, u64>,
+    clock: u64,
+}
+
+static EVAL_SCRIPTS: std::sync::LazyLock<parking_lot::Mutex<EvalScripts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A script `EVAL` has just put in the cache: counted, and the least
+/// recently used let go past [`EVAL_SCRIPTS_MAX`].
+fn eval_script_added(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    scripts.clock += 1;
+    let now = scripts.clock;
+    if let Some(was) = scripts.last_used.insert(sha.to_string(), now) {
+        scripts.by_use.remove(&was);
+    }
+    scripts.by_use.insert(now, sha.to_string());
+    while scripts.by_use.len() > EVAL_SCRIPTS_MAX {
+        let Some((_, oldest)) = scripts.by_use.pop_first() else {
+            break;
+        };
+        scripts.last_used.remove(&oldest);
+        script_store().write().remove(&oldest);
+        crate::stats::EVICTED_SCRIPTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A cached script has been run: if it is one `EVAL` sent, it is now the most
+/// recently used.
+fn eval_script_used(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    let Some(was) = scripts.last_used.get(sha).copied() else {
+        return;
+    };
+    scripts.clock += 1;
+    let now = scripts.clock;
+    scripts.by_use.remove(&was);
+    scripts.by_use.insert(now, sha.to_string());
+    scripts.last_used.insert(sha.to_string(), now);
+}
+
+/// `SCRIPT LOAD` of a script: kept from now on, whatever `EVAL` sent.
+fn eval_script_loaded(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    if let Some(was) = scripts.last_used.remove(sha) {
+        scripts.by_use.remove(&was);
+    }
+}
+
 /// Whether a script's first line is a shebang with the `no-writes` flag.
 pub(crate) fn script_declares_no_writes(source: &[u8]) -> bool {
     let line = source.split(|b| *b == b'\n').next().unwrap_or_default();
@@ -3416,8 +3475,12 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         } else {
             sha
         };
-        match script_store().read().get(sha).cloned() {
-            Some(src) => src,
+        let found = script_store().read().get(sha).cloned();
+        match found {
+            Some(src) => {
+                eval_script_used(sha);
+                src
+            }
             None => return resp_error("NOSCRIPT No matching script. Please use EVAL."),
         }
     } else {
@@ -3428,14 +3491,24 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         // The stored copy, so that a script sent again and again is the one
         // already compiled (see `compiled_script`).
         let sha = sha1_hex(source);
-        if let Some(stored) = script_store().read().get(&sha).cloned() {
+        let stored = script_store().read().get(&sha).cloned();
+        if let Some(stored) = stored {
+            eval_script_used(&sha);
             stored
         } else {
-            script_store()
+            let mut added = false;
+            let stored = script_store()
                 .write()
-                .entry(sha)
-                .or_insert_with(|| Arc::from(source))
-                .clone()
+                .entry(sha.clone())
+                .or_insert_with(|| {
+                    added = true;
+                    Arc::from(source)
+                })
+                .clone();
+            if added {
+                eval_script_added(&sha);
+            }
+            stored
         }
     };
 
@@ -5215,6 +5288,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 .write()
                 .entry(sha.clone())
                 .or_insert_with(|| Arc::from(source));
+            eval_script_loaded(&sha);
             resp_bulk_str(&sha)
         }
         "EXISTS" => {
@@ -5242,6 +5316,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Some(_) => return resp_error("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
             };
             let scripts = std::mem::take(&mut *script_store().write());
+            *EVAL_SCRIPTS.lock() = EvalScripts::default();
             let vm = lua_vms_renew_for_admin(&[Vm::Eval]).unwrap_or_default();
             if async_free && scripts.len() > 64 {
                 let n = scripts.len() as u64;
