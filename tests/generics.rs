@@ -840,14 +840,15 @@ fn test_flushdb_only_current() {
 // AUTH COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// AUTH on a server with no password always succeeds
+// AUTH <password> on a server with no password is Redis's error (#135);
+// nothing else is held up by it
 #[test]
 fn test_auth_no_password_configured() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    assert!(c.cmds(&["AUTH", "anything"]).is_ok());
+    assert!(c.cmds(&["AUTH", "anything"]).is_error());
     // Normal commands still work
     assert!(c.cmds(&["SET", "auth:k", "v"]).is_ok());
 }
