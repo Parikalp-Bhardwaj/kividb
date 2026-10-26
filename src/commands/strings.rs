@@ -637,7 +637,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
 
                     match s.parse::<i64>() {
-                        Ok(n) => n + 1,
+                        // At i64::MAX it wrapped to i64::MIN, or panicked in a
+                        // debug build (#124).
+                        Ok(n) => match n.checked_add(1) {
+                            Some(n) => n,
+                            None => {
+                                return Some(resp_error(
+                                    "ERR increment or decrement would overflow",
+                                ));
+                            }
+                        },
                         Err(_) => {
                             return Some(resp_error("ERR value is not an integer or out of range"));
                         }

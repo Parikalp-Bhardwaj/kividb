@@ -111,6 +111,11 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`INCR` at the largest integer wrapped to the smallest (#124).** `INCR` on
+  `9223372036854775807` stored `-9223372036854775808` (and a debug build
+  panicked); it now answers `ERR increment or decrement would overflow` and
+  leaves the value, as `INCRBY` and Redis do.
+
 - **Monitoring saw less than Redis shows (#158).** The latency monitor's
   `command` and `fast-command` events are recorded when a command takes at
   least `latency-monitor-threshold` (in the config file too), as in Redis;
