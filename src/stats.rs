@@ -296,11 +296,16 @@ pub fn reset_rdb_changes() {
     }
 }
 
-/// 1 Hz sampling for `instantaneous_ops_per_sec` in INFO — safe from any startup path.
+/// 1 Hz sampling for `instantaneous_ops_per_sec` in INFO, and `used_memory`'s
+/// peak every 100 ms — safe from any startup path.
 pub fn spawn_instantaneous_ops_sampler() {
     std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        for tick in 1u64.. {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::commands::memory::used_and_peak();
+            if tick % 10 != 0 {
+                continue;
+            }
             let current = TOTAL_COMMANDS_PROCESSED.total();
             let last = LAST_SAMPLE_COMMANDS.swap(current, Ordering::Relaxed);
             INSTANTANEOUS_OPS.store(current.saturating_sub(last), Ordering::Relaxed);

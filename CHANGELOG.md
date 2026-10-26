@@ -111,6 +111,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`mem_fragmentation_ratio` was virtual size over RSS, so `MEMORY DOCTOR`
+  always warned (#152).** It is now Redis's: RSS over `used_memory`, on
+  every platform (it was a fixed `1.0` on macOS and Windows), with
+  `mem_fragmentation_bytes` their difference. An empty Linux server
+  reported `176.19`, and one with 100,000 keys `56.67`, where the ratio was
+  about 1.8; dashboards and alerts above 1.5 always fired. `MEMORY DOCTOR`
+  follows Redis's rules: nothing to say about an instance using under 5 MB,
+  fragmentation above 1.4 only when it is over 10 MB, and a peak half as
+  large again as now. `used_memory_peak` is the peak of `used_memory`,
+  sampled every 100 ms, not the most RSS seen when `INFO` ran;
+  `used_memory_startup` is measured at startup, not a fixed 1 MB. `CONFIG
+  GET lazyfree-lazy-user-del` answers `no`, which is what `DEL` does.
+
 - **`LASTSAVE` was 0 after a restart, and some persistence fields never
   changed (#149).** `LASTSAVE` and `rdb_last_save_time` now start at the
   server's start, as in Redis, and move with every save of the whole

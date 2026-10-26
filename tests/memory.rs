@@ -506,6 +506,43 @@ fn test_memory_stats_human_field_is_non_empty_string() {
 // MEMORY DOCTOR
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// `mem_fragmentation_ratio` is RSS over `used_memory`, as in Redis; it was
+/// virtual size over RSS, 56 with 100,000 keys. `used_memory_peak` is the
+/// peak of `used_memory`, not of RSS (#152).
+#[test]
+fn info_memory_fragmentation_is_rss_over_used_memory() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let value = "x".repeat(100);
+    for i in 0..50_000 {
+        c.cmd(&["SET", &format!("frag:{i}"), &value]);
+    }
+    let info = c.cmd(&["INFO", "memory"]);
+    let field = |name: &str| -> f64 {
+        info.as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name}"))
+            .trim_end_matches('%')
+            .parse()
+            .unwrap()
+    };
+    let (used, rss, ratio) = (
+        field("used_memory"),
+        field("used_memory_rss"),
+        field("mem_fragmentation_ratio"),
+    );
+    assert!(
+        (ratio - rss / used).abs() < 0.01,
+        "{ratio} vs {rss} / {used}"
+    );
+    assert!(ratio > 0.3 && ratio < 5.0, "{ratio}");
+    assert!(field("used_memory_peak") >= used);
+    let startup = field("used_memory_startup");
+    assert!(startup > 0.0 && startup < used, "{startup} {used}");
+}
+
 #[test]
 fn test_memory_doctor_returns_non_empty_string() {
     let port = free_port();
@@ -522,11 +559,14 @@ fn test_memory_doctor_healthy_on_fresh_server() {
     start_server(port);
     let mut c = Conn::connect(port);
     let result = c.cmd(&["MEMORY", "DOCTOR"]);
-    // Fresh server should report healthy
+    // The figures are the process's, and the other tests here fill and
+    // free memory in it: any of the doctor's findings can be true.
+    let msg = result.as_str();
     assert!(
-        result.as_str().contains("fine") || result.as_str().contains("fragmentation"),
-        "Expected healthy message or fragmentation warning, got: {}",
-        result.as_str()
+        ["fine", "very little memory", "High fragmentation", "Peak memory"]
+            .iter()
+            .any(|finding| msg.contains(finding)),
+        "Expected one of MEMORY DOCTOR's findings, got: {msg}"
     );
 }
 

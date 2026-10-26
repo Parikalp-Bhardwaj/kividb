@@ -1131,7 +1131,8 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             // No save points: nothing is saved on a timer.
             ("save", ""),
             ("appendfsync", "everysec"),
-            ("lazyfree-lazy-user-del", "yes"),
+            // `DEL` frees what it deletes before it replies (#152).
+            ("lazyfree-lazy-user-del", "no"),
             ("lazyfree-lazy-user-flush", "no"),
             ("lazyfree-lazy-expire", "yes"),
             ("lazyfree-lazy-server-del", "yes"),
@@ -3601,16 +3602,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if want("memory") {
-                let (rss, peak, vsize) = crate::commands::memory::read_proc_status_pub();
-                // Only Linux's VmSize/VmRSS are comparable enough for this to
-                // mean anything — see `memory::fragmentation`.
-                let (frag_ratio, frag_bytes) = crate::commands::memory::fragmentation(rss, vsize);
+                let (rss, _, _) = crate::commands::memory::read_proc_status_pub();
                 let maxmem = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
                 // What the process has allocated — what `maxmemory` is
                 // measured against — as distinct from what the operating
                 // system has given it, which is the RSS below.
-                let used = crate::memory_use::allocated();
-                let startup_memory: usize = 1_000_000;
+                let (used, peak) = crate::commands::memory::used_and_peak();
+                let (frag_ratio, frag_bytes) = crate::commands::memory::fragmentation(rss, used);
+                // What the server had allocated before any data; KiviDB
+                // counts no other overhead apart from the dataset.
+                let startup_memory = crate::commands::memory::startup_used().min(used);
                 let overhead = startup_memory;
                 let dataset = used.saturating_sub(overhead);
                 let dataset_perc = if used > 0 {
@@ -3643,7 +3644,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "used_memory_peak_perc:{:.2}%\r\n",
                     if peak > 0 {
-                        rss as f64 / peak as f64 * 100.0
+                        used as f64 / peak as f64 * 100.0
                     } else {
                         100.0
                     }
