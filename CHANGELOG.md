@@ -99,6 +99,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A backup sealed before a restart could not be cleaned up, and stood in
+  the way of the next one (#150).** A backup's state was only in memory:
+  after a restart, `BACKUP CLEANUP` said there was no backup and
+  `BACKUP START` that the directory was not empty, until its files were
+  deleted by hand; its `backup-sealed-ttl` never ran out. At startup, a
+  complete backup in `backupdirname` is now taken up again as sealed
+  (`BACKUP LIST`, `BACKUP CLEANUP`, and the TTL, counted from the seal), and
+  what a backup cut short by the restart left there as failed, cleared by
+  `BACKUP CLEANUP` or the next `BACKUP START`.
+
 - **Settings `CONFIG SET` takes stopped the server in the config file
   (#142).** `tracking-table-max-keys`, `array-slice-size`,
   `array-sparse-kmax`, `array-sparse-kmin`, `stream-node-max-entries`,

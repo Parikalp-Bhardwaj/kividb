@@ -597,6 +597,75 @@ fn an_unsealed_backup_can_be_aborted_and_started_again() {
     assert!(matches!(c.cmd(&["BACKUP", "HELP"]), V::Arr(_)));
 }
 
+/// A backup's state was only in memory: after a restart, a sealed backup
+/// could not be cleaned up, and no other could start (#150).
+#[test]
+fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    c.cmd(&["SET", "k", "v"]);
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let listed = c.cmd(&["BACKUP", "LIST"]).strings();
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    assert_eq!(c.cmd(&["BACKUP", "LIST"]).strings(), listed);
+    assert!(c.cmd(&["BACKUP", "CLEANUP"]).ok());
+    assert_eq!(status(&mut c).0, "idle");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    drop(c);
+
+    // Cut short by the restart: a failed backup, which the next one clears.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "failed");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let files = c.cmd(&["BACKUP", "LIST"]).strings();
+    assert_eq!(files.len(), 3, "{files:?}");
+}
+
+/// A sealed backup's `backup-sealed-ttl` counts from its seal, across a
+/// restart (#150).
+#[test]
+fn a_sealed_backup_from_before_a_restart_still_runs_out() {
+    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    wait_for_state(&mut c, "idle");
+    let left = std::fs::read_dir(server.dir.join("backupdir"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 0);
+}
+
 /// `preload-file` means "start from exactly this". If it cannot be loaded the
 /// server must not come up on some other dataset, or an empty one.
 #[test]
