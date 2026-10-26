@@ -78,6 +78,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A write of several keys could be seen half done (#159).** Keys are
+  spread over shards that threads work on at once, and only `MSET`,
+  `MSETNX` and `MGET` locked all of theirs together: a reader could find
+  a `DEL` of 200 keys with some gone and some not, a `RENAME` with neither
+  key there, a `SUNIONSTORE`, `SORT ... STORE` or `LMOVE` part way. In
+  Redis every command is one step. A write naming keys of more than one
+  shard now runs alone, as `EXEC` does: other commands wait for it, which
+  costs only those writes, not single-key ones or `MSET`.
+  And three transaction fixes:
+  - a command refused by ACL (`NOPERM`) inside `MULTI` aborts the
+    transaction, as any other refused command does: `EXEC` ran the rest;
+  - a write that changed nothing (`SET ... NX` on a key that exists, `SADD`
+    of a member there already, `EXPIRE` of a missing key) no longer fails
+    a `WATCH` on the key, as in Redis;
+  - on a replica, the writes its master sends fail a `WATCH`, as a client's
+    do; they did not.
+
 - **A client using client-side caching could be left serving changed keys
   (#161).** Invalidations were queued for a connection with room for 512
   (256 under io_uring), and one that found the queue full was dropped
