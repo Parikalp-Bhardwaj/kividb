@@ -149,6 +149,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`XREAD BLOCK` left its registration behind when it ended without data
+  (#170).** A reader that timed out, was unblocked, disconnected or was
+  woken by another of its streams stayed registered on every stream it
+  had named until an `XADD` to that stream. A client polling idle streams
+  with a short `BLOCK` grew the server's memory without limit. A reader is
+  now taken out of every stream it waited on when its read ends, in
+  constant time however many others wait on the same stream. (Found and
+  fixed by @Parikalp-Bhardwaj in #175.)
+
 - **With the AOF on, a write is acknowledged once its record is in the file
   (#147).** It was acknowledged as soon as its record was queued for the
   AOF's writer, so a process killed with no warning (`kill -9`, the OOM
