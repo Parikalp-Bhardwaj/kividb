@@ -958,6 +958,7 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // ── TS.INFO ───────────────────────────────────────────────────────────────────
 
 fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 2 {
         return Some(resp_error(
@@ -1011,7 +1012,8 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             out.push(resp_bulk_str("sourceKey"));
             out.push(match &ts.source {
                 Some(source) => resp_bulk_str(source),
-                None => resp_null_bulk(),
+                // RESP3's null to a RESP3 client: `$-1` there breaks it.
+                None => crate::resp::write::resp_null_for(resp),
             });
 
             // Rules
