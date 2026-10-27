@@ -308,7 +308,9 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
         Some(KiviDBValue::TimeSeries(inner)) => Ok((Arc::clone(inner), false)),
         Some(_) => Err(resp_error(WRONGTYPE)),
         None => {
-            let series: Series = Arc::new(RwLock::new(TsInner::new()));
+            let mut fresh = TsInner::new();
+            fresh.duplicate_policy = DuplicatePolicy::server_default();
+            let series: Series = Arc::new(RwLock::new(fresh));
             map.insert(Key::from(key), KiviDBValue::TimeSeries(Arc::clone(&series)));
             Ok((series, true))
         }
@@ -443,9 +445,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut ts = TsInner::new();
     ts.retention = retention;
     ts.chunk_size = chunk_size;
-    if let Some(dp) = dup_policy {
-        ts.duplicate_policy = dp;
-    }
+    ts.duplicate_policy = dup_policy.unwrap_or_else(DuplicatePolicy::server_default);
     for (lk, lv) in &labels {
         ts.labels.insert(lk.clone(), lv.clone());
     }

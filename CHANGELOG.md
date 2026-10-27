@@ -14,6 +14,13 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **`ts-duplicate-policy` (#127):** the duplicate policy of a time series
+  made without one, by `TS.CREATE` or `TS.ADD`. It stays `last`, so that an
+  upgraded server, and an AOF it replays, keep doing what they did; set it to
+  `block` for RedisTimeSeries's default, where a second sample at the same
+  timestamp is an error. A series keeps the policy it was made with. Config
+  file and `CONFIG SET`; set it alike on a master and its replicas.
+
 - **TLS certificates are loaded again with `CONFIG SET`, without a restart
   (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
   `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or
