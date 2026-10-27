@@ -552,6 +552,11 @@ impl BlockingWait {
         self.state.take()
     }
 
+    /// Whether it ends by itself at a time: `clients_in_timeout_table`.
+    pub fn has_timeout(&self) -> bool {
+        self.timeout.is_some()
+    }
+
     /// Whether parking this from a resume dispatch is intended rather than a
     /// handler that forgot its resume check. Each such park awaits a new
     /// signal, so it cannot spin.

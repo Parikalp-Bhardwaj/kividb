@@ -537,7 +537,10 @@ fn info_memory_fragmentation_is_rss_over_used_memory() {
         (ratio - rss / used).abs() < 0.01,
         "{ratio} vs {rss} / {used}"
     );
-    assert!(ratio > 0.3 && ratio < 5.0, "{ratio}");
+    // Not near 1 with as little as this: a new server's RSS is mostly its
+    // own (threads, Lua's VMs), 5.3 on a CI runner. Virtual over resident
+    // size, the old figure, was 56.
+    assert!(ratio > 0.3 && ratio < 10.0, "{ratio}");
     assert!(field("used_memory_peak") >= used);
     let startup = field("used_memory_startup");
     assert!(startup > 0.0 && startup < used, "{startup} {used}");
@@ -622,14 +625,15 @@ fn test_memory_malloc_stats_returns_string() {
 }
 
 #[test]
-fn test_memory_malloc_stats_contains_malloc_tag() {
+fn test_memory_malloc_stats_says_what_redis_without_jemalloc_says() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
     let result = c.cmd(&["MEMORY", "MALLOC-STATS"]);
-    assert!(
-        result.as_str().contains("malloc"),
-        "MEMORY MALLOC-STATS should contain '<malloc' tag"
+    // It was a fixed piece of XML that looked like statistics (#152).
+    assert_eq!(
+        result.as_str(),
+        "Stats not supported for the current allocator"
     );
 }
 

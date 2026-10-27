@@ -48,10 +48,12 @@ other files:
 - The config file is read strictly: an unknown directive stops the server.
 
 **Durability**
-- With the AOF on, a hard kill (`kill -9`, the OOM killer) can lose the last
-  few acknowledged writes. In testing that was up to four. Redis loses none
-  to a process kill. A clean shutdown loses nothing, and a power failure up
-  to a second, as with Redis's `everysec`.
+- With the AOF on, a write is acknowledged once its record is in the file,
+  as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
+  write, and a power failure up to a second, as with Redis's `everysec`.
+  Before 1.1.3 a write was acknowledged once its record was queued, and a
+  hard kill could lose the last few; `aof-ack-after-write no` still does
+  that, for more writes a second.
 
 **Data**
 - HyperLogLog registers aren't in Redis's layout

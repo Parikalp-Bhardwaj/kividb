@@ -14,6 +14,13 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **`ts-duplicate-policy` (#127):** the duplicate policy of a time series
+  made without one, by `TS.CREATE` or `TS.ADD`. It stays `last`, so that an
+  upgraded server, and an AOF it replays, keep doing what they did; set it to
+  `block` for RedisTimeSeries's default, where a second sample at the same
+  timestamp is an error. A series keeps the policy it was made with. Config
+  file and `CONFIG SET`; set it alike on a master and its replicas.
+
 - **TLS certificates are loaded again with `CONFIG SET`, without a restart
   (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
   `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or
@@ -119,6 +126,55 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `bad argument #2 to 'assert' (string expected, got table)`.
 
 ### Fixed
+
+- **With the AOF on, a write is acknowledged once its record is in the file
+  (#147).** It was acknowledged as soon as its record was queued for the
+  AOF's writer, so a process killed with no warning (`kill -9`, the OOM
+  killer, a container stopped without a grace period) lost writes its
+  clients had been told were made: one to four in our tests, more under a
+  burst. As in Redis, the replies to a batch of commands that wrote now wait
+  for their records to reach the file (the page cache: `appendfsync
+  everysec` still syncs it within the second, so a crash of the machine
+  can lose up to a second, as in Redis). Waiting connections are answered
+  together by one write, a group commit; reads, and everything with the AOF
+  off, wait for nothing. A connection writes its own records before it
+  replies, with no thread to wake. It costs writes: on a 16-core server
+  with the AOF on, 20-28% of `SET`s a second with 50 clients and
+  pipelined, under 10% with one client, nothing for reads. The new setting
+  `aof-ack-after-write no` (default `yes`, also `CONFIG SET`) gives 1.1.2's
+  behaviour and speed back, for those who would rather lose the last few
+  writes to a kill.
+
+- **Pub/Sub: channel names are binary-safe, and a subscriber over the soft
+  limit is cut off on time (#161).** `PUBLISH` refused a channel name that
+  was not UTF-8, and `SUBSCRIBE` changed one into another (`\xff` became
+  `�`); names are now bytes, as in Redis, through `PUBSUB CHANNELS` and
+  `NUMSUB` and across a cluster's nodes. A subscriber over the 8 MB soft
+  limit for 60 seconds was disconnected only when another message was
+  published to it; a check every second now does it.
+
+- **More of `INFO` and `CLIENT LIST` is measured (#152, #158).**
+  `mem_replication_backlog` is what the backlog holds, and
+  `mem_clients_normal` and `mem_clients_slaves` what the clients' query
+  buffers hold (they were 0); `CLIENT LIST`'s `multi` is the commands a
+  client has queued in its transaction (-1 outside one), `watch` the keys it
+  watches, and `tot-mem` its query buffer (they were -1, 0 and 0);
+  `clients_in_timeout_table` counts the clients blocked with a timeout.
+  `INFO all` and `everything` give a `keysizes` count up to 10 seconds old,
+  so that an exporter scraping them pays for one pass over the keys per 10
+  seconds rather than one each time (`INFO keysizes` counts now).
+  `MEMORY MALLOC-STATS` says what Redis says when it is not built with
+  jemalloc, as KiviDB is not: `Stats not supported for the current
+  allocator`; it was a fixed piece of XML. The allocator's internals
+  (`allocator_active`, its ratios) are not something KiviDB can read, and
+  `fd`, `obl`, `oll`, `omem` and `argv-mem` have no counterpart in how it
+  writes replies.
+
+- **Scripts: the `struct` library (#154).** `struct.pack`, `struct.unpack`
+  and `struct.size`, with Redis's formats (`>`, `<`, `!`, `x`, `b`/`B`,
+  `h`/`H`, `l`/`L`, `T`, `i`/`I` with a size, `c` with a size or `c0`, `s`,
+  `f`, `d`). A script that used it failed with `attempted to access
+  nonexistent global variable 'struct'`.
 
 - **Shard channels: `SPUBLISH` reaches a replica's subscribers, and
   `SSUBSCRIBE` is routed in a cluster (#161).** Standalone, `PUBLISH` went

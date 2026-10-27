@@ -320,7 +320,7 @@ async fn park_blocking_uring(
     let block_state = wait.take_state();
     let (client_registry, client_id) = client;
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
-    client_registry.set_blocked(client_id, Some(unblock_tx));
+    client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = std::os::fd::AsRawFd::as_raw_fd(&**stream);
     let delivery = {
         let waiting = wait.wait();
@@ -353,7 +353,7 @@ async fn park_blocking_uring(
             }
         }
     };
-    client_registry.set_blocked(client_id, None);
+    client_registry.set_blocked(client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
     // leaves the line it was standing in.
@@ -725,6 +725,9 @@ pub async fn handle_client(
     // Transaction state — only touched when MULTI/EXEC/WATCH are used.
     use crate::commands::transaction::TxState;
     let mut tx = TxState::new();
+    // A command of the batch being answered may have queued an AOF
+    // record: its reply waits for it (see `aof::written`).
+    let mut aof_wait = false;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
     // state (not read from client_registry per command) so execute_command's
@@ -898,6 +901,9 @@ pub async fn handle_client(
             if !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
+            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
+                aof_wait = true;
+            }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             reply_gate.settle(&mut out_buf);
@@ -1053,6 +1059,9 @@ pub async fn handle_client(
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(wait) = blocking_slot.take_parked() {
+                        if std::mem::take(&mut aof_wait) {
+                            crate::aof::written(&aof_tx).await;
+                        }
                         match park_blocking_uring(
                             wait,
                             &mut blocking_slot,
@@ -1124,6 +1133,9 @@ pub async fn handle_client(
                 });
                 if let Some(wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
+                    if std::mem::take(&mut aof_wait) {
+                        crate::aof::written(&aof_tx).await;
+                    }
                     match park_blocking_uring(
                         wait,
                         &mut blocking_slot,
@@ -2468,6 +2480,11 @@ pub async fn handle_client(
         // they reach the client immediately instead of waiting for the next
         // command. The guard keeps the two writers from interleaving.
         activity.note_flush(out_buf.len(), commands_before);
+        activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
+        // Replies to writes go out once their records are in the AOF (#147).
+        if std::mem::take(&mut aof_wait) {
+            crate::aof::written(&aof_tx).await;
+        }
         if !out_buf.is_empty() {
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES

@@ -346,12 +346,12 @@ pub fn process_message(
             if sender_is_member(state, &sender_id)
                 && let Some(hooks) = state.hooks.get()
             {
-                let channel = String::from_utf8_lossy(&channel);
+                // The name as it was published, bytes and all (#161).
                 let payload: Arc<[u8]> = Arc::from(payload.as_slice());
                 if sharded {
-                    hooks.pubsub.spublish(&channel, payload);
+                    hooks.pubsub.spublish(&channel[..], payload);
                 } else {
-                    hooks.pubsub.publish(&channel, payload);
+                    hooks.pubsub.publish(&channel[..], payload);
                 }
             }
             None

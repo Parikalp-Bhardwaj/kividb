@@ -96,6 +96,22 @@ impl Conn {
         self.read()
     }
 
+    /// An `INCR`'s reply, or `None` once the server is gone.
+    fn try_cmd(&mut self, args: &[&str]) -> Option<V> {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            buf.extend_from_slice(a.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).ok()?;
+        let mut line = String::new();
+        if self.reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        line.trim_end().strip_prefix(':')?.parse().ok().map(V::Int)
+    }
+
     fn read(&mut self) -> V {
         let mut line = String::new();
         self.reader.read_line(&mut line).expect("reply");
@@ -659,6 +675,68 @@ fn lastsave_starts_at_the_start_and_moves_with_every_save() {
     wait_for_field(&mut c, "rdb_bgsave_in_progress", 0);
     let took = persistence_field(&mut c, "rdb_last_bgsave_time_sec");
     assert!((0..60).contains(&took), "{took}");
+}
+
+/// With the AOF on, a write is acknowledged once its record is in the file:
+/// a server killed with no warning keeps every write its clients were told
+/// was made. It acknowledged the write once the record was queued, and lost
+/// the last few (#147).
+#[test]
+fn a_killed_server_keeps_every_acknowledged_write() {
+    let mut server = Server::start(&["--aof"]);
+    let port = server.port;
+    // The default; `no` gives up the guarantee for speed (1.1.2's way).
+    let mut c = server.conn();
+    let setting = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
+    assert_eq!(setting.arr()[1].s(), "yes");
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "no"]).ok());
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "maybe"])
+            .is_err()
+    );
+    drop(c);
+    for round in 0..3 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..6)
+            .map(|w| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    let key = format!("acked:{round}:{w}");
+                    let mut acked = 0i64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let reply = c.try_cmd(&["INCR", &key]);
+                        match reply {
+                            Some(V::Int(n)) => acked = n,
+                            _ => break,
+                        }
+                    }
+                    (key, acked)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(700));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        server.child = kividb(&server.dir, port, &["--aof"])
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("could not restart kividb");
+        let mut c = server.conn();
+        for (key, acked) in acked {
+            let kept: i64 = match c.cmd(&["GET", &key]) {
+                V::Str(n) => n.parse().unwrap(),
+                _ => 0,
+            };
+            assert!(
+                kept >= acked,
+                "round {round}: {key} kept {kept}, {acked} acknowledged"
+            );
+        }
+    }
 }
 
 /// A backup's state was only in memory: after a restart, a sealed backup

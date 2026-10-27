@@ -38,6 +38,8 @@ impl AofSender for tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
     fn send_aof(&self, data: Vec<u8>) {
         if self.send(data).is_err() {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }
@@ -46,6 +48,8 @@ impl AofSender for std::sync::mpsc::SyncSender<Vec<u8>> {
     fn send_aof(&self, data: Vec<u8>) {
         if self.send(data).is_err() {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }

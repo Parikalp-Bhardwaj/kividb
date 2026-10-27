@@ -572,6 +572,11 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     super::glob_redis::matches(pattern.as_bytes(), text.as_bytes())
 }
 
+/// [`glob_match`] of bytes: a channel's name need not be UTF-8.
+pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    super::glob_redis::matches(pattern, text)
+}
+
 pub fn get_expiry_shard<'a>(
     expiry_store: &'a ExpiryStore,
     db: usize,

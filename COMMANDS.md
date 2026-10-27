@@ -658,7 +658,7 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap |
+| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block` |
 | `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels. Updating labels atomically rebuilds the label index |
 | `TS.DEL` | `TS.DEL key fromTimestamp toTimestamp` | Delete all samples in the inclusive timestamp range. Returns the count of deleted samples |
 

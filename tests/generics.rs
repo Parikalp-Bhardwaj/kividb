@@ -2892,3 +2892,66 @@ fn test_bcast_pending_is_told_before_acl_setuser_changes_the_user() {
     assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
     assert_eq!(parts[1].as_array()[0].as_str(), "p:x");
 }
+
+/// `CLIENT LIST` reports a client's transaction (`multi`, the commands it
+/// has queued, -1 outside one) and the keys it watches (`watch`), and `INFO clients` the clients blocked with a
+/// timeout. They were fixed (#158).
+#[test]
+fn test_client_list_reports_transactions_and_blocked_clients() {
+    let field = |line: &str, name: &str| -> i64 {
+        client_list_field(line, name)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+    };
+    let port = free_port();
+    start_server(port);
+    let mut observer = Conn::connect(port);
+    let mut client = Conn::connect(port);
+    client.cmds(&["CLIENT", "SETNAME", "in-tx"]);
+    let line = |observer: &mut Conn| -> String {
+        observer
+            .cmds(&["CLIENT", "LIST"])
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=in-tx"))
+            .expect("the client")
+            .to_string()
+    };
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (-1, 0));
+    // An idle client has given its query buffer back: nothing to count.
+    assert_eq!(field(&now, "tot-mem="), 0, "{now}");
+
+    client.cmds(&["WATCH", "w1", "w2"]);
+    client.cmds(&["MULTI"]);
+    client.cmds(&["SET", "w1", "1"]);
+    client.cmds(&["INCR", "w2"]);
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (2, 2));
+    client.cmds(&["EXEC"]);
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (-1, 0));
+
+    // Blocked with a timeout: in the table while it waits.
+    let in_table = |observer: &mut Conn| -> i64 {
+        observer
+            .cmds(&["INFO", "clients"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("clients_in_timeout_table:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = in_table(&mut observer);
+    let mut waiter = Conn::connect(port);
+    let blocked = std::thread::spawn(move || waiter.cmds(&["BLPOP", "never-pushed", "3"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while in_table(&mut observer) <= before {
+        assert!(std::time::Instant::now() < deadline, "never counted");
+        thread::sleep(Duration::from_millis(20));
+    }
+    observer.cmds(&["LPUSH", "never-pushed", "x"]);
+    blocked.join().unwrap();
+}
