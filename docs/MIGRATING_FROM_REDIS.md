@@ -108,7 +108,7 @@ What the RDB reader takes from Redis:
 - **With the AOF on, a write is answered once its record is in the file**,
   as in Redis: a `kill -9` or an OOM kill loses no acknowledged write, and a
   power failure loses up to a second, as with Redis's `appendfsync
-  everysec`. Before 1.1.3 a write was answered once its record was queued,
+  everysec`. Before 1.2 a write was answered once its record was queued,
   and a hard kill could lose the last few; `aof-ack-after-write no` still
   does that, for more writes a second (see [PERSISTENCE.md](PERSISTENCE.md)).
 - [PERSISTENCE.md](PERSISTENCE.md) covers snapshots, checkpoints, backups
