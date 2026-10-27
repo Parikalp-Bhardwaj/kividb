@@ -537,7 +537,10 @@ fn info_memory_fragmentation_is_rss_over_used_memory() {
         (ratio - rss / used).abs() < 0.01,
         "{ratio} vs {rss} / {used}"
     );
-    assert!(ratio > 0.3 && ratio < 5.0, "{ratio}");
+    // Not near 1 with as little as this: a new server's RSS is mostly its
+    // own (threads, Lua's VMs), 5.3 on a CI runner. Virtual over resident
+    // size, the old figure, was 56.
+    assert!(ratio > 0.3 && ratio < 10.0, "{ratio}");
     assert!(field("used_memory_peak") >= used);
     let startup = field("used_memory_startup");
     assert!(startup > 0.0 && startup < used, "{startup} {used}");

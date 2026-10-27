@@ -491,6 +491,10 @@ fn test_readers_never_see_a_multi_key_write_half_done() {
     let port = free_port();
     start_server(port);
     let keys: Vec<String> = (0..200).map(|i| format!("d{i}")).collect();
+    let mut w = Conn::connect(port);
+    // Before the reader starts: a reader that came first found neither
+    // `from` nor `to`, and counted that as a RENAME half done.
+    w.cmds(&["SET", "from", "x"]);
     let stop = Arc::new(AtomicBool::new(false));
     let torn = Arc::new(AtomicU64::new(0));
     let reader = {
@@ -512,8 +516,6 @@ fn test_readers_never_see_a_multi_key_write_half_done() {
             }
         })
     };
-    let mut w = Conn::connect(port);
-    w.cmds(&["SET", "from", "x"]);
     for _ in 0..300 {
         let mut mset = vec!["MSET"];
         for k in &keys {
