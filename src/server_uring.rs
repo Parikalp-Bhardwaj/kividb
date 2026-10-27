@@ -320,7 +320,7 @@ async fn park_blocking_uring(
     let block_state = wait.take_state();
     let (client_registry, client_id) = client;
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
-    client_registry.set_blocked(client_id, Some(unblock_tx));
+    client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = std::os::fd::AsRawFd::as_raw_fd(&**stream);
     let delivery = {
         let waiting = wait.wait();
@@ -353,7 +353,7 @@ async fn park_blocking_uring(
             }
         }
     };
-    client_registry.set_blocked(client_id, None);
+    client_registry.set_blocked(client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
     // leaves the line it was standing in.
@@ -2468,6 +2468,7 @@ pub async fn handle_client(
         // they reach the client immediately instead of waiting for the next
         // command. The guard keeps the two writers from interleaving.
         activity.note_flush(out_buf.len(), commands_before);
+        activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
         if !out_buf.is_empty() {
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES

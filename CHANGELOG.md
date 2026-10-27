@@ -127,6 +127,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **More of `INFO` and `CLIENT LIST` is measured (#152, #158).**
+  `mem_replication_backlog` is what the backlog holds, and
+  `mem_clients_normal` and `mem_clients_slaves` what the clients' query
+  buffers hold (they were 0); `CLIENT LIST`'s `multi` is the commands a
+  client has queued in its transaction (-1 outside one), `watch` the keys it
+  watches, and `tot-mem` its query buffer (they were -1, 0 and 0);
+  `clients_in_timeout_table` counts the clients blocked with a timeout.
+  `INFO all` and `everything` give a `keysizes` count up to 10 seconds old,
+  so that an exporter scraping them pays for one pass over the keys per 10
+  seconds rather than one each time (`INFO keysizes` counts now).
+  `MEMORY MALLOC-STATS` says what Redis says when it is not built with
+  jemalloc, as KiviDB is not: `Stats not supported for the current
+  allocator`; it was a fixed piece of XML. The allocator's internals
+  (`allocator_active`, its ratios) are not something KiviDB can read, and
+  `fd`, `obl`, `oll`, `omem` and `argv-mem` have no counterpart in how it
+  writes replies.
+
 - **Scripts: the `struct` library (#154).** `struct.pack`, `struct.unpack`
   and `struct.size`, with Redis's formats (`>`, `<`, `!`, `x`, `b`/`B`,
   `h`/`H`, `l`/`L`, `T`, `i`/`I` with a size, `c` with a size or `c0`, `s`,

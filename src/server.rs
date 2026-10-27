@@ -122,7 +122,7 @@ where
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
-        .set_blocked(waiter.client_id, Some(unblock_tx));
+        .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
     let delivery = {
         let waiting = wait.wait();
         tokio::pin!(waiting);
@@ -164,7 +164,9 @@ where
             }
         }
     };
-    waiter.client_registry.set_blocked(waiter.client_id, None);
+    waiter
+        .client_registry
+        .set_blocked(waiter.client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
     // leaves the line it was standing in.
@@ -2249,6 +2251,7 @@ where
 
         // One TCP write per read syscall batch (pipelining).
         activity.note_flush(combined.len(), commands_before);
+        activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
         if write_tcp_batch(&writer, &mut combined).await.is_err() {
             break;
         }
