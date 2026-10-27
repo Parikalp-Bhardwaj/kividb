@@ -65,6 +65,28 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **Release candidates are no longer published as GitHub Releases.** A tag
+  such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
+  (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its binaries
+  stay with the workflow run; the Releases page lists only releases.
+
+- **Key specs come from Valkey's command files, and from KiviDB's own.**
+  The key specs that `COMMAND INFO` and `COMMAND DOCS` report, and that a
+  cluster routes by, were generated from Redis 8.10's command files, which
+  are not under a licence KiviDB can ship in every build. They are now
+  generated from Valkey 9.1.3's (BSD 3-Clause, see `NOTICE`). The commands
+  Valkey does not have (the `AR*` array commands, `DELEX`, `DIGEST`,
+  `INCREX`, `LMOVEM`, `BLMOVEM`, `SDIFFCARD`, `SUNIONCARD`, `XACKDEL`,
+  `XDELEX`, `XNACK`, `XCFGSET`, `XIDMPRECORD`, `HIMPORT SET`) and `HSETEX`,
+  which KiviDB implements as Redis 8 does, have specs written for KiviDB
+  (`scripts/key_specs_kividb.json`). Which arguments are keys is unchanged.
+  Some flags differ from Redis's:
+  - `ARCOUNT`, `ARLEN`, `ARINFO` and `ARNEXT` are `RO` without `access`;
+  - `ARINSERT` and `ARRING` are `insert`, not `update`;
+  - `DELEX` is `RM delete`, not `RW delete variable_flags`;
+  - the `STORE` and `STOREDIST` keys of `GEORADIUS` and `GEORADIUSBYMEMBER`
+    carry `variable_flags`.
+
 - **`AUTH <password>` is refused when no password is set, as in Redis
   (#135).** With the `default` user open (no `requirepass`), `AUTH` with a
   password replied `OK`; it now replies `ERR AUTH <password> called without
@@ -240,7 +262,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   so. Scripts that opened with it failed before doing anything.
   `redis.set_repl(redis.REPL_ALL)` is taken; keeping a script's writes from
   the AOF or the replicas is not supported, and is refused rather than
-  ignored. The `struct` library is still missing.
+  ignored.
 
 - **A compaction rule wrote its open bucket as samples arrived, and
   `LATEST` changed nothing (#128).** As in RedisTimeSeries, the destination
