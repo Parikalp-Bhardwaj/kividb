@@ -105,13 +105,11 @@ What the RDB reader takes from Redis:
 - Turn on the append-only file (`--aof` or `appendonly yes`) if you need
   writes to survive a restart. Without it, data is only on disk after a
   `BGSAVE`, or at a clean shutdown.
-- **With the AOF on, a hard kill can lose the last few acknowledged
-  writes.** A write is answered when its record is queued for the file, not
-  once it's written there. In testing, a `kill -9` or an OOM kill lost up to
-  four writes. A clean shutdown loses nothing, and a power failure loses up
-  to a second, as with Redis's `appendfsync everysec`. Redis itself loses
-  nothing to a process kill. If your application can't afford that, keep it
-  in mind. Closing this gap is planned.
+- **With the AOF on, a write is answered once its record is in the file**,
+  as in Redis: a `kill -9` or an OOM kill loses no acknowledged write, and a
+  power failure loses up to a second, as with Redis's `appendfsync
+  everysec`. Before 1.1.3 a write was answered once its record was queued,
+  and a hard kill could lose the last few.
 - [PERSISTENCE.md](PERSISTENCE.md) covers snapshots, checkpoints, backups
   and what recovery guarantees.
 
