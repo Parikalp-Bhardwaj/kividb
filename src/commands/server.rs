@@ -880,6 +880,20 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             // What the latency monitor records (#158): remembered too, for
             // `CONFIG GET`.
+            // The policy of a series made without one (#127).
+            "ts-duplicate-policy" => match crate::types::DuplicatePolicy::parse(value) {
+                Some(policy) => {
+                    crate::types::DuplicatePolicy::set_server_default(&policy);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), policy.as_str().to_ascii_lowercase());
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'ts-duplicate-policy') \
+                     - argument(s) must be one of the following: block, first, last, min, max, sum",
+                )),
+            },
             "latency-monitor-threshold" => match value.parse::<i64>() {
                 Ok(ms) if ms >= 0 => {
                     crate::latency::set_threshold_ms(ms as u64);
@@ -1165,6 +1179,7 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("timeout", "0"),
             ("tcp-keepalive", "300"),
             ("latency-monitor-threshold", "0"),
+            ("ts-duplicate-policy", "last"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))

@@ -1604,7 +1604,7 @@ impl Config {
                     }
                     // Remembered for `CONFIG GET`, and in effect too.
                     Some(_)
-                        if key == "latency-monitor-threshold"
+                        if matches!(key, "latency-monitor-threshold" | "ts-duplicate-policy")
                             || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
