@@ -435,24 +435,22 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
     };
+    // `TIMEOUT` where an option may be, not a word of another clause that
+    // happens to read `TIMEOUT` (`APPLY … AS timeout`, a parameter).
     let mut timeout_ms = None;
-    let mut i = 3;
-    while i + 1 < cmd.len() {
-        if cmd[i].eq_ignore_ascii_case(b"TIMEOUT") {
-            match std::str::from_utf8(cmd[i + 1])
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                Some(ms) => timeout_ms = Some(ms),
-                None => {
-                    return Some(resp_error(
-                        "Bad arguments for TIMEOUT: expected a non-negative integer",
-                    ));
-                }
+    if let Some(at) = crate::commands::aggregate_pipeline::option_at(cmd, 3, "TIMEOUT") {
+        match cmd
+            .get(at + 1)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(ms) => timeout_ms = Some(ms),
+            None => {
+                return Some(resp_error(
+                    "Bad arguments for TIMEOUT: expected a non-negative integer",
+                ));
             }
-            break;
         }
-        i += 1;
     }
     let deadline = crate::commands::search::search_deadline(timeout_ms);
 
@@ -537,15 +535,13 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             rows.push(row);
         }
     }
-    if crate::commands::search::past_deadline(deadline) {
-        timed_out = true;
-    }
 
     // ── A KNN clause: the nearest `k` of what the filter left ────────────────
     //
     // Exactly, as FT.SEARCH does with a filter, and with the distance under
     // the clause's name, for the pipeline. It was dropped, and every
-    // document the filter left went on (#162).
+    // document the filter left went on (#162). After a scan cut short, of
+    // the rows it found; and it keeps the deadline too.
     if let Some(knn) = &knn {
         let Some(field) = def.fields.iter().find(|f| f.name == knn.field) else {
             return Some(resp_error("The vector field is gone from the index"));
@@ -560,7 +556,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             .iter()
             .filter_map(|row| row.get("__key").cloned())
             .collect();
-        let nearest = knn_filtered(live, &knn.vector, knn.k, metric, &candidates);
+        let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, &candidates, deadline);
+        timed_out |= cut;
         let rank: ahash::AHashMap<String, (usize, f32)> = nearest
             .into_iter()
             .enumerate()
@@ -579,13 +576,16 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // ── The rest of the cluster ──────────────────────────────────────────────
     // Asked by a coordinator: the rows as they are, every column, and
-    // whether this scan ran out of time. A coordinator: the rows of every
+    // whether this scan ran out of time, if the coordinator asks (one from
+    // before there was a timeout does not). A coordinator: the rows of every
     // other master too, before any step, then `ON_TIMEOUT`.
     if crate::cluster::search::is_forwarded(ctx) {
-        return Some(crate::cluster::search::encode_rows(&rows, timed_out));
+        let flag = crate::cluster::search::wants_timeout_flag(cmd).then_some(timed_out);
+        return Some(crate::cluster::search::encode_rows(&rows, flag));
     }
     if crate::cluster::search::coordinates(ctx) {
-        let owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        let mut owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        crate::cluster::search::ask_for_timeout_flag(&mut owned);
         match crate::cluster::search::fan_out(ctx, &owned) {
             Ok(replies) => {
                 for reply in replies {
@@ -612,7 +612,13 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     // ── Parse and execute pipeline clauses ────────────────────────────────────
-    let rows = crate::commands::aggregate_pipeline::run(rows, cmd, 3);
+    // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
+    // scan cost as much as the scan.
+    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    timed_out |= cut;
+    if cut && crate::commands::search::on_timeout_fails() {
+        return Some(resp_error("Timeout limit was reached"));
+    }
 
     // ── Emit final rows ─────────────────────────────────────────────────────
     //
@@ -1259,20 +1265,31 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
 
-/// Brute-force KNN over only the keys in `candidates`.
+/// Brute-force KNN over only the keys in `candidates`. Stops when
+/// `deadline` has passed, with the nearest of the candidates measured so
+/// far, and then the second value is true.
 pub(crate) fn knn_filtered(
     live_index: &crate::vector::LiveIndex,
     query: &[f32],
     k: usize,
     metric: &crate::vector::DistanceMetric,
     candidates: &std::collections::HashSet<String>,
-) -> Vec<crate::vector::KnnResult> {
+    deadline: Option<std::time::Instant>,
+) -> (Vec<crate::vector::KnnResult>, bool) {
+    // A distance per candidate: the clock is read every DEADLINE_EVERY.
+    let mut seen = 0u32;
+    let mut cut = false;
+    let mut in_time = |_: &&String| {
+        cut = cut || crate::commands::search::deadline_due(deadline, &mut seen);
+        !cut
+    };
     // Pull the vectors for candidate keys only
     let mut scored: Vec<(f32, String)> = match live_index {
         crate::vector::LiveIndex::Flat(idx) => {
             let vectors = idx.vectors.read();
             candidates
                 .iter()
+                .take_while(&mut in_time)
                 .filter_map(|key| vectors.get(key).map(|v| (v.clone(), key.clone())))
                 .filter(|(v, _)| v.len() == query.len())
                 .map(|(v, key)| (crate::vector::distance(metric, query, &v), key))
@@ -1283,6 +1300,7 @@ pub(crate) fn knn_filtered(
             let nodes = idx.nodes.read();
             candidates
                 .iter()
+                .take_while(&mut in_time)
                 .filter_map(|key| key_to_id.get(key).map(|&id| (id, key.clone())))
                 .filter_map(|(id, key)| {
                     let n = &nodes[id];
@@ -1302,10 +1320,11 @@ pub(crate) fn knn_filtered(
     }
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-    scored
+    let nearest = scored
         .into_iter()
         .map(|(score, key)| crate::vector::KnnResult { key, score })
-        .collect()
+        .collect();
+    (nearest, cut)
 }
 
 /// Backfill a subset of vector fields after FT.ALTER added them.

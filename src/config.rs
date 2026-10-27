@@ -1887,7 +1887,8 @@ mod config_file_tests {
     fn config_set_settings_are_directives_too() {
         let (_, warnings) = load(
             "stream-node-max-entries 100\nstream-node-max-bytes 4kb\n\
-             tracking-table-max-keys 1000000\nbusy-reply-threshold 5000\n",
+             tracking-table-max-keys 1000000\nbusy-reply-threshold 5000\n\
+             search-timeout 0\nsearch-on-timeout return\n",
         )
         .unwrap();
         #[cfg(feature = "lua")]
@@ -1907,6 +1908,14 @@ mod config_file_tests {
         assert!(err.contains("power of two"), "{err}");
         let err = load("stream-node-max-entries -1\n").unwrap_err();
         assert!(err.contains("stream-node-max-entries"), "{err}");
+        for bad in [
+            "search-timeout -1\n",
+            "search-timeout soon\n",
+            "search-on-timeout never\n",
+        ] {
+            let err = load(bad).unwrap_err();
+            assert!(err.contains("search-"), "{bad}: {err}");
+        }
         for typo in ["maxclientz 1\n", "cluster-allow-reads-when-down yes\n"] {
             let err = load(typo).unwrap_err();
             assert!(err.contains("unknown directive"), "{typo}: {err}");

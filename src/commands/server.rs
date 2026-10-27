@@ -905,6 +905,37 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      - argument(s) must be one of the following: block, first, last, min, max, sum",
                 )),
             },
+            // How long FT.SEARCH and FT.AGGREGATE may run, and what running
+            // out means: `FT.CONFIG`'s `TIMEOUT` and `ON_TIMEOUT` under
+            // Redis 8's names. One value, kept by `FT.CONFIG`, whichever
+            // name sets it.
+            "search-timeout" => match value.parse::<i64>() {
+                Ok(ms)
+                    if ms >= 0
+                        && crate::commands::search_tools::set_config(
+                            "TIMEOUT",
+                            &ms.to_string(),
+                        ) =>
+                {
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
+            "search-on-timeout" => {
+                let policy = value.to_ascii_lowercase();
+                if matches!(policy.as_str(), "return" | "fail" | "return_strict")
+                    && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
+                {
+                    Some(resp_simple("OK"))
+                } else {
+                    Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'search-on-timeout') \
+                         - argument(s) must be one of the following: return, fail, return_strict",
+                    ))
+                }
+            }
             "latency-monitor-threshold" => match value.parse::<i64>() {
                 Ok(ms) if ms >= 0 => {
                     crate::latency::set_threshold_ms(ms as u64);
@@ -1376,6 +1407,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "tracking-table-max-keys",
             ctx.tracking_table.max_keys().to_string(),
+        ),
+        // What `FT.CONFIG` holds: see `config_set_global`.
+        (
+            "search-timeout",
+            crate::commands::search_tools::config_value("TIMEOUT"),
+        ),
+        (
+            "search-on-timeout",
+            crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
         ),
     ];
     for (name, value) in in_effect {

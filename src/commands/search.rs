@@ -635,15 +635,17 @@ pub(crate) struct FilterHits {
 }
 
 /// When the query must stop. `timeout_ms` is the command's `TIMEOUT`, or
-/// the engine's `FT.CONFIG TIMEOUT` when the command did not name one. `0`
-/// is no limit.
+/// the engine's `FT.CONFIG TIMEOUT` (`search-timeout`) when the command did
+/// not name one. `0` is no limit, and the default.
 pub(crate) fn search_deadline(timeout_ms: Option<u64>) -> Option<Instant> {
     let ms =
-        timeout_ms.unwrap_or_else(|| crate::commands::search_tools::config_number("TIMEOUT", 500));
+        timeout_ms.unwrap_or_else(|| crate::commands::search_tools::config_number("TIMEOUT", 0));
     if ms == 0 {
         None
     } else {
-        Some(Instant::now() + Duration::from_millis(ms))
+        // A limit further off than the clock can count is none: adding it
+        // would panic where the clock counts less far.
+        Instant::now().checked_add(Duration::from_millis(ms))
     }
 }
 
@@ -667,6 +669,14 @@ pub(crate) fn deadline_due(deadline: Option<Instant>, seen: &mut u32) -> bool {
     }
     *seen = 0;
     past_deadline(deadline)
+}
+
+/// Whether a step over `n` items that cannot stop part-way (a sort) is to
+/// be left out because the deadline has passed. Fewer than
+/// [`DEADLINE_EVERY`] items cost less than reading the clock, and always
+/// run: a query that small is never reported as cut short.
+pub(crate) fn no_time_for(deadline: Option<Instant>, n: usize) -> bool {
+    n >= DEADLINE_EVERY as usize && past_deadline(deadline)
 }
 
 /// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
@@ -881,9 +891,8 @@ pub(crate) fn filter_search(
             }
         }
     }
-    if !timed_out && past_deadline(deadline) {
-        timed_out = true;
-    }
+    // A scan that reached the end is whole, however long it took: only one
+    // that stopped early has timed out.
     FilterHits {
         matches: out,
         timed_out,
@@ -1329,14 +1338,19 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 // The filter first, then the nearest among what it left:
                 // exact, whatever the index type.
                 let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
-                timed_out = found.timed_out;
                 let allowed: std::collections::HashSet<String> =
                     found.matches.into_iter().map(|m| m.key).collect();
-                crate::commands::vector::knn_filtered(live, &knn.vector, knn.k, metric, &allowed)
+                let (nearest, cut) = crate::commands::vector::knn_filtered(
+                    live,
+                    &knn.vector,
+                    knn.k,
+                    metric,
+                    &allowed,
+                    deadline,
+                );
+                timed_out = found.timed_out || cut;
+                nearest
             };
-            if past_deadline(deadline) {
-                timed_out = true;
-            }
             nearest
                 .into_iter()
                 .map(|found| Hit {
@@ -1356,7 +1370,11 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
             timed_out = found.timed_out;
             let mut matches = found.matches;
-            if by_distance {
+            // A sort cannot stop part-way. Past the deadline it is left
+            // out, and what was found comes back in the order it was found.
+            if no_time_for(deadline, matches.len()) {
+                timed_out = true;
+            } else if by_distance {
                 // Nearest first.
                 matches.sort_by(|a, b| {
                     a.distance
@@ -1388,12 +1406,6 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .collect()
         }
     };
-    // A shard answers with what it found and whether it timed out; the
-    // coordinator applies `ON_TIMEOUT`.
-    if timed_out && !shard && on_timeout_fails() {
-        return Err("Timeout limit was reached".into());
-    }
-
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
@@ -1406,7 +1418,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         let numeric = schema_field.is_some_and(|f| matches!(f.field_type, FieldType::Numeric));
         let unf = schema_field.is_some_and(|f| f.options.unf);
         let source = schema_field.map_or(name.as_str(), |f| f.name.as_str());
+        // A document read for each hit: as long as the scan, so the deadline
+        // is kept here too. Cut short, the hits are not sorted.
+        let mut seen = 0u32;
+        let mut keyed = true;
         for hit in &mut hits {
+            if deadline_due(deadline, &mut seen) {
+                timed_out = true;
+                keyed = false;
+                break;
+            }
             // A value the query produced (the distance) or one the document
             // holds.
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
@@ -1424,21 +1445,32 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .flatten(),
             };
         }
-        hits.sort_by(|a, b| {
-            use std::cmp::Ordering;
-            let order = match (&a.sort_key, &b.sort_key) {
-                (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
-                (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
-                (Some(SortKey::Number(_)), Some(SortKey::Text(_))) => Ordering::Less,
-                (Some(SortKey::Text(_)), Some(SortKey::Number(_))) => Ordering::Greater,
-                // A document without the value comes last, either way round.
-                (Some(_), None) => return Ordering::Less,
-                (None, Some(_)) => return Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            let order = if *ascending { order } else { order.reverse() };
-            order.then_with(|| a.key.cmp(&b.key))
-        });
+        if keyed && no_time_for(deadline, hits.len()) {
+            timed_out = true;
+            keyed = false;
+        }
+        if keyed {
+            hits.sort_by(|a, b| {
+                use std::cmp::Ordering;
+                let order = match (&a.sort_key, &b.sort_key) {
+                    (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
+                    (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
+                    (Some(SortKey::Number(_)), Some(SortKey::Text(_))) => Ordering::Less,
+                    (Some(SortKey::Text(_)), Some(SortKey::Number(_))) => Ordering::Greater,
+                    // A document without the value comes last, either way round.
+                    (Some(_), None) => return Ordering::Less,
+                    (None, Some(_)) => return Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                let order = if *ascending { order } else { order.reverse() };
+                order.then_with(|| a.key.cmp(&b.key))
+            });
+        }
+    }
+    // A shard answers with what it found and whether it timed out; the
+    // coordinator applies `ON_TIMEOUT`.
+    if timed_out && !shard && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
     }
 
     // ── The page ─────────────────────────────────────────────────────────────
@@ -1534,7 +1566,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         })
         .collect();
     let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
-    if shard {
+    // A coordinator that asks for it is told whether this part timed out;
+    // one from before there was a timeout gets the page as it expects it.
+    if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
         Ok(crate::cluster::search::encode_search(page, timed_out))
     } else {
         Ok(page)
@@ -1675,6 +1709,7 @@ fn coordinate(
     shard_cmd.push(b"LIMIT".to_vec());
     shard_cmd.push(b"0".to_vec());
     shard_cmd.push((args.offset + args.count).to_string().into_bytes());
+    crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
     let local = {
@@ -2052,6 +2087,8 @@ mod tests {
         assert!(!past_deadline(None));
         assert!(search_deadline(Some(0)).is_none());
         assert!(search_deadline(Some(50)).is_some());
+        // As far off as a TIMEOUT can say: a deadline or none, not a panic.
+        let _ = search_deadline(Some(u64::MAX));
     }
 
     #[test]
@@ -2063,5 +2100,11 @@ mod tests {
         }
         assert!(deadline_due(deadline, &mut seen));
         assert!(!deadline_due(None, &mut 0u32));
+        // A sort of fewer items than that always runs; of more, not past it.
+        assert!(!no_time_for(deadline, DEADLINE_EVERY as usize - 1));
+        assert!(no_time_for(deadline, DEADLINE_EVERY as usize));
+        assert!(!no_time_for(None, usize::MAX));
+        let later = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!no_time_for(later, usize::MAX));
     }
 }
