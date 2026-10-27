@@ -541,7 +541,9 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
                 .i(),
             1
         );
-        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+"]);
+        // The bucket is still open: with LATEST, from the source the
+        // compaction still knows (#128).
+        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+", "LATEST"]);
         assert_eq!(compacted.arr().len(), 1);
         assert_eq!(compacted.arr()[0].arr()[1].s(), "20", "avg of 10 and 30");
 
@@ -1215,6 +1217,85 @@ impl V {
 }
 
 // ── Scripts ───────────────────────────────────────────────────────────────────
+
+/// What Redis's scripts call that did nothing or was missing (#154):
+/// `redis.log` writes to the server's log, `redis.replicate_commands()` is
+/// true, `redis.set_repl(redis.REPL_ALL)` is taken and the others refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_logs_and_asks_for_effects_replication() {
+    let server = Server::start(&["--logfile", "kividb.log", "--loglevel", "notice"]);
+    let mut c = server.conn();
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.log(redis.LOG_WARNING, 'from', 'a script', 7) \
+         redis.log(redis.LOG_DEBUG, 'not at notice') \
+         return redis.replicate_commands()",
+        "0",
+    ]);
+    assert_eq!(reply.i(), 1, "{reply:?}");
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.set_repl(redis.REPL_ALL) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "k",
+    ]);
+    assert!(reply.ok(), "{reply:?}");
+    for script in [
+        "redis.set_repl(redis.REPL_NONE)",
+        "redis.log(redis.LOG_WARNING)",
+        "redis.log(9, 'x')",
+    ] {
+        assert!(c.cmd(&["EVAL", script, "0"]).is_err(), "{script}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(server.dir.join("kividb.log")).unwrap_or_default();
+        if log.contains("from a script 7") {
+            assert!(!log.contains("not at notice"), "{log}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "not in the log: {log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `SCRIPT KILL` does not stop a script that has written: half its writes
+/// would stay. It is answered UNKILLABLE, as in Redis, and the script runs
+/// on; it was answered OK and ran on all the same (#129).
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_written_is_unkillable() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SET', 'w', '1') while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["GET", "w"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("UNKILLABLE"),
+        "{reply:?}"
+    );
+    // It runs on: the server is still busy with it.
+    let reply = c.cmd(&["PING"]);
+    assert!(reply.is_err() && reply.s().starts_with("BUSY"), "{reply:?}");
+}
 
 /// While a script runs, other clients wait for it; once it has overrun
 /// `lua-time-limit` they are told BUSY — and SCRIPT KILL still gets through

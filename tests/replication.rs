@@ -258,10 +258,16 @@ fn test_waitaof() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let r = c.cmds(&["WAITAOF", "1", "0", "0"]);
+    // With the AOF off, nothing is on disk by one: asking for a local fsync
+    // is an error, as in Redis, and none is reported. It reported one (#137).
+    assert!(matches!(
+        c.cmds(&["WAITAOF", "1", "0", "0"]),
+        RespValue::Error(_)
+    ));
+    let r = c.cmds(&["WAITAOF", "0", "0", "0"]);
     let arr = r.as_array();
     assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0].as_int(), 1);
+    assert_eq!(arr[0].as_int(), 0);
     assert_eq!(arr[1].as_int(), 0);
 }
 
@@ -675,6 +681,110 @@ fn wait_link_up(c: &mut Conn) {
     wait_until("replica link up", Duration::from_secs(10), || {
         repl_info(c, "master_link_status").as_deref() == Some("up")
     });
+}
+
+/// A script runs on a replica, and only a write it makes is refused, as in
+/// Redis; every EVAL, EVALSHA and FCALL was refused before it ran (#145).
+/// One that declares it may write is refused at once; one that declares
+/// `no-writes` runs.
+#[cfg(feature = "lua")]
+#[test]
+fn test_scripts_that_read_run_on_a_replica() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "first", "1"]).is_ok());
+    assert!(m
+        .cmds(&[
+            "FUNCTION",
+            "LOAD",
+            "#!lua name=replica_lib\n\
+             redis.register_function{function_name='reads', \
+             callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}\n\
+             redis.register_function('writes', function(keys) return redis.call('SET', keys[1], 'x') end)",
+        ])
+        .as_str()
+        .contains("replica_lib"));
+    wait_until("the replica to have first", Duration::from_secs(10), || {
+        r.cmds(&["GET", "first"]) == RespValue::Bulk(b"1".to_vec())
+    });
+    let refused =
+        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.contains("READONLY"));
+
+    let read = r.cmds(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "first"]);
+    assert_eq!(read, RespValue::Bulk(b"1".to_vec()));
+    let write = r.cmds(&[
+        "EVAL",
+        "return redis.call('SET', KEYS[1], 'x')",
+        "1",
+        "first",
+    ]);
+    assert!(refused(&write), "{write:?}");
+    let declared = r.cmds(&["EVAL", "#!lua\nreturn 1", "0"]);
+    assert!(refused(&declared), "{declared:?}");
+    let no_writes = r.cmds(&["EVAL", "#!lua flags=no-writes\nreturn 2", "0"]);
+    assert_eq!(no_writes, RespValue::Int(2));
+
+    wait_until(
+        "the replica to have the library",
+        Duration::from_secs(10),
+        || r.cmds(&["FCALL", "reads", "1", "first"]) == RespValue::Bulk(b"1".to_vec()),
+    );
+    let write = r.cmds(&["FCALL", "writes", "1", "first"]);
+    assert!(refused(&write), "{write:?}");
+    assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
+}
+
+/// A shard channel's message reaches a replica's subscribers, as a
+/// channel's does: `SPUBLISH` was not sent down the replication stream
+/// (#161).
+#[test]
+fn test_spublish_reaches_a_replicas_subscribers() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut sub = Conn::connect(replica);
+    let ack = sub.cmds(&["SSUBSCRIBE", "news"]);
+    assert_eq!(ack.as_array()[0].as_str(), "ssubscribe");
+    let mut m = Conn::connect(master);
+    m.cmds(&["SPUBLISH", "news", "hello"]);
+    let message = sub.read_value();
+    let parts = message.as_array();
+    assert_eq!(parts[0].as_str(), "smessage");
+    assert_eq!(parts[2].as_str(), "hello");
+}
+
+/// A replica given a `masterauth` still replicates a master that has no
+/// password, and one that has that password. `AUTH <password>` is refused
+/// where no password is set (#135): the replica logs in as the default user
+/// by name.
+#[test]
+fn test_masterauth_works_with_and_without_a_password_on_the_master() {
+    for master_pass in ["", "s3cret"] {
+        let master = spawn_server(Config {
+            requirepass: master_pass.to_string(),
+            ..Default::default()
+        });
+        let replica = spawn_server(Config {
+            masterauth: "s3cret".to_string(),
+            ..replica_of(master)
+        });
+        let mut r = Conn::connect(replica);
+        wait_link_up(&mut r);
+        let mut m = Conn::connect(master);
+        if !master_pass.is_empty() {
+            assert!(m.cmds(&["AUTH", master_pass]).is_ok());
+        }
+        assert!(m.cmds(&["SET", "auth:k", "v"]).is_ok());
+        wait_until(
+            "the replica to have auth:k",
+            Duration::from_secs(10),
+            || r.cmds(&["GET", "auth:k"]) == RespValue::Bulk(b"v".to_vec()),
+        );
+    }
 }
 
 /// On a replica, WATCH sees the writes its master sends: an EXEC after the

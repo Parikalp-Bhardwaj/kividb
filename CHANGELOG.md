@@ -58,6 +58,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`AUTH <password>` is refused when no password is set, as in Redis
+  (#135).** With the `default` user open (no `requirepass`), `AUTH` with a
+  password replied `OK`; it now replies `ERR AUTH <password> called without
+  any password configured for the default user. Are you sure your
+  configuration is correct?`, which is how a client learns that the
+  password it was given is not in use. `AUTH default <password>` still logs
+  in. A client configured with a password for a server that has none now
+  gets this error when it connects.
+
 - **`CONFIG SET` refuses what it cannot set, as Redis does (#143).** A name
   that is neither KiviDB's nor Redis's (`bogus-name`, a misspelling) gets
   `ERR Unknown option or number of arguments for CONFIG SET`; it was taken,
@@ -110,6 +119,136 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `bad argument #2 to 'assert' (string expected, got table)`.
 
 ### Fixed
+
+- **Shard channels: `SPUBLISH` reaches a replica's subscribers, and
+  `SSUBSCRIBE` is routed in a cluster (#161).** Standalone, `PUBLISH` went
+  down the replication stream to subscribers on replicas, and `SPUBLISH` did
+  not. In a cluster, `SSUBSCRIBE` succeeded on any node, which got the
+  channel's messages only if it had the channel's slot; as in Redis, it is
+  now answered `MOVED` by a node that does not have the slot (a replica of
+  its master takes it), and `CROSSSLOT` for channels of more than one slot.
+
+- **Search: synonym groups had no effect (#130).** `FT.SYNUPDATE` kept its
+  groups, and `FT.SEARCH` for one term of a group did not find documents with
+  another. As in RediSearch, a query term now matches every term of the
+  groups it is in, in documents indexed before the group was made as well as
+  after. A quoted phrase is matched as written.
+
+- **Vector sets: `VSIM ... FILTER` filters; `REDUCE` is refused; `VINFO`
+  says how vectors are kept (#132).** `FILTER` was taken and ignored, so an
+  application that filtered by attribute got elements that did not match. It
+  now takes Redis's expressions over the elements' JSON attributes
+  (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024,
+  2025]`, arithmetic, `not`, `**`, ...), and only the elements that pass are
+  scored; the search being exact, `FILTER-EF` changes nothing. An element
+  without the field asked for does not pass, as in Redis; an expression that
+  is not one is `ERR syntax error in FILTER expression`. `VADD ... REDUCE`
+  was taken and ignored, and the set kept the dimension given; it is now
+  refused. `Q8` and `BIN` are still taken, with the vectors kept at full
+  precision, and `VINFO` reports `quant-type` `f32`, Redis's name for that,
+  where it said `NOQUANT`.
+
+- **Keyspace notifications: Redis's event names, events from the commands
+  that sent none, and `keymiss` (#160).**
+  - Named as in Redis: `INCR`, `DECR` and `DECRBY` send `incrby` (they sent
+    `incr`, `decr`, `decrby`); `GETDEL` `del`; `GETSET` and `SETNX` `set`;
+    `GETEX` `expire` or `persist`; `LMOVE` `lpop` or `rpop` on the source and
+    `lpush` or `rpush` on the destination (it sent `lmove` on both). A
+    listener on `__keyevent@0__:incrby` or `:set` missed these.
+  - Sent now: `setrange` (`SETRANGE`), `setbit` (`SETBIT`, a `BITFIELD` that
+    writes), `set` or `del` (`BITOP`'s destination), `pfadd` (`PFADD`,
+    `PFMERGE`), `zadd` (`GEOADD`), `move_from` and `move_to` (`MOVE`), and the
+    JSON, time series and vector set commands' own (`json.set`, `ts.add`,
+    `vadd`, ...), under a new `d` class, which `A` includes, as in Redis.
+  - `m`: a read that looks for a key and does not find it sends `keymiss`.
+    It never fired.
+  - A `notify-keyspace-events` with a character that is not a flag is
+    refused, by `CONFIG SET` and in the config file; `KEAQ!` was taken as
+    `AKE`.
+
+- **The script cache had no limit (#155).** Every distinct script sent with
+  `EVAL` stayed cached until `SCRIPT FLUSH`, so a client that wrote its
+  values into the script (rather than passing them as arguments) grew it for
+  ever: 20,000 such `EVAL`s left 20,012 scripts and 4.6 MB. As in Redis 7.4,
+  the cache keeps 500 scripts sent only with `EVAL`, letting the least
+  recently used go (`EVAL` or `EVALSHA` of one counts as a use), and counts
+  them in `evicted_scripts` in `INFO stats`. Scripts loaded with
+  `SCRIPT LOAD` are not counted and stay.
+
+- **Scripts: `redis.log` writes to the log; `redis.replicate_commands()` and
+  `redis.set_repl()` exist (#154).** `redis.log` did nothing; it now writes
+  its arguments, joined by spaces, at Redis's level for it (`LOG_WARNING`
+  as a warning, `LOG_NOTICE` as info, ...). `redis.replicate_commands()`,
+  how scripts asked before Redis 7 to be replicated as their effects (job
+  queues, rate limiters), returns true, as in Redis 7: KiviDB always does
+  so. Scripts that opened with it failed before doing anything.
+  `redis.set_repl(redis.REPL_ALL)` is taken; keeping a script's writes from
+  the AOF or the replicas is not supported, and is refused rather than
+  ignored. The `struct` library is still missing.
+
+- **A compaction rule wrote its open bucket as samples arrived, and
+  `LATEST` changed nothing (#128).** As in RedisTimeSeries, the destination
+  now gets a bucket once it has closed (when the first sample of a later one
+  arrives), and again if a sample is added to it later; the bucket still
+  open is reported only with `LATEST`, on `TS.GET`, `TS.MGET`, `TS.RANGE`,
+  `TS.REVRANGE`, `TS.MRANGE` and `TS.MREVRANGE`. Dashboards and downsampling
+  jobs saw partial values as final. A compaction knows its source:
+  `TS.INFO` reports `sourceKey`, and a destination takes one source only
+  (`TSDB: the destination key already has a src rule`). A snapshot with a
+  compaction in it is not readable by 1.1.2 and older.
+
+- **Scripts that only read run on a replica (#145).** `EVAL`, `EVALSHA` and
+  `FCALL` were refused with `READONLY` on a replica before the script ran,
+  even when it only read, so read/write splitting and cluster clients with
+  `READONLY` failed. As in Redis, a script now runs on a replica and a write
+  it makes is refused there; a script whose shebang declares it may write
+  (no `no-writes` flag), and a function registered without `no-writes`, are
+  refused before they run.
+
+- **`SCRIPT KILL` replied `OK` to a script that had written, which ran on
+  (#129).** It looked for the script's writes on the thread of the client
+  that sent it, where there were none, so it answered `OK`; the script,
+  knowing it had written, carried on, and the server stayed `BUSY`. As in
+  Redis, it now answers `UNKILLABLE Sorry the script already executed write
+  commands against the dataset.`, and `SHUTDOWN NOSAVE` is the way out.
+  `FUNCTION KILL` is the same.
+
+- **`ACL GENPASS` with 1 to 4 bits returned an empty password (#140).** It
+  gives a hex digit per 4 bits, as Redis does: one digit for 1 to 4 bits,
+  three for 9 to 12. Whole bytes were taken, so under 8 bits gave none, and
+  an empty password matches an empty `AUTH`.
+
+- **`CLUSTER REPLICAS` and `CLUSTER SLAVES` reply with an array (#138).**
+  They replied with one string, the replicas' lines joined by newlines; now,
+  as in Redis, one bulk string per replica in the `CLUSTER NODES` line
+  format, and an empty array for a master without replicas.
+
+- **`CLUSTER SLOT-STATS ORDERBY` sorts descending by default (#139).** It
+  sorted ascending, so `ORDERBY key-count LIMIT n` returned empty slots;
+  as in Redis, it now returns the busiest first unless `ASC` is given.
+
+- **`WAITAOF` said a write was on disk with the AOF off (#137).** It replied
+  `[1, 0]`, one local fsync, when nothing is written to an AOF. With the AOF
+  off, `WAITAOF` with `numlocal` above 0 is now refused, as in Redis
+  (`ERR WAITAOF cannot be used when numlocal is set but appendonly is
+  disabled.`), and `WAITAOF 0 ...` replies `[0, 0]`. With the AOF on, the
+  first number is 1 once the write is fsynced, whatever `numlocal` asked
+  for, as in Redis; it was 0 for `numlocal` 0.
+
+- **`ACL HELP` answers; `COMMAND` with an unknown subcommand is an error
+  (#134).** `ACL HELP` was an unknown subcommand, in an error that said to
+  try `ACL HELP`; it now lists ACL's subcommands, as Redis does. `COMMAND
+  NOPE` replied nil; it now replies `ERR unknown subcommand 'NOPE'. Try
+  COMMAND HELP.`, as the other containers and Redis do.
+
+- **`COMMAND` no longer lists `GEODELBYMEMBER` (#126).** It was in the
+  command tables with nothing behind it, and answered `unknown command`;
+  Redis has no such command either (`ZREM` removes a member of a geo set).
+
+- **`INCR` at the largest integer wrapped to the smallest (#124).** `INCR` on
+  `9223372036854775807` stored `-9223372036854775808` (and a debug build
+  panicked); it now answers `ERR increment or decrement would overflow` and
+  leaves the value, as `INCRBY` and Redis do.
 
 - **Monitoring saw less than Redis shows (#158).** The latency monitor's
   `command` and `fast-command` events are recorded when a command takes at

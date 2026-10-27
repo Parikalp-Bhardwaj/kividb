@@ -100,6 +100,9 @@ const TAG_STREAM_V3: u8 = 13;
 /// rules. Written only for a series that has a non-default policy or any
 /// rules, so dumps without them stay readable by older builds.
 const TAG_TIMESERIES_V2: u8 = 14;
+/// `TAG_TIMESERIES_V2` followed by the series it is a compaction of. Written
+/// only for a compaction, so other series stay readable by older builds.
+const TAG_TIMESERIES_V3: u8 = 15;
 
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_le_bytes())?;
@@ -460,8 +463,11 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             // series was back on the default policy and no longer fed its
             // compactions — silently.
             let extended = !inner.rules.is_empty()
-                || inner.duplicate_policy != crate::types::DuplicatePolicy::Last;
-            w.write_all(&[if extended {
+                || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
+                || inner.source.is_some();
+            w.write_all(&[if inner.source.is_some() {
+                TAG_TIMESERIES_V3
+            } else if extended {
                 TAG_TIMESERIES_V2
             } else {
                 TAG_TIMESERIES
@@ -491,6 +497,9 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
+            }
+            if let Some(source) = &inner.source {
+                write_bytes(w, source.as_bytes())?;
             }
         }
 
@@ -1409,7 +1418,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
-                TAG_TIMESERIES | TAG_TIMESERIES_V2 => {
+                TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
@@ -1442,7 +1451,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                             String::from_utf8_lossy(&lv).into_owned(),
                         );
                     }
-                    if tag[0] == TAG_TIMESERIES_V2 {
+                    if tag[0] != TAG_TIMESERIES {
                         let bad = |what: &str| {
                             io::Error::new(io::ErrorKind::InvalidData, format!("bad series {what}"))
                         };
@@ -1469,6 +1478,12 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                                 bucket_duration,
                                 align_timestamp,
                             });
+                        }
+                        if tag[0] == TAG_TIMESERIES_V3 {
+                            ts.source = Some(
+                                String::from_utf8(read_bytes(&mut r)?)
+                                    .map_err(|_| bad("source"))?,
+                            );
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))

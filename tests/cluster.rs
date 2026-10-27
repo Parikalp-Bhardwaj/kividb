@@ -706,6 +706,9 @@ fn command_describes_where_each_commands_keys_are() {
     let mixed = c.cmd(&["COMMAND", "INFO", "get", "nosuchcommand"]);
     assert_eq!(mixed.array().len(), 2);
     assert_eq!(mixed.array()[1], Resp::Nil);
+    // Listed with no command behind it, and not Redis's (#126).
+    let gone = c.cmd(&["COMMAND", "INFO", "geodelbymember"]);
+    assert_eq!(gone.array(), [Resp::Nil]);
 }
 
 /// A transaction is routed command by command as it is queued. One that
@@ -795,6 +798,30 @@ fn replica_follows_its_master_and_serves_reads_after_readonly() {
 
     // Replicas do not count toward the cluster's size.
     assert_eq!(master.cluster_info("cluster_size"), "2");
+
+    // An array with a `CLUSTER NODES` line per replica, as in Redis; it was
+    // one string (#138). A master without replicas has an empty one.
+    let replicas = master.conn().cmd(&["CLUSTER", "REPLICAS", &master.id()]);
+    assert_eq!(replicas.array().len(), 1, "{replicas:?}");
+    let line = replicas.array()[0].text();
+    assert!(
+        line.starts_with(&replica.id()) && !line.ends_with('\n'),
+        "{line:?}"
+    );
+    let none = master.conn().cmd(&["CLUSTER", "SLAVES", &nodes[1].id()]);
+    assert!(none.array().is_empty(), "{none:?}");
+
+    // Busiest slot first by default, as in Redis; it was the emptiest (#139).
+    let stats = master.conn().cmd(&[
+        "CLUSTER",
+        "SLOT-STATS",
+        "ORDERBY",
+        "key-count",
+        "LIMIT",
+        "1",
+    ]);
+    let top = &stats.array()[0].array();
+    assert_eq!(top[0].int(), slot_of(&key) as i64, "{stats:?}");
 
     // Without READONLY, the replica redirects to its master.
     let mut c = replica.conn();
@@ -2140,6 +2167,29 @@ fn keys_of_a_slot_lost_to_another_master_are_dropped() {
 // ── Pub/Sub ───────────────────────────────────────────────────────────────────
 
 /// A message published on one node reaches a subscriber connected to another.
+/// `SSUBSCRIBE` is routed by its channel's slot, as in Redis: `MOVED` from a
+/// node that does not have it, `CROSSSLOT` for channels of two slots. It
+/// succeeded anywhere (#161).
+#[test]
+fn ssubscribe_is_routed_by_slot() {
+    let (nodes, ranges) = form_cluster(2);
+    let mine = key_in(ranges[0].0..=ranges[0].1, "chan");
+    let theirs = key_in(ranges[1].0..=ranges[1].1, "chan");
+    let mut c = nodes[0].conn();
+    let reply = c.cmd(&["SSUBSCRIBE", &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine, &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("CROSSSLOT")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine]);
+    assert_eq!(reply.array()[0].text(), "ssubscribe", "{reply:?}");
+}
+
 #[test]
 fn publish_reaches_subscribers_on_other_nodes() {
     let (nodes, _) = form_cluster(3);

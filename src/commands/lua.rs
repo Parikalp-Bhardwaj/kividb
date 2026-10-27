@@ -28,6 +28,65 @@ fn script_store() -> &'static RwLock<HashMap<String, Arc<str>>> {
     SCRIPT_STORE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
+/// past this, the least recently used goes. A client that writes its values
+/// into the script, rather than passing them as arguments, grew the cache
+/// for ever (#155). `SCRIPT LOAD`ed scripts are not counted, and stay.
+const EVAL_SCRIPTS_MAX: usize = 500;
+
+/// The scripts sent only with `EVAL`, by when they were last run.
+#[derive(Default)]
+struct EvalScripts {
+    by_use: std::collections::BTreeMap<u64, String>,
+    last_used: HashMap<String, u64>,
+    clock: u64,
+}
+
+static EVAL_SCRIPTS: std::sync::LazyLock<parking_lot::Mutex<EvalScripts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A script `EVAL` has just put in the cache: counted, and the least
+/// recently used let go past [`EVAL_SCRIPTS_MAX`].
+fn eval_script_added(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    scripts.clock += 1;
+    let now = scripts.clock;
+    if let Some(was) = scripts.last_used.insert(sha.to_string(), now) {
+        scripts.by_use.remove(&was);
+    }
+    scripts.by_use.insert(now, sha.to_string());
+    while scripts.by_use.len() > EVAL_SCRIPTS_MAX {
+        let Some((_, oldest)) = scripts.by_use.pop_first() else {
+            break;
+        };
+        scripts.last_used.remove(&oldest);
+        script_store().write().remove(&oldest);
+        crate::stats::EVICTED_SCRIPTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A cached script has been run: if it is one `EVAL` sent, it is now the most
+/// recently used.
+fn eval_script_used(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    let Some(was) = scripts.last_used.get(sha).copied() else {
+        return;
+    };
+    scripts.clock += 1;
+    let now = scripts.clock;
+    scripts.by_use.remove(&was);
+    scripts.by_use.insert(now, sha.to_string());
+    scripts.last_used.insert(sha.to_string(), now);
+}
+
+/// `SCRIPT LOAD` of a script: kept from now on, whatever `EVAL` sent.
+fn eval_script_loaded(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    if let Some(was) = scripts.last_used.remove(sha) {
+        scripts.by_use.remove(&was);
+    }
+}
+
 /// Whether a script's first line is a shebang with the `no-writes` flag.
 pub(crate) fn script_declares_no_writes(source: &[u8]) -> bool {
     let line = source.split(|b| *b == b'\n').next().unwrap_or_default();
@@ -37,6 +96,21 @@ pub(crate) fn script_declares_no_writes(source: &[u8]) -> bool {
                 .filter_map(|word| word.strip_prefix("flags="))
                 .any(|flags| flags.split(',').any(|flag| flag.trim() == "no-writes"))
         })
+}
+
+/// Whether a script says it may write: a shebang without `no-writes`. One
+/// with no shebang says nothing, and runs on a replica until it writes.
+pub(crate) fn script_declares_writes(source: &[u8]) -> bool {
+    source.starts_with(b"#!") && !script_declares_no_writes(source)
+}
+
+/// [`script_declares_writes`] of the cached script with this SHA1.
+pub(crate) fn cached_script_declares_writes(sha: &[u8]) -> bool {
+    let sha = String::from_utf8_lossy(sha).to_ascii_lowercase();
+    script_store()
+        .read()
+        .get(&sha)
+        .is_some_and(|source| script_declares_writes(source.as_bytes()))
 }
 
 /// The same, of the cached script with this SHA1.
@@ -187,6 +261,11 @@ static LUA_HOLD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 /// Unix ms at which the script now holding the VM took it.
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the script now holding the VM has written. `SCRIPT KILL` comes
+/// from another client, on another thread, and the script's own note of it
+/// is in its thread's [`SCRIPT_EVAL`]: read there, it was always no, and a
+/// script that had written was answered OK and ran on (#129).
+static LUA_HOLDER_WROTE: AtomicBool = AtomicBool::new(false);
 /// Bytes the functions' VM held when it was last let go: `INFO`'s
 /// `used_memory_vm_functions`, read without waiting for a running script.
 static FUNCTIONS_VM_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -813,6 +892,7 @@ where
     let prev = LUA_HOLD_DEPTH.fetch_add(1, Ordering::SeqCst);
     if prev == 0 {
         LUA_SCRIPT_STARTED_MS.store(crate::replication::unix_ms(), Ordering::Relaxed);
+        LUA_HOLDER_WROTE.store(false, Ordering::SeqCst);
         LUA_SCRIPT_BUSY_OTHERS.store(true, Ordering::SeqCst);
     }
     struct OuterDepth;
@@ -980,6 +1060,10 @@ pub(crate) fn script_note_successful_write() {
             se.wrote = true;
         }
     });
+    // The script holding the shared VM: for `SCRIPT KILL`, from elsewhere.
+    if EXEC_LUA.with(|c| c.borrow().is_some()) {
+        LUA_HOLDER_WROTE.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Commands that run or compile the Lua VM for long stretches — must not block a Tokio worker
@@ -1099,8 +1183,7 @@ fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
         return resp_error("ERR No scripts in execution.");
     }
-    let wrote = SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| s.wrote).unwrap_or(false));
-    if wrote {
+    if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
             "UNKILLABLE Sorry the script already executed write commands against the dataset.",
         );
@@ -1564,10 +1647,76 @@ fn new_lua_vm() -> Lua {
         .set("REDIS_VERSION_NUM", (8i64 << 16) | (10 << 8))
         .unwrap();
 
+    // To the server's log, at Redis's level for it; it did nothing (#154).
     let log_fn = lua
-        .create_function(|_, _args: LuaMultiValue| Ok(()))
+        .create_function(|_, args: LuaMultiValue| {
+            let mut args = args.into_iter();
+            let (Some(level), Some(first)) = (args.next(), args.next()) else {
+                return Err(LuaError::RuntimeError(
+                    "redis.log() requires two arguments or more.".into(),
+                ));
+            };
+            let level = match level {
+                LuaValue::Integer(0) => crate::loglevel::DEBUG,
+                LuaValue::Integer(1) => crate::loglevel::VERBOSE,
+                LuaValue::Integer(2) => crate::loglevel::INFO,
+                LuaValue::Integer(3) => crate::loglevel::WARN,
+                LuaValue::Number(n) if n.fract() == 0.0 && (0.0..=3.0).contains(&n) => [
+                    crate::loglevel::DEBUG,
+                    crate::loglevel::VERBOSE,
+                    crate::loglevel::INFO,
+                    crate::loglevel::WARN,
+                ][n as usize],
+                _ => return Err(LuaError::RuntimeError("Invalid debug level.".into())),
+            };
+            if !crate::loglevel::enabled(level) {
+                return Ok(());
+            }
+            // The arguments joined by spaces, as Redis writes them.
+            let text = |value: LuaValue| match value {
+                LuaValue::String(s) => s.to_string_lossy().to_string(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                LuaValue::Boolean(b) => b.to_string(),
+                LuaValue::Nil => "nil".into(),
+                other => other.type_name().to_string(),
+            };
+            let line: Vec<String> = std::iter::once(first).chain(args).map(text).collect();
+            crate::log_at!(level, "{}", line.join(" "));
+            Ok(())
+        })
         .unwrap();
     redis_table.set("log", log_fn).unwrap();
+
+    // Before Redis 7, how a script asked to be replicated as its effects:
+    // here every script is, so it is true, as in Redis 7 (#154). A script
+    // that opens with it failed before doing anything.
+    let replicate_commands = lua.create_function(|_, _: LuaMultiValue| Ok(true)).unwrap();
+    redis_table
+        .set("replicate_commands", replicate_commands)
+        .unwrap();
+    redis_table.set("REPL_NONE", 0i64).unwrap();
+    redis_table.set("REPL_AOF", 1i64).unwrap();
+    redis_table.set("REPL_SLAVE", 2i64).unwrap();
+    redis_table.set("REPL_REPLICA", 2i64).unwrap();
+    redis_table.set("REPL_ALL", 3i64).unwrap();
+    // What a script's writes go to: everything, which is what KiviDB does.
+    // Keeping them from the AOF or the replicas is not supported, and is
+    // refused rather than ignored.
+    let set_repl = lua
+        .create_function(|_, flags: LuaValue| match flags {
+            LuaValue::Integer(3) => Ok(()),
+            LuaValue::Number(3.0) => Ok(()),
+            LuaValue::Integer(0..=2) | LuaValue::Number(_) => Err(LuaError::RuntimeError(
+                "redis.set_repl() other than REDIS.REPL_ALL is not supported by KiviDB".into(),
+            )),
+            _ => Err(LuaError::RuntimeError(
+                "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE."
+                    .into(),
+            )),
+        })
+        .unwrap();
+    redis_table.set("set_repl", set_repl).unwrap();
 
     let placeholder = lua
         .create_function(|_, _: LuaMultiValue| {
@@ -3326,8 +3475,12 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         } else {
             sha
         };
-        match script_store().read().get(sha).cloned() {
-            Some(src) => src,
+        let found = script_store().read().get(sha).cloned();
+        match found {
+            Some(src) => {
+                eval_script_used(sha);
+                src
+            }
             None => return resp_error("NOSCRIPT No matching script. Please use EVAL."),
         }
     } else {
@@ -3338,14 +3491,24 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         // The stored copy, so that a script sent again and again is the one
         // already compiled (see `compiled_script`).
         let sha = sha1_hex(source);
-        if let Some(stored) = script_store().read().get(&sha).cloned() {
+        let stored = script_store().read().get(&sha).cloned();
+        if let Some(stored) = stored {
+            eval_script_used(&sha);
             stored
         } else {
-            script_store()
+            let mut added = false;
+            let stored = script_store()
                 .write()
-                .entry(sha)
-                .or_insert_with(|| Arc::from(source))
-                .clone()
+                .entry(sha.clone())
+                .or_insert_with(|| {
+                    added = true;
+                    Arc::from(source)
+                })
+                .clone();
+            if added {
+                eval_script_added(&sha);
+            }
+            stored
         }
     };
 
@@ -5125,6 +5288,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 .write()
                 .entry(sha.clone())
                 .or_insert_with(|| Arc::from(source));
+            eval_script_loaded(&sha);
             resp_bulk_str(&sha)
         }
         "EXISTS" => {
@@ -5152,6 +5316,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Some(_) => return resp_error("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
             };
             let scripts = std::mem::take(&mut *script_store().write());
+            *EVAL_SCRIPTS.lock() = EvalScripts::default();
             let vm = lua_vms_renew_for_admin(&[Vm::Eval]).unwrap_or_default();
             if async_free && scripts.len() > 64 {
                 let n = scripts.len() as u64;

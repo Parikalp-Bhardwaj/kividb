@@ -566,10 +566,18 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
             "notify-keyspace-events" => {
-                let new_flags = crate::keyspace_events::parse_ks_flags(value);
-                crate::keyspace_events::KS_FLAGS
-                    .store(new_flags, std::sync::atomic::Ordering::Relaxed);
-                Some(resp_simple("OK"))
+                match crate::keyspace_events::parse_ks_flags_strict(value) {
+                    Some(new_flags) => {
+                        crate::keyspace_events::KS_FLAGS
+                            .store(new_flags, std::sync::atomic::Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                     'notify-keyspace-events') - {}",
+                        crate::keyspace_events::BAD_FLAGS
+                    ))),
+                }
             }
             "repl-backlog-size" => match value.parse::<u64>() {
                 Ok(v) if v >= 1 => {
@@ -1620,7 +1628,6 @@ const ALL_COMMANDS: &[&str] = &[
     "GEORADIUSBYMEMBER",
     "GEOSEARCH",
     "GEOSEARCHSTORE",
-    "GEODELBYMEMBER",
     "GET",
     "GETBIT",
     "GETDEL",
@@ -2426,7 +2433,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "GEORADIUSBYMEMBER",
             "GEOSEARCH",
             "GEOSEARCHSTORE",
-            "GEODELBYMEMBER",
             "GEOHASH",
             "GEORADIUSBYMEMBER_RO",
             "GEORADIUS_RO",
@@ -2879,12 +2885,11 @@ pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u
         | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LINSERT" | "LREM" | "LTRIM" | "LMPOP" | "SADD"
         | "SREM" | "SPOP" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "ZMPOP"
         | "XADD" | "XDEL" | "XDELEX" | "XTRIM" | "XSETID" | "XGROUP" | "XACK" | "XAUTOCLAIM"
-        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD"
-        | "GEODELBYMEMBER" | "JSON.SET" | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY"
-        | "JSON.NUMMULTBY" | "JSON.STRAPPEND" | "JSON.ARRAPPEND" | "JSON.ARRINSERT"
-        | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR" | "JSON.TOGGLE" | "JSON.MERGE" | "VADD"
-        | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY" | "TS.DECRBY" | "TS.CREATE" | "TS.DEL"
-        | "TS.ALTER" => {
+        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD" | "JSON.SET"
+        | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.STRAPPEND"
+        | "JSON.ARRAPPEND" | "JSON.ARRINSERT" | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR"
+        | "JSON.TOGGLE" | "JSON.MERGE" | "VADD" | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY"
+        | "TS.DECRBY" | "TS.CREATE" | "TS.DEL" | "TS.ALTER" => {
             if args.len() < 2 {
                 return Err("ERR Invalid arguments specified".into());
             }
@@ -3440,6 +3445,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "evicted_keys:{}\r\n",
                     crate::stats::EVICTED_KEYS.load(Ordering::Relaxed)
+                ));
+                out.push_str(&format!(
+                    "evicted_scripts:{}\r\n",
+                    crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
@@ -4302,8 +4311,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Err(e) => Some(resp_error(&e)),
                         };
                     }
+                    // As the other containers answer, and Redis; it was
+                    // nil (#134).
                     _ => {
-                        return Some(resp_null_array());
+                        return Some(resp_error(&format!(
+                            "ERR unknown subcommand '{}'. Try COMMAND HELP.",
+                            String::from_utf8_lossy(cmd[1])
+                        )));
                     }
                 }
             }

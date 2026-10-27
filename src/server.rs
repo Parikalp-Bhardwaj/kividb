@@ -1019,6 +1019,13 @@ where
             // it has subscriptions. Inside MULTI they are queued like any other
             // command, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
+                if let Some(refusal) =
+                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
+                {
+                    combined.extend_from_slice(&refusal);
+                    parse_offset += consumed;
+                    continue;
+                }
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
@@ -1643,6 +1650,10 @@ where
                     // nopass users authenticate with any password.
                     if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
+                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
+                        // As Redis: how a client learns that the password it
+                        // was given is not in use. It was answered OK (#135).
+                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
                     } else {
                         let (provided_username, provided_password) = if cmd.len() >= 3 {
                             // AUTH username password
@@ -1866,14 +1877,23 @@ where
                 "WAITAOF" => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
-                    } else if !aof_enabled {
-                        b"*2\r\n:1\r\n:0\r\n".to_vec()
+                    } else if !aof_enabled
+                        && !crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Nothing goes to an AOF, so nothing is on disk by
+                        // one: it answered that the write was (#137). On at
+                        // the start, or turned on since by `CONFIG SET`.
+                        let num_local = std::str::from_utf8(cmd[1])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if num_local != 0 {
+                            b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n"
+                                .to_vec()
+                        } else {
+                            b"*2\r\n:0\r\n:0\r\n".to_vec()
+                        }
                     } else {
-                        let num_local: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
                         let timeout_ms: u64 =
                             std::str::from_utf8(cmd.get(3).copied().unwrap_or(b"0"))
                                 .ok()
@@ -1895,12 +1915,10 @@ where
                         loop {
                             let fsynced =
                                 crate::aof::AOF_FSYNCED.load(std::sync::atomic::Ordering::Relaxed);
+                            // As Redis: 1 once the write is on disk here,
+                            // whatever `numlocal` asked for.
                             if fsynced >= target {
-                                if num_local > 0 {
-                                    break b"*2\r\n:1\r\n:0\r\n".to_vec();
-                                } else {
-                                    break b"*2\r\n:0\r\n:0\r\n".to_vec();
-                                }
+                                break b"*2\r\n:1\r\n:0\r\n".to_vec();
                             }
                             if tokio::time::Instant::now() >= deadline {
                                 break b"*2\r\n:0\r\n:0\r\n".to_vec();

@@ -84,6 +84,9 @@ pub static EXPIRED_SUBKEYS: AtomicU64 = AtomicU64::new(0);
 /// Of `expired_keys`, those the background cycle took (Redis 8.10's
 /// `expired_keys_active`), not a read that found them past their time.
 pub static EXPIRED_KEYS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// Scripts sent only with `EVAL` that the script cache let go to stay
+/// within its limit — `evicted_scripts` (#155).
+pub static EVICTED_SCRIPTS: AtomicU64 = AtomicU64::new(0);
 /// Keys deleted to get under `maxmemory` — `evicted_keys`.
 pub static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
