@@ -108,23 +108,36 @@ fn ts_duplicate_policy_is_the_default_of_new_series() {
     assert_eq!(c.cmd(&["TS.ADD", "before", "1000", "1"]), ":1000");
     assert_eq!(c.cmd(&["TS.ADD", "before", "1000", "2"]), ":1000");
 
-    assert_eq!(c.cmd(&["CONFIG", "SET", "ts-duplicate-policy", "BLOCK"]), "+OK");
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "ts-duplicate-policy", "BLOCK"]),
+        "+OK"
+    );
     assert_eq!(c.config("ts-duplicate-policy"), "block");
     // Made from now on, by TS.ADD or TS.CREATE: BLOCK.
     assert_eq!(c.cmd(&["TS.ADD", "after", "1000", "1"]), ":1000");
-    assert!(c.cmd(&["TS.ADD", "after", "1000", "2"]).starts_with("-TSDB"));
+    assert!(
+        c.cmd(&["TS.ADD", "after", "1000", "2"])
+            .starts_with("-TSDB")
+    );
     assert_eq!(c.cmd(&["TS.CREATE", "created"]), "+OK");
     assert_eq!(c.cmd(&["TS.ADD", "created", "5", "1"]), ":5");
     assert!(c.cmd(&["TS.ADD", "created", "5", "2"]).starts_with("-TSDB"));
     // Made before: as it was.
     assert_eq!(c.cmd(&["TS.ADD", "before", "1000", "3"]), ":1000");
     // An explicit policy still wins.
-    assert_eq!(c.cmd(&["TS.CREATE", "summed", "DUPLICATE_POLICY", "SUM"]), "+OK");
+    assert_eq!(
+        c.cmd(&["TS.CREATE", "summed", "DUPLICATE_POLICY", "SUM"]),
+        "+OK"
+    );
     c.cmd(&["TS.ADD", "summed", "7", "1"]);
     assert_eq!(c.cmd(&["TS.ADD", "summed", "7", "2"]), ":7");
 
-    assert!(c
-        .cmd(&["CONFIG", "SET", "ts-duplicate-policy", "sometimes"])
-        .starts_with("-ERR"));
-    assert_eq!(c.cmd(&["CONFIG", "SET", "ts-duplicate-policy", "last"]), "+OK");
+    assert!(
+        c.cmd(&["CONFIG", "SET", "ts-duplicate-policy", "sometimes"])
+            .starts_with("-ERR")
+    );
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "ts-duplicate-policy", "last"]),
+        "+OK"
+    );
 }
