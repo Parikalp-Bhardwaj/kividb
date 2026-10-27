@@ -3075,6 +3075,8 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
 /// A shard that runs out of time tells the coordinator, which applies
 /// `ON_TIMEOUT`: `fail` is an error, `return` a partial reply. RESP3 puts
 /// the warning on the coordinator's reply; over RESP2 there is none.
+/// Documents are loaded until a 1 ms search times out, then four times as
+/// many again, so that a fast host does not finish the queries after it.
 #[test]
 fn a_timed_out_search_is_reported_across_the_cluster() {
     let (nodes, ranges) = form_cluster(3);
@@ -3132,14 +3134,19 @@ fn a_timed_out_search_is_reported_across_the_cluster() {
 
     let mut n = 0usize;
     let mut timed_out = false;
-    while n < 80_000 {
+    while n < 200_000 {
         insert(n, 8_000);
         n += 8_000;
         let mut c = nodes[0].conn();
         let hello = c.cmd(&["HELLO", "3"]);
         assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
-        let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
-        if warned(&reply) {
+        // Twice in a row: one search held up by the host, not by its
+        // documents, is not the size to grow from.
+        let mut late = || {
+            let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+            warned(&reply)
+        };
+        if late() && late() {
             timed_out = true;
             break;
         }
@@ -3148,8 +3155,42 @@ fn a_timed_out_search_is_reported_across_the_cluster() {
         timed_out,
         "TIMEOUT 1 still finished after {n} documents across the cluster"
     );
+    insert(n, 4 * n);
+    n *= 5;
 
+    // No limit: every master's part, whole.
     let mut c = nodes[1].conn();
+    let all = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "0",
+    ]);
+    assert_eq!(all.array()[0].int(), n as i64, "{all:?}");
+    let count = |c: &mut Conn, timeout: &str| {
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "to",
+            "*",
+            "TIMEOUT",
+            timeout,
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "c",
+        ])
+    };
+    let all = count(&mut c, "0");
+    assert_eq!(all.array()[1].array()[1].text(), n.to_string(), "{all:?}");
+
     assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
     let failed = c.cmd(&["FT.SEARCH", "to", "*", "TIMEOUT", "1"]);
     assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
@@ -3161,7 +3202,7 @@ fn a_timed_out_search_is_reported_across_the_cluster() {
     );
 
     assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
-    let failed = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    let failed = count(&mut c, "1");
     assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
     assert!(
         failed
@@ -3175,6 +3216,21 @@ fn a_timed_out_search_is_reported_across_the_cluster() {
     assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
     let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
     assert!(warned(&reply), "{reply:?}");
-    let reply = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    let reply = count(&mut c, "1");
     assert!(warned(&reply), "{reply:?}");
+
+    // Over RESP2: a count short of the whole, and no error.
+    let mut c = nodes[0].conn();
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(reply.array()[0].int() < n as i64, "{reply:?}");
 }
