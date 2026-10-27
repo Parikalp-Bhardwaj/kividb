@@ -87,6 +87,8 @@ pub enum BlockState {
     StreamIds {
         ids: Vec<crate::types::StreamId>,
         deadline: Option<std::time::Instant>,
+        /// Its registrations: dropping this, however the wait ends, removes them.
+        registered: crate::wait_table::StreamWait,
     },
     /// A command waiting in line for its keys (the blocking list and
     /// sorted-set commands): its deadline (`None` = wait forever) and its
