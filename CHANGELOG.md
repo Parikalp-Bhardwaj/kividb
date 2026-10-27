@@ -127,6 +127,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Pub/Sub: channel names are binary-safe, and a subscriber over the soft
+  limit is cut off on time (#161).** `PUBLISH` refused a channel name that
+  was not UTF-8, and `SUBSCRIBE` changed one into another (`\xff` became
+  `�`); names are now bytes, as in Redis, through `PUBSUB CHANNELS` and
+  `NUMSUB` and across a cluster's nodes. A subscriber over the 8 MB soft
+  limit for 60 seconds was disconnected only when another message was
+  published to it; a check every second now does it.
+
 - **More of `INFO` and `CLIENT LIST` is measured (#152, #158).**
   `mem_replication_backlog` is what the backlog holds, and
   `mem_clients_normal` and `mem_clients_slaves` what the clients' query
