@@ -137,7 +137,13 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   everysec` still syncs it within the second, so a crash of the machine
   can lose up to a second, as in Redis). Waiting connections are answered
   together by one write, a group commit; reads, and everything with the AOF
-  off, wait for nothing.
+  off, wait for nothing. A connection writes its own records before it
+  replies, with no thread to wake. It costs writes: on a 16-core server
+  with the AOF on, 20-28% of `SET`s a second with 50 clients and
+  pipelined, under 10% with one client, nothing for reads. The new setting
+  `aof-ack-after-write no` (default `yes`, also `CONFIG SET`) gives 1.1.2's
+  behaviour and speed back, for those who would rather lose the last few
+  writes to a kill.
 
 - **Pub/Sub: channel names are binary-safe, and a subscriber over the soft
   limit is cut off on time (#161).** `PUBLISH` refused a channel name that

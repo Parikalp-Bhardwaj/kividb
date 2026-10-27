@@ -236,6 +236,13 @@ Connections waiting at the same time are answered by one write (a group
 commit), and reads wait for nothing. Before 1.1.3 a write was acknowledged
 once its record was queued, and a killed process could lose the last few.
 
+The wait costs writes: on a 16-core server, 20-28% of `SET`s a second with
+50 clients, with or without pipelining, and under 10% with one client.
+`aof-ack-after-write no` (in the config file, or `CONFIG SET` at run time)
+acknowledges a write once its record is queued, as before 1.1.3, at full
+speed, and a killed process can lose the last few acknowledged writes. The
+default is `yes`.
+
 ## Verifying
 
 ```bash

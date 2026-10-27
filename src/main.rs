@@ -1217,7 +1217,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             // Same contract as AofSender: a record is
                             // never dropped silently. The only failure
                             // here is a gone consumer (shutdown).
-                            if std_tx.send(msg).is_err() {
+                            let sent = std_tx.send(msg);
+                            crate::aof::records_queued();
+                            if sent.is_err() {
                                 crate::aof::record_lost_aof_record();
                                 break;
                             }
@@ -1637,7 +1639,9 @@ async fn async_main_tokio(
             tokio::spawn(async move {
                 while let Some(msg) = tls_aof_bridge_rx.recv().await {
                     // Same contract as AofSender: never drop silently.
-                    if std_tx.send(msg).is_err() {
+                    let sent = std_tx.send(msg);
+                    crate::aof::records_queued();
+                    if sent.is_err() {
                         crate::aof::record_lost_aof_record();
                         break;
                     }

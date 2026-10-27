@@ -52,7 +52,8 @@ other files:
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
   write, and a power failure up to a second, as with Redis's `everysec`.
   Before 1.1.3 a write was acknowledged once its record was queued, and a
-  hard kill could lose the last few.
+  hard kill could lose the last few; `aof-ack-after-write no` still does
+  that, for more writes a second.
 
 **Data**
 - HyperLogLog registers aren't in Redis's layout
