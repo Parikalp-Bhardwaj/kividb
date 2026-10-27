@@ -601,9 +601,9 @@ fn memory_purge() -> Vec<u8> {
 }
 
 fn memory_malloc_stats() -> Vec<u8> {
-    // On Linux you'd call malloc_info() — complex and rarely needed.
-    // Return minimal valid XML matching the format clients expect.
-    resp_bulk_str("<malloc version=\"1\"><heap nr=\"0\"/><total/></malloc>")
+    // What Redis answers when built without jemalloc, as KiviDB is: it was
+    // a fixed piece of XML that looked like statistics (#152).
+    resp_bulk_str("Stats not supported for the current allocator")
 }
 
 #[cfg(test)]

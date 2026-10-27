@@ -1131,6 +1131,34 @@ fn config_set_tls_undo(ctx: &Ctx, before: TlsBefore) {
     }
 }
 
+/// `INFO keysizes`: a pass over every key. Asked for by name it is counted
+/// now; as part of `INFO all` or `everything`, which exporters scrape every
+/// few seconds, a count up to [`KEYSIZES_REUSED_FOR`] old is given again,
+/// so that they cost one pass per that time and not one each (#158).
+fn keysizes_section(ctx: &Ctx, fresh: bool) -> String {
+    static LAST: std::sync::LazyLock<
+        parking_lot::Mutex<ahash::AHashMap<usize, (std::time::Instant, String)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let server = Arc::as_ptr(ctx.store) as *const () as usize;
+    if !fresh
+        && let Some((at, text)) = LAST.lock().get(&server)
+        && at.elapsed() < KEYSIZES_REUSED_FOR
+    {
+        return text.clone();
+    }
+    let text: String = ctx
+        .store
+        .iter()
+        .enumerate()
+        .map(|(i, db)| keysizes(i, db))
+        .collect();
+    LAST.lock()
+        .insert(server, (std::time::Instant::now(), text.clone()));
+    text
+}
+
+const KEYSIZES_REUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
 pub(crate) fn remembered_config(name: &str) -> Option<String> {
     REMEMBERED_CONFIG.lock().get(name).cloned()
@@ -3382,9 +3410,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keysizes") {
                 out.push_str("# Keysizes\r\n");
-                for (i, db) in ctx.store.iter().enumerate() {
-                    out.push_str(&keysizes(i, db));
-                }
+                out.push_str(&keysizes_section(ctx, asked("keysizes")));
                 out.push_str("\r\n");
             }
 
@@ -3803,9 +3829,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("mem_fragmentation_ratio:{frag_ratio:.4}\r\n"));
                 out.push_str(&format!("mem_fragmentation_bytes:{frag_bytes}\r\n"));
                 out.push_str("mem_not_counted_for_evict:0\r\n");
-                out.push_str("mem_replication_backlog:0\r\n");
-                out.push_str("mem_clients_slaves:0\r\n");
-                out.push_str("mem_clients_normal:0\r\n");
+                // The backlog's bytes, and the clients' query buffers: they
+                // were 0 (#152).
+                out.push_str(&format!(
+                    "mem_replication_backlog:{}\r\n",
+                    ctx.repl_state.backlog_histlen.load(Ordering::Relaxed)
+                ));
+                let (clients_normal, clients_replicas) = ctx.client_registry.buffer_totals();
+                out.push_str(&format!("mem_clients_slaves:{clients_replicas}\r\n"));
+                out.push_str(&format!("mem_clients_normal:{clients_normal}\r\n"));
                 out.push_str("mem_aof_buffer:0\r\n");
                 out.push_str(&format!(
                     "active_defrag_running:{}\r\n",
@@ -3842,7 +3874,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("tracking_total_keys:{keys}\r\n"));
                 out.push_str(&format!("tracking_total_items:{items}\r\n"));
                 out.push_str(&format!("tracking_total_prefixes:{prefixes}\r\n"));
-                out.push_str("clients_in_timeout_table:0\r\n");
+                out.push_str(&format!(
+                    "clients_in_timeout_table:{}\r\n",
+                    crate::client_registry::ClientRegistryInner::in_timeout_table()
+                ));
                 let (blocking_keys, on_nokey) = ctx.wait_table.blocking_keys();
                 out.push_str(&format!("total_blocking_keys:{blocking_keys}\r\n"));
                 out.push_str(&format!("total_blocking_keys_on_nokey:{on_nokey}\r\n"));

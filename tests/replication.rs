@@ -737,6 +737,32 @@ fn test_scripts_that_read_run_on_a_replica() {
     assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
 }
 
+/// `mem_replication_backlog` is what the backlog holds: it was 0 (#152).
+#[test]
+fn test_info_memory_reports_the_replication_backlog() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    m.cmds(&["SET", "backlog:k", &"v".repeat(1000)]);
+    let backlog = |m: &mut Conn| -> u64 {
+        m.cmds(&["INFO", "memory"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("mem_replication_backlog:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    wait_until(
+        "the backlog to hold the write",
+        Duration::from_secs(10),
+        || backlog(&mut m) >= 1000,
+    );
+}
+
 /// A shard channel's message reaches a replica's subscribers, as a
 /// channel's does: `SPUBLISH` was not sent down the replication stream
 /// (#161).

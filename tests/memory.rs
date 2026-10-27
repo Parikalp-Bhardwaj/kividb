@@ -622,14 +622,15 @@ fn test_memory_malloc_stats_returns_string() {
 }
 
 #[test]
-fn test_memory_malloc_stats_contains_malloc_tag() {
+fn test_memory_malloc_stats_says_what_redis_without_jemalloc_says() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
     let result = c.cmd(&["MEMORY", "MALLOC-STATS"]);
-    assert!(
-        result.as_str().contains("malloc"),
-        "MEMORY MALLOC-STATS should contain '<malloc' tag"
+    // It was a fixed piece of XML that looked like statistics (#152).
+    assert_eq!(
+        result.as_str(),
+        "Stats not supported for the current allocator"
     );
 }
 
