@@ -475,6 +475,9 @@ where
 
     use crate::commands::transaction::TxState;
     let mut tx = TxState::new();
+    // A command of the batch being answered may have queued an AOF
+    // record: its reply waits for it (see `aof::written`).
+    let mut aof_wait = false;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut combined = Vec::with_capacity(8192);
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
@@ -676,6 +679,12 @@ where
             if !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
+            if !aof_wait
+                && crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                && crate::aof::may_log(cmd[0])
+            {
+                aof_wait = true;
+            }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             reply_gate.settle(&mut combined);
@@ -829,6 +838,9 @@ where
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(wait) = blocking_slot.take_parked() {
+                        if std::mem::take(&mut aof_wait) {
+                            crate::aof::written(&aof_tx).await;
+                        }
                         match park_blocking(
                             wait,
                             &mut blocking_slot,
@@ -906,6 +918,9 @@ where
                 });
                 if let Some(wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
+                    if std::mem::take(&mut aof_wait) {
+                        crate::aof::written(&aof_tx).await;
+                    }
                     match park_blocking(
                         wait,
                         &mut blocking_slot,
@@ -2252,6 +2267,10 @@ where
         // One TCP write per read syscall batch (pipelining).
         activity.note_flush(combined.len(), commands_before);
         activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
+        // Replies to writes go out once their records are in the AOF (#147).
+        if std::mem::take(&mut aof_wait) {
+            crate::aof::written(&aof_tx).await;
+        }
         if write_tcp_batch(&writer, &mut combined).await.is_err() {
             break;
         }

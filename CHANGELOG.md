@@ -127,6 +127,18 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **With the AOF on, a write is acknowledged once its record is in the file
+  (#147).** It was acknowledged as soon as its record was queued for the
+  AOF's writer, so a process killed with no warning (`kill -9`, the OOM
+  killer, a container stopped without a grace period) lost writes its
+  clients had been told were made: one to four in our tests, more under a
+  burst. As in Redis, the replies to a batch of commands that wrote now wait
+  for their records to reach the file (the page cache: `appendfsync
+  everysec` still syncs it within the second, so a crash of the machine
+  can lose up to a second, as in Redis). Waiting connections are answered
+  together by one write, a group commit; reads, and everything with the AOF
+  off, wait for nothing.
+
 - **Pub/Sub: channel names are binary-safe, and a subscriber over the soft
   limit is cut off on time (#161).** `PUBLISH` refused a channel name that
   was not UTF-8, and `SUBSCRIBE` changed one into another (`\xff` became
