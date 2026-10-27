@@ -685,6 +685,17 @@ fn lastsave_starts_at_the_start_and_moves_with_every_save() {
 fn a_killed_server_keeps_every_acknowledged_write() {
     let mut server = Server::start(&["--aof"]);
     let port = server.port;
+    // The default; `no` gives up the guarantee for speed (1.1.2's way).
+    let mut c = server.conn();
+    let setting = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
+    assert_eq!(setting.arr()[1].s(), "yes");
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "no"]).ok());
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "maybe"])
+            .is_err()
+    );
+    drop(c);
     for round in 0..3 {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writers: Vec<_> = (0..6)

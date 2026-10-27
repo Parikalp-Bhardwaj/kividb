@@ -214,9 +214,51 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
 // cache; `appendfsync everysec` syncs it within the second, as before).
 //
 // A connection whose replies answer a write sends a barrier down its own AOF
-// queue, behind its records, and waits for it. The writer answers every
-// barrier it has taken once it has written what came before: one write, for
-// as many connections as were waiting, is a group commit.
+// queue, behind its records, and then writes what is queued itself, if no
+// one else is writing: no thread to wake and wait for. Otherwise whoever is
+// writing (another connection, or the writer thread) takes its barrier with
+// what it writes. Every barrier is answered once what came before it is
+// written: one write, for as many connections as were waiting, is a group
+// commit. Waking the writer thread for each write and waiting to be woken
+// back halved the writes a second.
+
+/// The queue and the file, shared by the writer thread and the connections
+/// that write what is queued themselves (see [`written`]).
+struct Log {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    file: std::fs::File,
+}
+
+static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
+
+/// Wakes the writer thread: a record or a barrier has been queued. Kept as a
+/// permit if it is busy, so nothing queued is left behind.
+static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Something has been sent down the AOF's queue. Every sender calls it.
+///
+/// While replies wait for their writes, the writer thread is not woken: the
+/// connection that sent the record writes it before it replies (see
+/// [`written`]), and woken, the thread took the lock first and left the
+/// connection waiting to be woken in turn — a quarter of the writes a
+/// second. What no reply waits for (an expiry's delete, a replica's stream)
+/// is written with the next connection's, or by the writer's next sync, a
+/// second at most.
+#[inline]
+pub fn records_queued() {
+    if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// Write whatever is queued, and answer the barriers it covers. Whether a
+/// barrier was answered; `None` if someone else is writing now.
+fn write_what_is_queued(block: bool) -> Option<bool> {
+    let mut log = if block { LOG.lock() } else { LOG.try_lock()? };
+    let log = log.as_mut()?;
+    Some(write_queued(&mut log.file, &mut log.rx, None).1)
+}
 
 /// A barrier in the queue, followed by its number.
 const BARRIER_MARK: &[u8] = b"\0kividb-aof-barrier\0";
@@ -230,6 +272,23 @@ static NEXT_BARRIER: AtomicU64 = AtomicU64::new(1);
 fn as_barrier(item: &[u8]) -> Option<u64> {
     let rest = item.strip_prefix(BARRIER_MARK)?;
     Some(u64::from_le_bytes(rest.try_into().ok()?))
+}
+
+/// `aof-ack-after-write`: whether a reply to a write waits for its record
+/// to be in the file. `yes`, the default, is Redis's guarantee; `no` is
+/// 1.1.2's behaviour, faster for writes, where a killed process can lose
+/// the last few acknowledged writes.
+static ACK_AFTER_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_ack_after_write(on: bool) {
+    ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
+}
+
+/// Whether a connection's replies may have to wait for the AOF: it is on,
+/// and acknowledges after writing.
+#[inline]
+pub fn acks_wait() -> bool {
+    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
@@ -248,7 +307,7 @@ pub fn may_log(name: &[u8]) -> bool {
 /// Bounded: should the writer be gone, a reply is late, not lost. With the
 /// AOF off, or no writer, nothing to wait for.
 pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
-    if !AOF_ENABLED.load(Ordering::Relaxed) || !WRITER_RUNNING.load(Ordering::Acquire) {
+    if !acks_wait() || !WRITER_RUNNING.load(Ordering::Acquire) {
         return;
     }
     let id = NEXT_BARRIER.fetch_add(1, Ordering::Relaxed);
@@ -259,6 +318,12 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if tx.send(mark).is_err() {
         BARRIERS.lock().remove(&id);
         return;
+    }
+    // Write it ourselves, unless someone else is writing. They may have
+    // taken all there was before our barrier came: then the writer thread
+    // takes it.
+    if write_what_is_queued(false).is_none() {
+        QUEUED.notify_one();
     }
     if tokio::time::timeout(std::time::Duration::from_secs(5), wait)
         .await
@@ -403,19 +468,20 @@ pub fn request_flush() {
     }
 }
 
-pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
-    WRITER_RUNNING.store(true, Ordering::Release);
 
     // A server asked to keep an append-only file that cannot open one must
     // not run: it would accept writes and keep none of them. (This used to be
     // a panic in this task alone — the server carried on, serving, with
     // nothing being logged.)
-    let mut file = match open_aof() {
+    let file = match open_aof() {
         Ok(file) => file,
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
     };
+    *LOG.lock() = Some(Log { rx, file });
+    WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
     // the baseline the first growth ratio is measured against. The writer opens
@@ -428,13 +494,13 @@ pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                do_fsync(&mut file, &mut rx);
+                do_fsync();
             }
             Some(()) = flush_rx.recv() => {
-                do_fsync(&mut file, &mut rx);
+                do_fsync();
             }
-            Some(cmd) = rx.recv() => {
-                let released = write_queued(&mut file, &mut rx, Some(cmd)).1;
+            () = QUEUED.notified() => {
+                let released = write_what_is_queued(true).unwrap_or(false);
                 // Not straight back to waiting. A sender wakes a writer
                 // that is waiting, with a system call, and under load the
                 // writer was back to waiting before the next record came:
@@ -444,8 +510,11 @@ pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
                 // at all. A record that arrives alone is still written at
                 // once: the pause is after it, not before. Not when it has
                 // answered barriers: their clients wait on it, and send
-                // nothing until they have their replies.
-                if !released {
+                // nothing until they have their replies. Nor while replies
+                // wait for writes at all: a connection's records come before
+                // its barrier, and a pause after them made the barrier wait
+                // it out, halving the writes a second (#147).
+                if !released && !acks_wait() {
                     std::thread::sleep(WRITER_PAUSE);
                 }
             }
@@ -612,13 +681,29 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
     }
 }
 
-fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
-    // Drain pending writes before fsyncing, coalesced into one write.
-    let had_data = write_queued(file, rx, None).0;
+/// Write what is queued and sync the file — on a handle of its own, outside
+/// the lock, so that connections writing their records do not wait out the
+/// disk.
+fn do_fsync() {
+    let (had_data, written, file) = {
+        let mut log = LOG.lock();
+        let Some(log) = log.as_mut() else {
+            return;
+        };
+        // Drain pending writes before fsyncing, coalesced into one write.
+        let had_data = write_queued(&mut log.file, &mut log.rx, None).0;
+        // What the sync covers: what is on this file now. Records others
+        // write once the lock is let go may miss it, so they are not counted.
+        let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        (had_data, written, log.file.try_clone())
+    };
+    let Ok(file) = file else {
+        return;
+    };
 
     // Skip the syscall only when there is nothing *unsynced*.
     //
-    // Records land on the file in the `rx.recv()` arm without an fsync.
+    // Records land on the file as they are queued, without an fsync.
     // `WAITAOF` then `request_flush()`s; the drain here is often empty
     // because the write already happened. Skipping `sync_data` in that case
     // leaves `AOF_FSYNCED` behind `AOF_WRITTEN` and WAITAOF times out at `[0,0]`.
@@ -628,7 +713,7 @@ fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>)
     // to hop to tokio's blocking pool every second on an empty fd — the same
     // overhead the AOF-off path already avoided, and the RSS ratchet on a
     // quiet box (`used_memory` is process RSS).
-    if !had_data && AOF_WRITTEN.load(Ordering::Relaxed) == AOF_FSYNCED.load(Ordering::Relaxed) {
+    if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
 
@@ -639,8 +724,7 @@ fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>)
             "AOF: fsync of {AOF_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
         );
     } else {
-        let written = AOF_WRITTEN.load(Ordering::Relaxed);
-        AOF_FSYNCED.store(written, Ordering::Relaxed);
+        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
     }
 }
 
@@ -657,6 +741,8 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         TURN_OVER_WAITERS.lock().push((generation, done_tx));
         send_to_global_writer(turn_over_mark(generation));
+        // Waited for: never left to the next sync.
+        QUEUED.notify_one();
         Some(done_rx)
     } else {
         None

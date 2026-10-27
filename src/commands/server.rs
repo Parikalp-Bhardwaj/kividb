@@ -880,6 +880,17 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             // What the latency monitor records (#158): remembered too, for
             // `CONFIG GET`.
+            // Whether a reply to a write waits for its AOF record (#147).
+            "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::aof::set_ack_after_write(value.eq_ignore_ascii_case("yes"));
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), value.to_ascii_lowercase());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
             // The policy of a series made without one (#127).
             "ts-duplicate-policy" => match crate::types::DuplicatePolicy::parse(value) {
                 Some(policy) => {
@@ -1208,6 +1219,7 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("tcp-keepalive", "300"),
             ("latency-monitor-threshold", "0"),
             ("ts-duplicate-policy", "last"),
+            ("aof-ack-after-write", "yes"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
