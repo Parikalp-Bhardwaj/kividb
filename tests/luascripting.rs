@@ -541,6 +541,67 @@ fn the_script_cache_keeps_500_scripts_sent_with_eval() {
     assert_eq!(exists, [1, 1, 1, 0], "{exists:?}");
 }
 
+/// Redis's `struct` library: `pack`, `unpack` and `size`, with its formats.
+/// It was missing, and a script that used it failed (#154).
+#[test]
+fn the_struct_library_packs_and_unpacks_as_redis_s() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let eval = |c: &mut Conn, script: &str| c.cmds(&["EVAL", script, "0"]);
+    assert_eq!(
+        eval(&mut c, "return struct.pack('>I', 1)"),
+        RespValue::Bulk(vec![0, 0, 0, 1])
+    );
+    assert_eq!(
+        eval(&mut c, "return struct.pack('<HH', 1, 2)"),
+        RespValue::Bulk(vec![1, 0, 2, 0])
+    );
+    let ints =
+        |values: &[i64]| RespValue::Array(values.iter().map(|v| RespValue::Int(*v)).collect());
+    assert_eq!(
+        eval(
+            &mut c,
+            "return {struct.unpack('<HH', struct.pack('<HH', 1, 2))}"
+        ),
+        ints(&[1, 2, 5])
+    );
+    assert_eq!(
+        eval(&mut c, "return struct.size('>iHd')"),
+        RespValue::Int(14)
+    );
+    assert_eq!(
+        eval(&mut c, "return struct.size('lLT')"),
+        RespValue::Int(24)
+    );
+    assert_eq!(
+        eval(&mut c, "return struct.pack('s', 'ab')"),
+        RespValue::Bulk(b"ab\0".to_vec())
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "local n, s, at = struct.unpack('Bc0', struct.pack('Bc0', 5, 'hello')) \
+             return {n, s, at}"
+        ),
+        RespValue::Array(vec![
+            RespValue::Int(5),
+            RespValue::Bulk(b"hello".to_vec()),
+            RespValue::Int(7)
+        ])
+    );
+    // A number given for an integer is cut to one, as Redis's struct does.
+    assert_eq!(
+        eval(&mut c, "return struct.pack('>i', 2.7)"),
+        RespValue::Bulk(vec![0, 0, 0, 2])
+    );
+    assert!(matches!(
+        eval(&mut c, "return struct.pack('q', 1)"),
+        RespValue::Error(_)
+    ));
+}
+
 #[test]
 fn a_redis_function_dump_with_two_libraries_restores_both() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();

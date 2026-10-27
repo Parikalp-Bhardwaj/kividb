@@ -2063,6 +2063,114 @@ end
     .exec()
     .unwrap();
 
+    // Redis's `struct` library (Roberto Ierusalimschy's lua_struct):
+    // `struct.pack`, `struct.unpack`, `struct.size`, on Lua 5.4's
+    // `string.pack`, one item at a time, so that `c0` (a string as long as
+    // the value before it) works (#154). Its formats as Redis's: `s` is a
+    // zero-terminated string, `l`, `L` and `T` are 8 bytes, `c` alone is one
+    // byte, numbers given for integers are cut to integers.
+    lua.load(
+        r##"
+struct = {}
+local function struct_items(fmt)
+    local items, at = {}, 1
+    while at <= #fmt do
+        local option = fmt:sub(at, at)
+        local size = fmt:match("^%d+", at + 1) or ""
+        at = at + 1 + #size
+        items[#items + 1] = { option, size }
+    end
+    return items
+end
+local struct_plain = {}
+for option in ("xbBhHiIfd"):gmatch(".") do struct_plain[option] = true end
+local function struct_option(option, size)
+    if option == "s" then return "z" end
+    if option == "l" then return "i8" end
+    if option == "L" or option == "T" then return "I8" end
+    if option == "c" then return "c" .. (size == "" and "1" or size) end
+    if struct_plain[option] then return option .. size end
+    error("invalid format option '" .. option .. "'")
+end
+local function struct_integer(value)
+    local n = tonumber(value)
+    if n == nil then error("bad argument to 'pack' (number expected)") end
+    return math.tointeger(n) or (n >= 0 and math.floor(n) or math.ceil(n))
+end
+local function struct_state(option)
+    return option == "<" or option == ">" or option == "=" or option == "!"
+end
+struct.pack = function(fmt, ...)
+    local values, next_value, state, out = table.pack(...), 1, "", {}
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == " " then
+        elseif option == "x" then
+            out[#out + 1] = string.pack(state .. "x" .. size)
+        elseif option == "c" and size == "0" then
+            out[#out + 1] = tostring(values[next_value])
+            next_value = next_value + 1
+        else
+            local value = values[next_value]
+            next_value = next_value + 1
+            if option == "s" or option == "c" then
+                value = tostring(value)
+            elseif option ~= "f" and option ~= "d" then
+                value = struct_integer(value)
+            end
+            out[#out + 1] = string.pack(state .. struct_option(option, size), value)
+        end
+    end
+    return table.concat(out)
+end
+struct.unpack = function(fmt, data, at)
+    at = at or 1
+    local state, out, last = "", {}, nil
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == " " then
+        elseif option == "x" then
+            at = string.unpack(state .. "x" .. size, data, at)
+        elseif option == "c" and size == "0" then
+            local length = math.tointeger(last)
+            if length == nil then error("format 'c0' needs a previous size") end
+            if at + length - 1 > #data then error("data string too short") end
+            last = data:sub(at, at + length - 1)
+            out[#out + 1] = last
+            at = at + length
+        else
+            local value
+            value, at = string.unpack(state .. struct_option(option, size), data, at)
+            out[#out + 1] = value
+            last = value
+        end
+    end
+    out[#out + 1] = at
+    return table.unpack(out)
+end
+struct.size = function(fmt)
+    local state, total = "", 0
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == "s" or (option == "c" and size == "0") then
+            error("options 'c0' - 's' have undefined sizes")
+        elseif option ~= " " then
+            total = total + string.packsize(state .. struct_option(option, size))
+        end
+    end
+    return total
+end
+"##,
+    )
+    .exec()
+    .unwrap();
+
     // Lua 5.1 compat: `unpack` was a global; in 5.2+ it moved to `table.unpack`.
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();

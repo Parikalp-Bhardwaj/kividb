@@ -127,6 +127,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Scripts: the `struct` library (#154).** `struct.pack`, `struct.unpack`
+  and `struct.size`, with Redis's formats (`>`, `<`, `!`, `x`, `b`/`B`,
+  `h`/`H`, `l`/`L`, `T`, `i`/`I` with a size, `c` with a size or `c0`, `s`,
+  `f`, `d`). A script that used it failed with `attempted to access
+  nonexistent global variable 'struct'`.
+
 - **Shard channels: `SPUBLISH` reaches a replica's subscribers, and
   `SSUBSCRIBE` is routed in a cluster (#161).** Standalone, `PUBLISH` went
   down the replication stream to subscribers on replicas, and `SPUBLISH` did
