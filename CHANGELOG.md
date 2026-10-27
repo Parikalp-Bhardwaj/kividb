@@ -14,6 +14,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **`FT.SEARCH` and `FT.AGGREGATE` honour `TIMEOUT`.** The command's
+  `TIMEOUT`, or `FT.CONFIG TIMEOUT` (500 ms) when none is given, cuts a
+  query short. `ON_TIMEOUT return` (the default) replies with what was
+  found; `total_results` is that partial count. Over RESP2 the client
+  gets no signal of the timeout; RESP3 puts `Timeout limit was reached`
+  in `warning`. `fail` and `return_strict` reply with that as an error.
+  `TIMEOUT 0` is no limit. `search-global-timeout` is still not
+  implemented.
+
 - **`ts-duplicate-policy` (#127):** the duplicate policy of a time series
   made without one, by `TS.CREATE` or `TS.ADD`. It stays `last`, so that an
   upgraded server, and an AOF it replays, keep doing what they did; set it to
