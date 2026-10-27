@@ -14,14 +14,28 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
-- **`FT.SEARCH` and `FT.AGGREGATE` honour `TIMEOUT`.** The command's
-  `TIMEOUT`, or `FT.CONFIG TIMEOUT` (500 ms) when none is given, cuts a
-  query short. `ON_TIMEOUT return` (the default) replies with what was
-  found; `total_results` is that partial count. Over RESP2 the client
-  gets no signal of the timeout; RESP3 puts `Timeout limit was reached`
-  in `warning`. `fail` and `return_strict` reply with that as an error.
-  `TIMEOUT 0` is no limit. `search-global-timeout` is still not
-  implemented.
+- **`FT.SEARCH` and `FT.AGGREGATE` honour `TIMEOUT`.** A query's
+  `TIMEOUT` (milliseconds) cuts it short; one that names none runs to the
+  end, as before, unless `search-timeout` (`FT.CONFIG TIMEOUT`) is set:
+  it is `0`, no limit, by default, because a query here can look at every
+  document (`FT.SEARCH idx * LIMIT 0 0` counts them one by one) and a limit
+  nobody asked for would make a large index's counts silently short.
+  `search-on-timeout` (`FT.CONFIG ON_TIMEOUT`) says what running out
+  means: `return` (the default) replies with what was found, and
+  `total_results` is that partial count; RESP3 puts `Timeout limit was
+  reached` in `warning`, while over RESP2 the client gets no signal.
+  `fail` and `return_strict` reply with that as an error. Both settings
+  are taken by `CONFIG SET` and the config file, and are one value with
+  their `FT.CONFIG` names. What is bounded: the scan, the sort of the
+  matches and `SORTBY`, the nearest-neighbour step of a filtered `KNN`,
+  and FT.AGGREGATE's `GROUPBY`, `APPLY`, `FILTER` and `SORTBY`; a query
+  that finishes, however late, is not reported as timed out, and every
+  `FT.CURSOR READ` page of a timed-out aggregation carries the warning.
+  In a cluster each master reports whether its part timed out and the
+  coordinator applies `ON_TIMEOUT`; that report is sent only to a
+  coordinator that asks for it, so masters of the previous release and of
+  this one can be mixed during a rolling upgrade. `FT.HYBRID` does not
+  take `TIMEOUT`. `search-global-timeout` is still not implemented.
 
 - **`ts-duplicate-policy` (#127):** the duplicate policy of a time series
   made without one, by `TS.CREATE` or `TS.ADD`. It stays `last`, so that an
