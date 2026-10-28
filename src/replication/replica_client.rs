@@ -999,6 +999,9 @@ async fn run_replication_session(
     // Bytes already in `repl_buf` (the prelude, or what arrived during the
     // index rebuild) must be applied before blocking on the socket.
     let mut pending_input = !repl_buf.is_empty();
+    // How far into `repl_buf` a transaction still arriving has been looked
+    // through for its `EXEC` (`transaction_at`).
+    let mut transaction_scanned = 0usize;
 
     loop {
         if repl_state.generation() != my_generation {
@@ -1050,20 +1053,12 @@ async fn run_replication_session(
         let mut applied_commands = false;
         if pending_input {
             pending_input = false;
-            // The commands and the position move together: whoever holds
-            // this lock sees a dataset that is exactly the stream up to the
-            // resync point. A save takes it to record that point beside the
-            // dataset it writes.
-            let _applying = repl_state.apply_lock.lock();
-            let mut parse_pos = 0usize;
-            while let Some((consumed, cmd)) = parse_resp_command(&repl_buf[parse_pos..]) {
-                if cmd.len() == 1 && cmd[0].eq_ignore_ascii_case(b"PING") {
-                    // The master's heartbeat. Nothing to apply.
-                    heartbeats_seen = true;
-                } else {
+            // One command, a write the master sent as it is.
+            macro_rules! apply {
+                ($cmd:expr) => {
                     repl_apply
                         .apply_command(
-                            cmd.iter().map(|v| v.to_vec()).collect(),
+                            $cmd,
                             store,
                             repl_state,
                             expiry_store,
@@ -1082,24 +1077,82 @@ async fn run_replication_session(
                             // be a point in the stream: resync in full.
                             repl_state.set_resync_point(None);
                             SessionError::Link(e.to_string())
-                        })?;
+                        })?
+                };
+            }
+            // Commands one by one up to a `MULTI`; then the transaction it
+            // opens, as one step, once its `EXEC` has arrived; and so on.
+            // A transaction not yet arrived in full stays in `repl_buf`, not
+            // applied and not counted: should the link drop now, it is asked
+            // for again from its `MULTI` (as Redis keeps a replica's offset
+            // at the `MULTI` until the `EXEC`).
+            loop {
+                let transaction = match transaction_at(&repl_buf, &mut transaction_scanned) {
+                    StreamTransaction::Whole(whole) => Some(whole),
+                    StreamTransaction::Partial => break,
+                    StreamTransaction::None => None,
+                };
+                // Alone before the lock below, never after: a command can
+                // hold the gate while it waits for that lock (`SAVE` does),
+                // and would wait for ever behind a transaction waiting for
+                // the gate.
+                let _alone = transaction.is_some().then(crate::command_gate::enter_alone);
+                // The commands and the position move together: whoever holds
+                // this lock sees a dataset that is exactly the stream up to the
+                // resync point. A save takes it to record that point beside the
+                // dataset it writes.
+                let _applying = repl_state.apply_lock.lock();
+                let parse_pos = match transaction {
+                    Some(whole) => {
+                        // As `EXEC` runs on the master: alone, so that no
+                        // reader here sees half of it; as one write, so that
+                        // no snapshot or backup is cut inside it; and to this
+                        // node's AOF as one group, between its own `MULTI`
+                        // and `EXEC`.
+                        let _whole = crate::write_gate::enter();
+                        let _propagation = repl_apply.propagation_group(repl_state);
+                        heartbeats_seen |= whole.heartbeat;
+                        for cmd in whole.commands {
+                            apply!(cmd);
+                        }
+                        whole.len
+                    }
+                    None => {
+                        let mut parse_pos = 0usize;
+                        while let Some((consumed, cmd)) = parse_resp_command(&repl_buf[parse_pos..])
+                        {
+                            if is_named(&cmd, b"MULTI") {
+                                // Applied whole, on the next turn.
+                                break;
+                            }
+                            if is_named(&cmd, b"PING") {
+                                // The master's heartbeat. Nothing to apply.
+                                heartbeats_seen = true;
+                            } else {
+                                apply!(cmd.iter().map(|v| v.to_vec()).collect());
+                            }
+                            parse_pos += consumed;
+                        }
+                        parse_pos
+                    }
+                };
+                if parse_pos == 0 {
+                    break;
                 }
-                parse_pos += consumed;
                 applied_commands = true;
-            }
-            let read: Vec<u8> = repl_buf[..parse_pos].to_vec();
-            if parse_pos > 0 {
+                let read: Vec<u8> = repl_buf[..parse_pos].to_vec();
                 repl_buf.drain(0..parse_pos);
+                transaction_scanned = 0;
+                applied = offset - repl_buf.len() as u64;
+                repl_state.repl_offset.store(applied, Ordering::Relaxed);
+                if let Some(point) = repl_state.resync_point.lock().as_mut() {
+                    point.offset = applied;
+                    point.db = selected_db;
+                }
+                // Kept in this node's backlog, in the master's numbering: if it
+                // is promoted, the master's other replicas carry on from it (#109).
+                repl_state.record_received(read, applied);
             }
-            applied = offset - repl_buf.len() as u64;
-            repl_state.repl_offset.store(applied, Ordering::Relaxed);
-            if let Some(point) = repl_state.resync_point.lock().as_mut() {
-                point.offset = applied;
-                point.db = selected_db;
-            }
-            // Kept in this node's backlog, in the master's numbering: if it
-            // is promoted, the master's other replicas carry on from it (#109).
-            repl_state.record_received(read, applied);
         }
 
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
@@ -1110,6 +1163,83 @@ async fn run_replication_session(
             last_ack = Instant::now();
         }
     }
+}
+
+/// Whether `cmd` is the bare command `name` — `MULTI`, `EXEC`, `PING`.
+fn is_named(cmd: &[&[u8]], name: &[u8]) -> bool {
+    cmd.len() == 1 && cmd[0].eq_ignore_ascii_case(name)
+}
+
+/// What the front of the stream holds.
+enum StreamTransaction {
+    /// Not a `MULTI`.
+    None,
+    /// A `MULTI` whose `EXEC` has not arrived yet.
+    Partial,
+    Whole(WholeTransaction),
+}
+
+/// A transaction from the master, `MULTI` to `EXEC`.
+struct WholeTransaction {
+    /// Bytes of the stream it takes, `MULTI` and `EXEC` included.
+    len: usize,
+    /// The commands between them.
+    commands: Vec<Vec<Vec<u8>>>,
+    /// A heartbeat came in the middle of it.
+    heartbeat: bool,
+}
+
+/// The transaction at the front of `buf`, if one is.
+///
+/// A large one — a script that wrote a million keys — arrives over many
+/// reads, and is looked at again after each. `scanned` keeps how far it has
+/// been looked through already (0 for none), so that it is not parsed from
+/// its start every time.
+fn transaction_at(buf: &[u8], scanned: &mut usize) -> StreamTransaction {
+    let multi_len = match parse_resp_command(buf) {
+        Some((consumed, cmd)) if is_named(&cmd, b"MULTI") => consumed,
+        _ => return StreamTransaction::None,
+    };
+    let mut pos = (*scanned).max(multi_len);
+    let end = loop {
+        match parse_resp_command(&buf[pos..]) {
+            Some((consumed, cmd)) => {
+                let at = pos;
+                pos += consumed;
+                if is_named(&cmd, b"EXEC") {
+                    break at;
+                }
+            }
+            None => {
+                *scanned = pos;
+                return StreamTransaction::Partial;
+            }
+        }
+    };
+    let mut whole = WholeTransaction {
+        len: pos,
+        commands: Vec::new(),
+        heartbeat: false,
+    };
+    let mut at = multi_len;
+    while at < end {
+        let Some((consumed, cmd)) = parse_resp_command(&buf[at..]) else {
+            break;
+        };
+        at += consumed;
+        if is_named(&cmd, b"PING") {
+            // The master's heartbeat, sent while the transaction was on
+            // its way. Nothing to apply.
+            whole.heartbeat = true;
+        } else if !is_named(&cmd, b"MULTI") {
+            // A `MULTI` inside one is not something a master sends; Redis
+            // refuses it and carries on with the transaction, as here.
+            whole
+                .commands
+                .push(cmd.iter().map(|v| v.to_vec()).collect());
+        }
+    }
+    StreamTransaction::Whole(whole)
 }
 
 /// Holds `slave_sync_in_progress` for as long as it lives.
@@ -1364,6 +1494,20 @@ pub(crate) struct ReplicationApplyEnv {
 }
 
 impl ReplicationApplyEnv {
+    /// A transaction from the master, as one group to this node's AOF (and,
+    /// were anything to go to the hub, there too). See
+    /// [`crate::replication::PropagationGroup`].
+    fn propagation_group<'a>(
+        &'a self,
+        repl_state: &'a ReplState,
+    ) -> crate::replication::PropagationGroup<'a> {
+        crate::replication::PropagationGroup::begin(
+            repl_state,
+            &self.discard_hub_tx,
+            self.aof_tx.as_ref(),
+        )
+    }
+
     /// For the replication stream: applied writes are appended to this node's
     /// own AOF, and their client-visible side effects go to the server's real
     /// hubs (see [`ReplicaStarter`]).
@@ -2103,5 +2247,83 @@ mod full_sync_guard_tests {
                 .read()
                 .contains_key("dead")
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_transaction_tests {
+    use super::*;
+
+    fn enc(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn whole(t: StreamTransaction) -> WholeTransaction {
+        match t {
+            StreamTransaction::Whole(whole) => whole,
+            StreamTransaction::Partial => panic!("partial"),
+            StreamTransaction::None => panic!("none"),
+        }
+    }
+
+    #[test]
+    fn a_command_that_is_not_multi_is_not_a_transaction() {
+        let mut scanned = 0;
+        let buf = enc(&["SET", "a", "1"]);
+        assert!(matches!(
+            transaction_at(&buf, &mut scanned),
+            StreamTransaction::None
+        ));
+        assert!(matches!(
+            transaction_at(b"", &mut scanned),
+            StreamTransaction::None
+        ));
+    }
+
+    #[test]
+    fn a_transaction_is_whole_only_once_its_exec_is_there() {
+        let mut stream = enc(&["MULTI"]);
+        stream.extend_from_slice(&enc(&["SET", "a", "1"]));
+        stream.extend_from_slice(&enc(&["PING"]));
+        stream.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let exec_at = stream.len();
+        stream.extend_from_slice(&enc(&["EXEC"]));
+        let len = stream.len();
+        stream.extend_from_slice(&enc(&["SET", "after", "3"]));
+
+        // Arriving a few bytes at a time: partial until the `EXEC` is
+        // whole, and what was looked through is not looked through again.
+        let mut scanned = 0;
+        for cut in 1..len {
+            assert!(
+                matches!(
+                    transaction_at(&stream[..cut], &mut scanned),
+                    StreamTransaction::Partial | StreamTransaction::None
+                ),
+                "at {cut}"
+            );
+            assert!(scanned <= exec_at);
+        }
+        assert_eq!(scanned, exec_at);
+        let t = whole(transaction_at(&stream, &mut scanned));
+        assert_eq!(t.len, len, "MULTI to EXEC, and nothing after");
+        assert!(t.heartbeat);
+        assert_eq!(
+            t.commands,
+            vec![
+                vec![b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()],
+                vec![b"SET".to_vec(), b"b".to_vec(), b"2".to_vec()],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_transaction_is_whole_and_applies_nothing() {
+        let mut stream = enc(&["multi"]);
+        stream.extend_from_slice(&enc(&["exec"]));
+        let t = whole(transaction_at(&stream, &mut 0));
+        assert_eq!(t.len, stream.len());
+        assert!(t.commands.is_empty());
     }
 }
