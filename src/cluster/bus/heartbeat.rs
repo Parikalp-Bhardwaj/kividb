@@ -86,6 +86,49 @@ pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
 
 pub const FAILURE_DETECTION_INTERVAL: Duration = Duration::from_millis(100);
 
+/// When the failure-detection loop last began a tick (Unix ms; 0 before the
+/// first). It runs every 100 ms on the bus thread, so a time long past means
+/// the bus is stuck. See [`spawn_bus_watchdog`].
+static BUS_TICKED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long the bus may go without a tick before the watchdog says so.
+const BUS_STALL_WARN: Duration = Duration::from_secs(10);
+
+/// Log when the bus has stopped running, and when it runs again. A bus
+/// stuck on a lock answers no peer and is failed over, and everything on
+/// the node that reads the topology waits with it; nothing else said so in
+/// the log. A thread of its own, so that it is not stuck with the bus.
+pub(crate) fn spawn_bus_watchdog() {
+    let spawned = std::thread::Builder::new()
+        .name("kividb-bus-watch".into())
+        .spawn(|| {
+            let mut stalled = false;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let ticked = BUS_TICKED_MS.load(Ordering::Relaxed);
+                if ticked == 0 {
+                    continue;
+                }
+                let silent = now_ms_local().saturating_sub(ticked);
+                if !stalled && silent > BUS_STALL_WARN.as_millis() as u64 {
+                    stalled = true;
+                    log_warn!(
+                        "Cluster: The cluster bus has not run for {} s: this node is not \
+                         heartbeating, and commands that read the cluster topology may not \
+                         be answered",
+                        silent / 1000
+                    );
+                } else if stalled && silent < 1_000 {
+                    stalled = false;
+                    log_warn!("Cluster: The cluster bus is running again");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log_warn!("Cluster: could not start the bus watchdog: {e}");
+    }
+}
+
 /// Periodic task that checks for stale peers (no PONG in node_timeout_ms)
 /// and applies PFAIL / FAIL flags. Runs ~10x per second so failures are
 /// detected promptly once the timeout window has elapsed.
@@ -101,6 +144,7 @@ pub async fn run_failure_detection_loop(
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        BUS_TICKED_MS.store(now_ms_local(), Ordering::Relaxed);
         let newly_failed = state.run_failure_detection_tick();
         for id in newly_failed {
             log_warn!("Cluster: Node {} marked FAIL by quorum", node_id_str(&id));

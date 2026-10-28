@@ -124,6 +124,13 @@ pub enum MigrationState {
     Importing { src_id: NodeId },
 }
 
+/// The locks below are `parking_lot` locks: a reader queues behind a waiting
+/// writer, so a thread must never take a lock it already holds, read or
+/// write, and a guard must not be kept across an `.await`. Where one thread
+/// holds several, it takes them in this order and no other: `forgotten`,
+/// `save_lock`, `failure_reports`, `nodes`, `slots`, `migrations`, `myself`.
+/// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
+/// its statement, or of the `match` / `if let` / `for` it heads.
 pub struct ClusterState {
     pub enabled: bool,
     /// This node's id. Behind a lock only so `CLUSTER RESET HARD` can replace
@@ -1113,8 +1120,14 @@ impl ClusterState {
         // Slots this node itself was serving and has just lost.
         let mut lost: Vec<u16> = Vec::new();
         {
-            let migrations = self.migrations.read();
+            // `slots` before `migrations`, the order everything else takes
+            // them in (see `ClusterState`). Taken the other way round, a bus
+            // thread holding `migrations` and waiting for `slots` met the end
+            // of a slot migration holding `slots` and waiting for
+            // `migrations` (`take_over_slots`, `hand_over_slots`), and both
+            // waited for good.
             let mut slots = self.slots.write();
+            let migrations = self.migrations.read();
             for claim in claims {
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
