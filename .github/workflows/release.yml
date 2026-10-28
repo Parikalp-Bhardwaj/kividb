@@ -401,6 +401,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Signed build provenance for the images (see the last steps).
+      id-token: write
+      attestations: write
     steps:
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -468,6 +471,52 @@ jobs:
               fi
             done
           done
+
+      # The digest of each variant's multi-arch manifest on GHCR, for its
+      # attestation. Docker Hub's copy is the same manifest, with the same
+      # digest, so one attestation answers for both.
+      - name: Image digests
+        id: digests
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          SRC: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for variant in default lua tls full; do
+            if [ "${variant}" = "default" ]; then ref="${SRC}:${TAG}"; else ref="${SRC}:${TAG}-${variant}"; fi
+            digest=$(docker buildx imagetools inspect "${ref}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            case "${digest}" in sha256:*) ;; *) echo "::error::no digest for ${ref}: ${digest}"; exit 1 ;; esac
+            echo "${variant}=${digest}" >> "$GITHUB_OUTPUT"
+            echo "${ref} ${digest}"
+          done
+
+      # Signed build provenance for each image: anyone can check one with
+      # `gh attestation verify oci://ghcr.io/kividbio/kividb:<tag> --repo
+      # kividbio/kividb`. Pushed to GHCR beside the image as well.
+      - name: Attest image provenance (default)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digests.outputs.default }}
+          push-to-registry: true
+      - name: Attest image provenance (lua)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digests.outputs.lua }}
+          push-to-registry: true
+      - name: Attest image provenance (tls)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digests.outputs.tls }}
+          push-to-registry: true
+      - name: Attest image provenance (full)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digests.outputs.full }}
+          push-to-registry: true
 
   # Stable releases only: a candidate has no macOS binaries (see `darwin`),
   # and the tap is what `brew install kividb` gives people. v1.0.6-rc1 went
@@ -578,10 +627,13 @@ jobs:
           && needs.docker-manifest.result == 'success'
           && needs.darwin.result == 'success' }}
     runs-on: ubuntu-latest
-    # pull-requests: read for the list of merged PRs on the release page.
+    # pull-requests: read for the list of merged PRs on the release page;
+    # id-token and attestations to sign the files' build provenance.
     permissions:
       contents: write
       pull-requests: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -601,6 +653,17 @@ jobs:
           cp artifacts/* release-assets/
           cd release-assets
           find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} \; | sort > SHA256SUMS.txt
+
+      # Signed build provenance for every release file: that this exact file
+      # was built by this workflow, from this commit (Sigstore, with the
+      # workflow's own OIDC identity; no keys). SHA256SUMS.txt lists them all,
+      # so the tarballs, .deb and .rpm are covered with no list to keep.
+      # Anyone can check a download with
+      # `gh attestation verify <file> --repo kividbio/kividb`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: release-assets/SHA256SUMS.txt
 
       # The release page: a heading, the release's own notes if it has them
       # (docs/releases/<tag>.md, written for people upgrading), then what
