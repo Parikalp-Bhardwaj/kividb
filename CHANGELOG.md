@@ -14,6 +14,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **Signed build provenance for every release file and image.** The
+  release workflow signs a GitHub artifact attestation (Sigstore, with the
+  workflow's own identity) for every tarball, `.deb` and `.rpm` in a
+  release, and for the multi-arch image of each variant on GHCR (the same
+  images Docker Hub carries). `SHA256SUMS.txt` shows a download arrived
+  whole; the attestation shows it was built by this repository's release
+  workflow from the tagged commit. Check one with
+  `gh attestation verify <file> --repo kividbio/kividb`, or
+  `gh attestation verify oci://ghcr.io/kividbio/kividb:<tag> --repo kividbio/kividb`.
+
 - **`FT.SEARCH` and `FT.AGGREGATE` honour `TIMEOUT`.** A query's
   `TIMEOUT` (milliseconds) cuts it short; one that names none runs to the
   end, as before, unless `search-timeout` (`FT.CONFIG TIMEOUT`) is set:
