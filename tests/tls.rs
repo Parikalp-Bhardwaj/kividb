@@ -362,9 +362,22 @@ fn wait_open(port: u16) {
 }
 
 /// Whether nothing listens on `port`: a connection to it is refused.
+/// Whether nothing accepts on `port`, within two seconds. A port closed with
+/// `CONFIG SET` is let go by each accept loop as it wakes, a moment after
+/// the reply (on io_uring the reply comes from the same thread as the loop,
+/// so it cannot wait for it): CI caught it still open the instant after.
 fn closed(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_err()
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A server with a plaintext port only, as one starts without TLS.

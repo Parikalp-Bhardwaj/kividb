@@ -145,6 +145,9 @@ pub fn move_to(server: Server, kind: Kind, port: u16) -> Result<(), String> {
         return Ok(());
     }
     if port == 0 {
+        // Each accept loop lets its socket go as it wakes to this, a moment
+        // after the reply. It is not waited for: on io_uring this runs on
+        // the very thread of one of those loops.
         server.pending.lock().clear();
         server.current.store(0, Ordering::SeqCst);
         server.moved.send_modify(|n| *n += 1);
