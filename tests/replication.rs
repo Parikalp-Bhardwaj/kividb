@@ -1743,3 +1743,178 @@ fn test_a_promoted_replica_continues_its_sibling() {
     );
     assert_eq!(bc.cmds(&["GET", "k:99"]).as_str(), "v");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRANSACTIONS AND SCRIPTS AS ONE STEP ON A REPLICA (#172)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Run `transfer` on the master many times while a reader on its replica
+/// reads both keys at once: `a` and `b` start at 0 and every transfer moves 1
+/// from one to the other, so a sum other than 0 is half a transfer.
+fn assert_replica_never_shows_half_of(transfer: impl Fn(&mut Conn) + Send + 'static) {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["MSET", "a", "0", "b", "0"]).is_ok());
+    wait_until(
+        "the replica to have a and b",
+        Duration::from_secs(10),
+        || {
+            r.cmds(&["MGET", "a", "b"])
+                == RespValue::Array(vec![
+                    RespValue::Bulk(b"0".to_vec()),
+                    RespValue::Bulk(b"0".to_vec()),
+                ])
+        },
+    );
+
+    const TRANSFERS: i64 = 3000;
+    let writer = thread::spawn(move || {
+        for _ in 0..TRANSFERS {
+            transfer(&mut m);
+        }
+    });
+    let mut reads = 0u64;
+    let mut torn = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let both = r.cmds(&["MGET", "a", "b"]);
+        let both = both.as_array();
+        let (a, b) = (both[0].as_int(), both[1].as_int());
+        reads += 1;
+        if a + b != 0 && torn.len() < 5 {
+            torn.push((a, b));
+        }
+        // Until the replica has the last transfer.
+        if writer.is_finished() && a == -TRANSFERS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica stopped at a = {a}"
+        );
+    }
+    writer.join().unwrap();
+    assert!(
+        torn.is_empty(),
+        "a reader on the replica saw half a transfer (a, b): {torn:?} in {reads} reads"
+    );
+}
+
+/// A transaction is one step on a replica too: a reader there never sees its
+/// first write without its second. Its writes reached the replica one by
+/// one, and were applied one by one (#172).
+#[test]
+fn test_a_replica_never_shows_half_a_transaction() {
+    assert_replica_never_shows_half_of(|m| {
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        m.cmds(&["DECRBY", "a", "1"]);
+        m.cmds(&["INCRBY", "b", "1"]);
+        assert_eq!(m.cmds(&["EXEC"]).as_array().len(), 2);
+    });
+}
+
+/// The same for a script that writes twice.
+#[cfg(feature = "lua")]
+#[test]
+fn test_a_replica_never_shows_half_a_script() {
+    assert_replica_never_shows_half_of(|m| {
+        let reply = m.cmds(&[
+            "EVAL",
+            "redis.call('DECRBY', KEYS[1], 1) return redis.call('INCRBY', KEYS[2], 1)",
+            "2",
+            "a",
+            "b",
+        ]);
+        assert!(matches!(reply, RespValue::Int(_)), "{reply:?}");
+    });
+}
+
+/// One command of the replication stream, as a replica reads it.
+fn read_stream_command(r: &mut impl BufRead) -> Vec<String> {
+    let header = read_line_raw(r);
+    let count: usize = header
+        .strip_prefix('*')
+        .unwrap_or_else(|| panic!("not a command: {header:?}"))
+        .parse()
+        .unwrap();
+    (0..count)
+        .map(|_| {
+            let len: usize = read_line_raw(r).trim_start_matches('$').parse().unwrap();
+            let mut arg = vec![0u8; len + 2];
+            r.read_exact(&mut arg).unwrap();
+            arg.truncate(len);
+            String::from_utf8(arg).unwrap()
+        })
+        .collect()
+}
+
+/// What a replica is sent for a transaction: its writes between a `MULTI`
+/// and an `EXEC`, when it wrote more than once; as they are, when it wrote
+/// once; nothing at all, when it wrote nothing.
+#[test]
+fn test_a_transaction_reaches_replicas_between_multi_and_exec() {
+    let master = spawn_server(Config::default());
+    // A replica by hand: the full sync, then the stream.
+    let stream = TcpStream::connect(("127.0.0.1", master)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writer
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let greeting = read_line_raw(&mut reader);
+    assert!(greeting.starts_with("+FULLRESYNC"), "{greeting}");
+    let len: usize = read_line_raw(&mut reader)
+        .trim_start_matches('$')
+        .parse()
+        .unwrap();
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).unwrap();
+
+    let mut m = Conn::connect(master);
+    wait_until(
+        "the master to count its replica",
+        Duration::from_secs(10),
+        || repl_info(&mut m, "connected_slaves").as_deref() == Some("1"),
+    );
+    for transaction in [
+        &[&["SET", "x", "1"][..], &["GET", "x"], &["SET", "y", "2"]][..],
+        &[&["SET", "z", "3"]],
+        &[&["GET", "z"]],
+    ] {
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        for command in transaction {
+            m.cmds(command);
+        }
+        assert_eq!(m.cmds(&["EXEC"]).as_array().len(), transaction.len());
+    }
+    assert!(m.cmds(&["SET", "last", "4"]).is_ok());
+
+    let mut sent = Vec::new();
+    while sent
+        .last()
+        .is_none_or(|c: &Vec<String>| c[0] != "SET" || c[1] != "last")
+    {
+        let command = read_stream_command(&mut reader);
+        if !["PING", "SELECT", "REPLCONF"].contains(&command[0].as_str()) {
+            sent.push(command);
+        }
+    }
+    let words = |c: &[&str]| c.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        sent,
+        vec![
+            words(&["MULTI"]),
+            words(&["SET", "x", "1"]),
+            words(&["SET", "y", "2"]),
+            words(&["EXEC"]),
+            words(&["SET", "z", "3"]),
+            words(&["SET", "last", "4"]),
+        ]
+    );
+}
