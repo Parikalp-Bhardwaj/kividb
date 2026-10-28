@@ -241,6 +241,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A cluster node no longer stops answering for good after a `CONFIG
+  GET`.** A node could stop answering everything, `PING` included, with
+  its CPU idle, and never recover. It was seen on nodes of a sharded
+  cluster soon after a master restarted, when an operator polls every node
+  more often. `CONFIG GET` took the read lock on the node table twice in a
+  row, and still held the first when it took the second. If the cluster bus
+  asked for the write lock in between, as it does on every heartbeat, the
+  bus waited for `CONFIG GET` and `CONFIG GET` waited behind the bus. Every
+  other command that reads the cluster's topology then queued behind them,
+  until no worker thread was left to answer anything. Now `CONFIG GET`
+  takes that lock once. While looking we found and fixed a second deadlock
+  of the same kind: a bus that took in a peer's slot claims at the moment
+  an atomic slot migration finished could deadlock with it, because the two
+  took the slot table and the migration table in opposite orders. A node
+  whose bus has not run for 10 s now logs `The cluster bus has not run
+  for N s`, and logs again when the bus runs again.
+
 - **A manual failover no longer loses writes when its election is slow
   (#185).** `CLUSTER FAILOVER` has the master hold writes while its replica
   catches up and wins an election. The master held them for 5 s, and the
