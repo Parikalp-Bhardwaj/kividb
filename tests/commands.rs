@@ -169,6 +169,31 @@ fn free_port() -> u16 {
     }
 }
 
+/// `DEBUG POPULATE` makes the keys it says it makes, as Redis: it replied
+/// `OK` and made none (#173).
+#[test]
+fn debug_populate_makes_its_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["DEBUG", "POPULATE", "100"]).as_str(), "OK");
+    assert_eq!(c.cmds(&["DBSIZE"]).as_int(), 100);
+    assert_eq!(c.cmds(&["GET", "key:0"]).as_str(), "value:0");
+    assert_eq!(c.cmds(&["GET", "key:99"]).as_str(), "value:99");
+    // A prefix, and a size: cut, or padded with zero bytes.
+    c.cmds(&["DEBUG", "POPULATE", "3", "p", "4"]);
+    assert_eq!(c.cmds(&["GET", "p:2"]).as_str(), "valu");
+    c.cmds(&["DEBUG", "POPULATE", "1", "q", "10"]);
+    assert_eq!(c.cmds(&["STRLEN", "q:0"]).as_int(), 10);
+    // A key that is there is left alone.
+    c.cmds(&["SET", "key:5", "mine"]);
+    c.cmds(&["DEBUG", "POPULATE", "10"]);
+    assert_eq!(c.cmds(&["GET", "key:5"]).as_str(), "mine");
+    assert_eq!(c.cmds(&["DBSIZE"]).as_int(), 104);
+    assert!(c.cmds(&["DEBUG", "POPULATE", "-1"]).is_error());
+    assert!(c.cmds(&["DEBUG", "POPULATE", "many"]).is_error());
+}
+
 fn start_server(port: u16) {
     thread::spawn(move || {
         let config = kividb::config::Config {
