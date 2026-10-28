@@ -1103,3 +1103,149 @@ fn test_no_ca_file_means_no_client_cert() {
 
     assert_eq!(tls_ping(port, &pki.ca_der, None).as_deref(), Ok("+PONG"));
 }
+
+// ── tls-auth-clients-allowed-names ───────────────────────────────────────────
+
+/// A client certificate signed by `pki`'s CA with subject CN `cn` (none if
+/// empty) and DNS names `dns`.
+fn named_cert(pki: &Pki, cn: &str, dns: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    let mut params =
+        CertificateParams::new(dns.iter().map(|name| name.to_string()).collect::<Vec<_>>())
+            .unwrap();
+    if !cn.is_empty() {
+        params.distinguished_name.push(DnType::CommonName, cn);
+    }
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let key = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key, &pki.ca_cert, &pki.ca_key).unwrap();
+    (cert.der().to_vec(), key.serialize_der())
+}
+
+/// A TLS connection presenting `client`, kept open.
+fn client_conn(port: u16, ca_der: &[u8], (cert, key): (Vec<u8>, Vec<u8>)) -> BlockingTls {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(ca_der.to_vec())).unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![CertificateDer::from(cert)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let stream = rt.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        connector.connect(name, tcp).await.unwrap()
+    });
+    BlockingTls { rt, stream }
+}
+
+/// `tls-auth-clients-allowed-names`: of the certificates the CA signed, only
+/// those with a CN or DNS name that matches are taken; `*` is one label;
+/// `CONFIG SET` changes it for new connections.
+#[test]
+fn allowed_names_pin_client_certificates() {
+    let pki = generate_pki();
+    let plain = free_port();
+    let tls = free_port();
+    let cfg = kividb::config::Config {
+        port: plain,
+        bind: "127.0.0.1".to_string(),
+        tls_port: tls,
+        tls_cert_file: pki.cert_path.to_str().unwrap().to_string(),
+        tls_key_file: pki.key_path.to_str().unwrap().to_string(),
+        tls_ca_cert_file: pki.ca_path.to_str().unwrap().to_string(),
+        tls_auth_clients_allowed_names: "*.DB1.nodes.kividb.internal".to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate(true).is_ok());
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(plain);
+    wait_open(tls);
+    let ping = |cert| tls_ping(tls, &pki.ca_der, Some(cert));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-auth-clients-allowed-names"]),
+        "tls-auth-clients-allowed-names *.db1.nodes.kividb.internal"
+    );
+
+    // A DNS name or the CN, in any case.
+    let node0 = named_cert(&pki, "client", &["node-0.db1.nodes.kividb.internal"]);
+    assert_eq!(ping(node0.clone()).as_deref(), Ok("+PONG"));
+    let by_cn = named_cert(&pki, "Node-1.db1.nodes.kividb.internal", &[]);
+    assert_eq!(ping(by_cn).as_deref(), Ok("+PONG"));
+    // Another database under the same CA, a name two labels down, the
+    // parent itself, and no matching name at all: refused.
+    for refused in [
+        named_cert(&pki, "", &["x.db2.nodes.kividb.internal"]),
+        named_cert(&pki, "", &["a.b.db1.nodes.kividb.internal"]),
+        named_cert(&pki, "", &["db1.nodes.kividb.internal"]),
+        named_cert(&pki, "client", &[]),
+    ] {
+        let reply = ping(refused);
+        assert!(reply.is_err(), "accepted: {reply:?}");
+    }
+    // Not asked for one under `optional`: still no certificate is fine.
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-auth-clients", "optional"]),
+        "OK"
+    );
+    assert_eq!(tls_ping(tls, &pki.ca_der, None).as_deref(), Ok("+PONG"));
+    let reply = ping(named_cert(&pki, "", &["x.db2.nodes.kividb.internal"]));
+    assert!(reply.is_err(), "accepted: {reply:?}");
+
+    // Changed at runtime: new connections only.
+    let mut kept = client_conn(tls, &pki.ca_der, node0.clone());
+    assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG");
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-auth-clients-allowed-names",
+            "*.db2.nodes.kividb.internal,admin.example",
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-auth-clients-allowed-names"]),
+        "tls-auth-clients-allowed-names *.db2.nodes.kividb.internal admin.example"
+    );
+    assert!(ping(node0.clone()).is_err());
+    assert_eq!(
+        ping(named_cert(&pki, "", &["x.db2.nodes.kividb.internal"])).as_deref(),
+        Ok("+PONG")
+    );
+    assert_eq!(
+        ping(named_cert(&pki, "admin.example", &[])).as_deref(),
+        Ok("+PONG")
+    );
+    assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG");
+
+    // What is not a name: refused, and nothing changes.
+    for bad in ["a.*.example", "*", "db1..internal"] {
+        let reply = plain_cmd(
+            plain,
+            &["CONFIG", "SET", "tls-auth-clients-allowed-names", bad],
+        );
+        assert!(reply.starts_with("ERR CONFIG SET failed"), "{bad}: {reply}");
+    }
+    assert!(ping(node0.clone()).is_err());
+
+    // Empty: off.
+    assert_eq!(
+        plain_cmd(
+            plain,
+            &["CONFIG", "SET", "tls-auth-clients-allowed-names", ""]
+        ),
+        "OK"
+    );
+    assert_eq!(ping(node0).as_deref(), Ok("+PONG"));
+}
