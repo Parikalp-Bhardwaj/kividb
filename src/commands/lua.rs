@@ -4346,8 +4346,10 @@ fn eval_script(
     });
 
     let _clear_eval = ClearScriptEval { lua };
-    // What the script writes goes to the AOF as one piece, when it ends.
-    let _aof_group = crate::aof::RecordGroup::begin(ctx.aof_tx);
+    // What the script writes goes to replicas between a `MULTI` and an
+    // `EXEC`, and to the AOF as one piece, when it ends (#172).
+    let _propagation =
+        crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
     set_global_keys_argv(lua, &keys, &argv)?;
@@ -4467,8 +4469,10 @@ fn eval_function_call(
     });
 
     let _clear_eval = ClearScriptEval { lua };
-    // What the script writes goes to the AOF as one piece, when it ends.
-    let _aof_group = crate::aof::RecordGroup::begin(ctx.aof_tx);
+    // What the script writes goes to replicas between a `MULTI` and an
+    // `EXEC`, and to the AOF as one piece, when it ends (#172).
+    let _propagation =
+        crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
     set_global_keys_argv(lua, &keys, &argv)?;

@@ -1463,10 +1463,8 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     {
         let parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
         let payload = crate::resp::write::encode_resp_command(&parts);
-        ctx.repl_state
-            .repl_offset
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
-        replication::propagate(ctx.hub_tx, payload);
+        // In a transaction or a script, after the writes made before it.
+        replication::propagate_in_order(ctx.repl_state, ctx.hub_tx, payload);
     }
 
     track(ctx, name, is_mutating_ok_write, writes_operation);

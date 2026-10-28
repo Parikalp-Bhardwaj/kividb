@@ -375,14 +375,14 @@ pub fn install_global_aof_sender(tx: Box<dyn crate::commands::ctx::AofSender>) {
 }
 
 thread_local! {
-    /// The records of the script this thread is running, held back until it
-    /// ends (`RecordGroup`).
+    /// The records of the script or transaction this thread is running, held
+    /// back until it ends (`RecordGroup`).
     static RECORD_GROUP: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Queue a record for the AOF: at once — or, while this thread is running a
-/// script, with everything else the script writes.
+/// script or a transaction, with everything else it writes.
 pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
     let data = RECORD_GROUP.with(|group| match group.borrow_mut().as_mut() {
         Some(held) => {
@@ -396,7 +396,20 @@ pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
     }
 }
 
-/// Everything a script writes, as one piece of the AOF.
+/// Put `data` in front of the records this thread's group holds — the
+/// `MULTI` of a group that turns out to be a transaction, at its second
+/// write. False if no group is open.
+pub(crate) fn put_in_front_of_group(data: &[u8]) -> bool {
+    RECORD_GROUP.with(|group| match group.borrow_mut().as_mut() {
+        Some(held) => {
+            held.splice(0..0, data.iter().copied());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Everything a script, or a transaction, writes, as one piece of the AOF.
 ///
 /// Each `redis.call` that writes makes a record. Queued one by one, they
 /// reach the file in whatever groups the writer happens to take them, and a
@@ -409,15 +422,17 @@ pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
 ///
 /// One message is one `write`, short of the kernel cutting that write at a
 /// page boundary as the process dies: far rarer than a kill between two
-/// messages, and not excluded. Nothing marks the group in the file.
-#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+/// messages, and not excluded. So the group is marked in the file: it is
+/// opened by a [`crate::replication::PropagationGroup`], which puts a
+/// `MULTI` before its records and an `EXEC` after them, and a replay drops a
+/// `MULTI` whose `EXEC` is not there (#172). A transaction's records are
+/// grouped the same way.
 pub struct RecordGroup<'a> {
     tx: &'a dyn crate::commands::ctx::AofSender,
     /// False for a script called by a script: the outer one's group holds.
     outermost: bool,
 }
 
-#[cfg_attr(not(feature = "lua"), allow(dead_code))]
 impl<'a> RecordGroup<'a> {
     pub fn begin(tx: &'a dyn crate::commands::ctx::AofSender) -> Self {
         let outermost = RECORD_GROUP.with(|group| {
