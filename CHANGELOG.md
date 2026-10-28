@@ -241,6 +241,18 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A master drops a replica that has gone silent, after `repl-timeout`,
+  as Redis does.** A replica whose host went away without closing the
+  connection (a terminated VM, a lost network path, a paused container)
+  stayed in `INFO replication` as `state=online`, its lag growing, and was
+  counted in `connected_slaves` until the master restarted. Now a replica
+  that is online and sends no `REPLCONF ACK` for `repl-timeout` seconds (60
+  by default) is disconnected, with `Replication: disconnecting timedout
+  replica <ip>:<port>` in the log, over plaintext and TLS alike.
+  `min-replicas-to-write` and `WAIT` were not misled: they already went by
+  each replica's last acknowledgement. Not new in 1.2.0. Reported by KiviDB
+  Cloud.
+
 - **A graceful shutdown no longer loses writes it acknowledged.** On SIGTERM
   or `SHUTDOWN`, the server stopped accepting connections but let the ones
   already open go on running commands while it wrote its final snapshot.
