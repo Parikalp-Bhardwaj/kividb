@@ -869,8 +869,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     // already open made after that moment was acknowledged
                     // and then lost with the process. Taken alone, the gate
                     // waits for the commands running now and lets no other
-                    // start; it is never let go.
-                    let _no_more_commands = crate::command_gate::enter_alone();
+                    // start; it is never let go. Forgotten, not kept in a
+                    // binding: one dropped at the end of this block opened
+                    // the gate again before `process::exit` below, and the
+                    // writes that ran in between were acknowledged and lost.
+                    std::mem::forget(crate::command_gate::enter_alone());
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
                     let result = crate::replication::save_dataset(
