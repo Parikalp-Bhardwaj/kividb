@@ -180,12 +180,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   sets on the score (`score > 0.8`) now means what it means on Redis.
   Sets made with KiviDB's own `METRIC IP` or `METRIC L2` keep their scores.
 
-- **Four small ones (#173):**
-  - `tracking_clients` went down with `CLIENT TRACKING OFF` and `RESET`, not
-    when a tracking client disconnected, so on a server whose clients came
-    and went it only grew; and as long as it was above 0, every write went
-    on looking for trackers that were gone. A client that leaves now stops
-    being counted.
+- **Three small ones (#173):**
   - `DEBUG POPULATE` replied `OK` and made nothing. It makes its keys now,
     as Redis: `DEBUG POPULATE count [prefix] [size]`, `key:0` onwards
     holding `value:0`…, cut or padded with zero bytes to `size`, leaving

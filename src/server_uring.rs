@@ -555,10 +555,8 @@ pub async fn handle_client(
     client_registry.register(client_info);
 
     // However the connection ends — the client leaving, an error, a kill —
-    // what was kept for it goes: the keys it was tracking, its place in
-    // `tracking_clients`, and its entry in the registry. The count was left
-    // behind, and it is also what tells a write whether anyone is tracking
-    // at all (#173).
+    // what was kept for it goes: the keys it was tracking, and its entry in
+    // the registry (which is where a tracking client stops being counted).
     struct ClientGuard {
         id: u64,
         registry: crate::client_registry::ClientRegistry,
@@ -566,9 +564,6 @@ pub async fn handle_client(
     }
     impl Drop for ClientGuard {
         fn drop(&mut self) {
-            if self.registry.get(self.id).is_some_and(|info| info.tracking) {
-                self.tracking.disable_tracking();
-            }
             self.tracking.unregister_client(self.id);
             self.registry.unregister(self.id);
         }

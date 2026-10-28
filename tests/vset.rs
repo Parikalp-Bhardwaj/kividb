@@ -582,10 +582,10 @@ fn test_vsim_withscores() {
 
     assert_eq!(arr[2].as_str(), "b");
     let score_b: f32 = arr[3].as_str().parse().unwrap();
-    // Cosine similarity of orthogonal vectors = 0.0
+    // Orthogonal vectors: 0.5, as Redis scores cosine, (1 + cosine) / 2 (#171)
     assert!(
-        score_b < 0.01,
-        "orthogonal vector similarity should be ~0.0, got {score_b}"
+        (score_b - 0.5).abs() < 0.01,
+        "orthogonal vector similarity should be ~0.5, got {score_b}"
     );
 }
 
@@ -1126,8 +1126,8 @@ fn test_vsim_explicit_cosine_metric() {
     let b_score = pairs.iter().find(|(n, _)| *n == "b").map(|(_, s)| *s);
     if let Some(bs) = b_score {
         assert!(
-            bs < 0.1,
-            "orthogonal vectors (cosine) should score ~0.0, got {bs}"
+            (bs - 0.5).abs() < 0.1,
+            "orthogonal vectors (cosine) should score ~0.5, got {bs}"
         );
     }
 }

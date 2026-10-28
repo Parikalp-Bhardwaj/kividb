@@ -259,8 +259,9 @@ fn overwritten_type_changed_and_array_events() {
     c.cmd(&["RPUSH", "src", "a", "b"]);
     assert_eq!(event(&mut sub), "rpush src");
     c.cmd(&["LMOVE", "src", "dst", "LEFT", "RIGHT"]);
-    assert_eq!(event(&mut sub), "lpop src");
+    // Redis's order (`lmoveGenericCommand`): the push, then the pop (#173).
     assert_eq!(event(&mut sub), "rpush dst");
+    assert_eq!(event(&mut sub), "lpop src");
     c.cmd(&["SETRANGE", "num", "0", "9"]);
     assert_eq!(event(&mut sub), "setrange num");
     c.cmd(&["SETBIT", "bits", "1", "1"]);

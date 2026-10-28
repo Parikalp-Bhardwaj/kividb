@@ -85,10 +85,11 @@ impl Conn {
     }
 }
 
-/// A client that turns tracking on and then disconnects stops being counted.
-/// Only `CLIENT TRACKING OFF` and `RESET` took it off, so the count only grew
-/// on a server whose clients came and went, and a write went on looking for
-/// trackers that were long gone (#173).
+/// A client that turns tracking on and then disconnects stops being counted,
+/// once: the registry takes it off as it lets the client go. (Reported as
+/// never happening in #173, from a check that never closed its connection;
+/// taking it off a second time, as a fix for that would have, makes the
+/// count wrong the other way.)
 #[test]
 fn a_tracking_client_that_leaves_is_no_longer_counted() {
     let port = free_port();
