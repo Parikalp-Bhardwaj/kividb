@@ -240,16 +240,26 @@ struct Node {
     dir: PathBuf,
     child: Option<Child>,
     extra: Vec<String>,
+    /// Environment variables of its process, besides the test's own.
+    env: Vec<(String, String)>,
 }
 
 impl Node {
     fn start(extra: &[&str]) -> Self {
+        Self::start_with_env(extra, &[])
+    }
+
+    fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let mut node = Node {
             port: cluster_port(),
             dir,
             child: None,
             extra: extra.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         };
         node.spawn();
         node
@@ -280,6 +290,7 @@ impl Node {
                 "kividb.conf",
             ])
             .args(&self.extra)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
@@ -456,7 +467,12 @@ fn wait_cluster_ok(nodes: &[&Node], known: usize) {
 
 /// Attach a fresh node as a replica of `master` and wait for it to sync.
 fn add_replica(cluster: &[Node], master: &Node) -> Node {
-    let replica = Node::start(&[]);
+    add_replica_with_env(cluster, master, &[])
+}
+
+/// [`add_replica`], its process given `env` as well.
+fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -> Node {
+    let replica = Node::start_with_env(&[], env);
     let r = cluster[0]
         .conn()
         .cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
@@ -1496,33 +1512,8 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     }
     let key = key_in(ranges[0].0..=ranges[0].1, "m");
 
-    // A writer that follows redirects and counts only acknowledged INCRs.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let stop = std::sync::Arc::clone(&stop);
-        let key = key.clone();
-        let ports = [nodes[0].port, replica.port];
-        std::thread::spawn(move || {
-            let mut acked = 0i64;
-            let mut target = 0usize;
-            let mut conn = Conn::connect(ports[target]);
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                match conn.try_cmd(&["INCR", &key]) {
-                    Ok(Resp::Int(_)) => acked += 1,
-                    // Redirected, read-only, paused or dropped: not
-                    // acknowledged. Try the other node.
-                    _ => {
-                        target = 1 - target;
-                        std::thread::sleep(Duration::from_millis(5));
-                        if let Some(c) = Conn::try_connect(ports[target]) {
-                            conn = c;
-                        }
-                    }
-                }
-            }
-            acked
-        })
-    };
+    let writer = counting_writer(&stop, &key, [nodes[0].port, replica.port]);
 
     std::thread::sleep(Duration::from_millis(500));
     let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
@@ -1559,6 +1550,102 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     // A failover against a master is refused.
     let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
     assert!(reply.err().is_some_and(|e| e.contains("replica")));
+}
+
+/// A writer that INCRs `key` until `stop`, follows redirects between the two
+/// `ports`, and counts only the INCRs acknowledged.
+fn counting_writer(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    key: &str,
+    ports: [u16; 2],
+) -> std::thread::JoinHandle<i64> {
+    let stop = std::sync::Arc::clone(stop);
+    let key = key.to_string();
+    std::thread::spawn(move || {
+        let mut acked = 0i64;
+        let mut target = 0usize;
+        let mut conn = Conn::connect(ports[target]);
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match conn.try_cmd(&["INCR", &key]) {
+                Ok(Resp::Int(_)) => acked += 1,
+                // Redirected, read-only, paused or dropped: not
+                // acknowledged. Try the other node.
+                _ => {
+                    target = 1 - target;
+                    std::thread::sleep(Duration::from_millis(5));
+                    if let Some(c) = Conn::try_connect(ports[target]) {
+                        conn = c;
+                    }
+                }
+            }
+        }
+        acked
+    })
+}
+
+/// A manual failover whose election outlasts the time it has loses no write
+/// the master acknowledged (#185). The votes reach the replica 6 s late, as
+/// they do from voters whose disks are slow to sync them. The master used to
+/// hold writes for 5 s and the replica to take over whenever it won: so the
+/// master took writes again, and those it acknowledged between the replica's
+/// promotion and its own hearing of it were lost. Now the master holds
+/// writes for twice as long as the replica has to win in, and a replica that
+/// has not won in that time gives the failover up.
+#[test]
+fn a_manual_failover_that_runs_out_of_time_loses_no_acknowledged_write() {
+    let (nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(&nodes, &nodes[0], &[("KIVIDB_TEST_VOTE_DELAY_MS", "6000")]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let key = key_in(ranges[0].0..=ranges[0].1, "late");
+
+    // Several writers, for more writes in whatever window there is.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|_| counting_writer(&stop, &key, [nodes[0].port, replica.port]))
+        .collect();
+
+    std::thread::sleep(Duration::from_millis(500));
+    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
+
+    // Past the late votes and the master's hold on writes, whichever way
+    // the failover went; then until the shard has one master again, and its
+    // replica follows it.
+    std::thread::sleep(Duration::from_secs(11));
+    let master_and_replica = || {
+        if replica.is_master() {
+            (&replica, &nodes[0])
+        } else {
+            (&nodes[0], &replica)
+        }
+    };
+    wait_until(
+        "one master for the shard, followed by the other node",
+        Duration::from_secs(30),
+        || {
+            let (master, follower) = master_and_replica();
+            !follower.is_master()
+                && master.is_master()
+                && follower.repl_info("master_link_status").as_deref() == Some("up")
+        },
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acked: i64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(acked > 0, "the writers never got a write through");
+
+    // Not equal, necessarily: an INCR held by the pause for longer than the
+    // client waits is applied, but was never acknowledged.
+    let (master, _) = master_and_replica();
+    let value: i64 = master.conn().cmd(&["GET", &key]).text().parse().unwrap();
+    assert!(
+        value >= acked,
+        "{} acknowledged INCRs lost: the counter is {value}, {acked} were acknowledged",
+        acked - value
+    );
 }
 
 // ── Resharding ────────────────────────────────────────────────────────────────

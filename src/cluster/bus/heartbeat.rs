@@ -288,7 +288,7 @@ async fn check_election(
                     return;
                 }
 
-                let epoch = state.start_election(master_id, false);
+                let epoch = state.start_election(master_id, false, None);
                 state.election_pending.store(false, Ordering::SeqCst);
                 log_warn!(
                     "Cluster: Starting election for epoch {epoch} (failed master: {})",
@@ -304,6 +304,24 @@ async fn check_election(
                 return;
             }
             let quorum = state.election_quorum(master_id);
+            // A manual failover is won while the master still holds writes
+            // for it, or not at all. Won later, the master has been taking
+            // writes again, and those it acknowledged between our promotion
+            // and its hearing of it are lost (#185). Given up, the master
+            // goes on as it was once its pause is over.
+            if let Some(deadline) = election.deadline_ms
+                && now_ms_local() >= deadline
+            {
+                log_warn!(
+                    "Cluster: Manual failover abandoned: the election at epoch {} was not won \
+                     in time ({} of {} votes)",
+                    election.epoch,
+                    election.votes_received.len(),
+                    quorum
+                );
+                state.end_election();
+                return;
+            }
             if election.votes_received.len() >= quorum {
                 log_info!(
                     "Cluster: Won election at epoch {} ({} votes, quorum {})",
@@ -498,6 +516,9 @@ pub(crate) async fn broadcast_auth_request(
                     sender_id,
                     request_epoch,
                 })) => {
+                    if let Some(delay) = test_vote_delay() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let count = state.record_vote(sender_id, request_epoch);
                     log_verbose!(
                         "Cluster: Got vote from {} for epoch {} (total: {})",
@@ -524,11 +545,37 @@ pub(crate) async fn broadcast_auth_request(
     }
 }
 
+/// For the tests of an election that runs long, and never set otherwise:
+/// `KIVIDB_TEST_VOTE_DELAY_MS`, how long a vote this node was given is held
+/// before it is counted. A voter syncs its vote to disk before it answers,
+/// and on a disk every other test is syncing to as well that has taken
+/// seconds (#185).
+fn test_vote_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_VOTE_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
 // ── Manual failover ──────────────────────────────────────────────────────────
 
-/// How long a master holds writes for a replica that asked to take over, and
-/// how long that replica waits to catch up before giving up.
+/// How long a replica that asked its master to hold writes has, from asking,
+/// to catch up and win its election; it gives the failover up if it has not.
+///
+/// The master holds writes for twice as long (`MANUAL_FAILOVER_PAUSE`), as
+/// in Redis, so that a replica that takes over does so while they are still
+/// held. Both used to be 5 s, and the election was not bounded at all: one
+/// whose votes were slow in coming (a voter syncs its vote to disk before it
+/// answers) was won after the master had begun taking writes again, and the
+/// writes it acknowledged before it heard of the promotion were lost (#185).
 pub const MANUAL_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a master holds writes for a replica that asked to take over.
+const MANUAL_FAILOVER_PAUSE: Duration = Duration::from_secs(10);
 
 /// The master's side of `CLUSTER FAILOVER`: stop accepting writes, and tell
 /// the replica how far it has to read to have everything.
@@ -562,7 +609,7 @@ pub(crate) async fn answer_mfstart(
         (replica.ip.clone(), replica.client_port)
     };
 
-    crate::pause::set_handoff_pause(MANUAL_FAILOVER_TIMEOUT.as_millis() as i64);
+    crate::pause::set_handoff_pause(MANUAL_FAILOVER_PAUSE.as_millis() as i64);
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
@@ -626,6 +673,9 @@ pub async fn run_manual_failover(
         format!("{}:{}", m.ip, m.cluster_port)
     };
 
+    // From before the master is asked: it holds writes from a moment later,
+    // for twice this.
+    let deadline_ms = now_ms_local() + MANUAL_FAILOVER_TIMEOUT.as_millis() as u64;
     let reply = dialer::exchange(
         &state,
         &master_addr,
@@ -641,9 +691,8 @@ pub async fn run_manual_failover(
     };
 
     // Catch up to the point the master stopped at.
-    let deadline = tokio::time::Instant::now() + MANUAL_FAILOVER_TIMEOUT;
     while repl_state.repl_offset.load(Ordering::Relaxed) < target_offset {
-        if tokio::time::Instant::now() >= deadline {
+        if now_ms_local() >= deadline_ms {
             return Err(format!(
                 "did not catch up with the master in time (at {} of {target_offset})",
                 repl_state.repl_offset.load(Ordering::Relaxed)
@@ -652,13 +701,19 @@ pub async fn run_manual_failover(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    start_forced_election(&state, master_id).await;
+    // Won by the same deadline, or given up (`check_election`).
+    start_forced_election(&state, master_id, Some(deadline_ms)).await;
     Ok(())
 }
 
-/// Start an election that does not require the master to be FAIL.
-pub async fn start_forced_election(state: &Arc<ClusterState>, master_id: NodeId) {
-    let epoch = state.start_election(master_id, true);
+/// Start an election that does not require the master to be FAIL, to be won
+/// by `deadline_ms` if there is one (see [`MANUAL_FAILOVER_TIMEOUT`]).
+pub async fn start_forced_election(
+    state: &Arc<ClusterState>,
+    master_id: NodeId,
+    deadline_ms: Option<u64>,
+) {
+    let epoch = state.start_election(master_id, true, deadline_ms);
     log_info!(
         "Cluster: Manual failover: starting election at epoch {epoch} to replace {}",
         node_id_str(&master_id)

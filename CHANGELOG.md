@@ -237,6 +237,21 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A manual failover no longer loses writes when its election is slow
+  (#185).** `CLUSTER FAILOVER` has the master hold writes while its replica
+  catches up and wins an election. The master held them for 5 s, and the
+  replica took over whenever it won, however late that was. Each voter syncs
+  its vote to disk before it answers, and on a busy disk that can take
+  seconds. If the election took longer than 5 s, the master started taking
+  writes again, and the ones it acknowledged after the replica took over
+  and before it heard about it were lost. That is the likely cause of the
+  63 writes one CI run lost. Now
+  the master holds writes for 10 s, and the replica has 5 s from asking to
+  catch up and win, as in Redis. If it hasn't won by then it gives the
+  failover up (`Manual failover abandoned` in its log), and the master goes
+  on as before once the pause ends. `CLUSTER FAILOVER FORCE` and `TAKEOVER`
+  are unchanged.
+
 - **A transaction, and a script, reach replicas and the AOF as one step
   (#172).** On the master a transaction ran as one step, but its writes went
   to replicas one by one, and a replica applied them one by one: a client
