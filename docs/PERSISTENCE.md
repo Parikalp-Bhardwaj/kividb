@@ -62,6 +62,10 @@ from its own files, then syncs with its master.
 * A partial record at the end of the file, the normal result of dying
   mid-write, is cut off with a `[WARN]` naming it. It was never acknowledged
   to a client.
+* A transaction (or a script that wrote more than once) is written between
+  a `MULTI` and an `EXEC`. One whose `EXEC` is not in the file is dropped
+  whole and cut off, as Redis does: `Revert incomplete MULTI/EXEC
+  transaction in AOF file`. Half of it is a dataset no client ever saw.
 * A malformed record *before* the end makes the whole replay fail before
   anything is applied, and the server refuses to start rather than start
   with part of its data.
