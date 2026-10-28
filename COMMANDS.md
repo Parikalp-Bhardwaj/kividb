@@ -471,7 +471,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; scores are similarities computed using the set's stored distance metric (1.0 = identical for cosine/IP, bounded 0–1 for L2) |
+| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; `WITHSCORES` gives each a similarity from the set's metric: for cosine, the default and Redis's only one, `(1 + cosine) / 2` as in Redis (1 the same direction, 0.5 at right angles, 0 opposite); for `IP` the dot product; for `L2` `1 / (1 + distance)` |
 
 ### Inspection and traversal
 
