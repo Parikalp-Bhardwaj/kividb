@@ -24,20 +24,25 @@ pub mod acceptor {
         pub auth_clients: String,
         pub client_cert: String,
         pub client_key: String,
+        /// `tls-auth-clients-allowed-names`, as `config::allowed_names`
+        /// writes it: lower case, separated by spaces.
+        pub allowed_names: String,
     }
 
     /// The settings that make up [`Files`].
-    pub const SETTINGS: [&str; 6] = [
+    pub const SETTINGS: [&str; 7] = [
         "tls-cert-file",
         "tls-key-file",
         "tls-ca-cert-file",
         "tls-auth-clients",
+        "tls-auth-clients-allowed-names",
         "tls-client-cert-file",
         "tls-client-key-file",
     ];
 
     impl Files {
         pub fn of(config: &crate::config::Config) -> Self {
+            let names = &config.tls_auth_clients_allowed_names;
             Files {
                 cert: config.tls_cert_file.clone(),
                 key: config.tls_key_file.clone(),
@@ -45,6 +50,9 @@ pub mod acceptor {
                 auth_clients: config.tls_auth_clients.clone(),
                 client_cert: config.tls_client_cert_file.clone(),
                 client_key: config.tls_client_key_file.clone(),
+                // Checked at startup: see `Config::validate`.
+                allowed_names: crate::config::allowed_names(names)
+                    .map_or_else(|_| names.clone(), |names| names.join(" ")),
             }
         }
 
@@ -54,6 +62,7 @@ pub mod acceptor {
                 "tls-key-file" => &mut self.key,
                 "tls-ca-cert-file" => &mut self.ca,
                 "tls-auth-clients" => &mut self.auth_clients,
+                "tls-auth-clients-allowed-names" => &mut self.allowed_names,
                 "tls-client-cert-file" => &mut self.client_cert,
                 "tls-client-key-file" => &mut self.client_key,
                 _ => return None,
@@ -172,9 +181,14 @@ pub mod acceptor {
             .map_err(|e| format!("[TLS] Failed to parse key: {e}"))?
             .ok_or_else(|| format!("[TLS] No private key found in '{key_path}'"))?;
 
+        let names = crate::config::allowed_names(&files.allowed_names)
+            .map_err(|e| format!("[TLS] tls-auth-clients-allowed-names: {e}"))?;
         let builder = ServerConfig::builder();
         let builder = match client_verifier(ca_path, auth_clients)? {
-            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            Some(verifier) if names.is_empty() => builder.with_client_cert_verifier(verifier),
+            Some(verifier) => {
+                builder.with_client_cert_verifier(Arc::new(AllowedNames { verifier, names }))
+            }
             None => builder.with_no_client_auth(),
         };
         let config = builder
@@ -217,5 +231,153 @@ pub mod acceptor {
             .build()
             .map_err(|e| format!("[TLS] Client certificate verifier error: {e}"))?;
         Ok(Some(verifier))
+    }
+
+    use tokio_rustls::rustls;
+    use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
+    use tokio_rustls::rustls::server::danger::ClientCertVerified;
+    use tokio_rustls::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+
+    /// `tls-auth-clients-allowed-names`: a certificate the CA's verifier
+    /// takes is taken only if its subject CN or one of its DNS names matches
+    /// one of `names`. One that does not fails the handshake, as a
+    /// certificate from another CA does.
+    #[derive(Debug)]
+    struct AllowedNames {
+        verifier: Arc<dyn ClientCertVerifier>,
+        names: Vec<String>,
+    }
+
+    impl ClientCertVerifier for AllowedNames {
+        fn offer_client_auth(&self) -> bool {
+            self.verifier.offer_client_auth()
+        }
+
+        fn client_auth_mandatory(&self) -> bool {
+            self.verifier.client_auth_mandatory()
+        }
+
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            self.verifier.root_hint_subjects()
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            now: UnixTime,
+        ) -> Result<ClientCertVerified, rustls::Error> {
+            let verified = self
+                .verifier
+                .verify_client_cert(end_entity, intermediates, now)?;
+            let presented = presented_names(end_entity);
+            if presented.iter().any(|name| {
+                self.names
+                    .iter()
+                    .any(|pattern| crate::config::allowed_name_matches(pattern, name))
+            }) {
+                return Ok(verified);
+            }
+            // The names, not the certificate; a few at most, and short.
+            let shown: Vec<String> = presented
+                .iter()
+                .take(8)
+                .map(|name| name.chars().take(100).collect())
+                .collect();
+            crate::log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "TLS: client certificate refused: its names ({}) match none of \
+                 tls-auth-clients-allowed-names",
+                if shown.is_empty() {
+                    "none".to_string()
+                } else {
+                    shown.join(", ")
+                }
+            );
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.verifier.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.verifier.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.verifier.supported_verify_schemes()
+        }
+    }
+
+    /// The subject CNs of a certificate, then its DNS names.
+    fn presented_names(cert: &CertificateDer<'_>) -> Vec<String> {
+        let Ok(parsed) = webpki::EndEntityCert::try_from(cert) else {
+            return Vec::new();
+        };
+        let mut names = common_names(parsed.subject());
+        names.extend(parsed.valid_dns_names().map(str::to_string));
+        names
+    }
+
+    /// One DER element at the start of `input`: its tag, its contents, and
+    /// what follows it.
+    fn der(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = input.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (first as usize, rest)
+        } else {
+            let n = (first & 0x7f) as usize;
+            if n == 0 || n > 4 || rest.len() < n {
+                return None;
+            }
+            let len = rest[..n]
+                .iter()
+                .fold(0usize, |len, &b| (len << 8) | b as usize);
+            (len, &rest[n..])
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+
+    /// The common names (OID 2.5.4.3) in a certificate's subject: the DER
+    /// of a Name without its outer SEQUENCE, a SET of attributes for each
+    /// part.
+    fn common_names(subject: &[u8]) -> Vec<String> {
+        const SET: u8 = 0x31;
+        const SEQUENCE: u8 = 0x30;
+        const OID: u8 = 0x06;
+        const CN: &[u8] = &[0x55, 0x04, 0x03];
+        let mut names = Vec::new();
+        let mut parts = subject;
+        while let Some((SET, mut attributes, rest)) = der(parts) {
+            parts = rest;
+            while let Some((SEQUENCE, attribute, more)) = der(attributes) {
+                attributes = more;
+                if let Some((OID, oid, value)) = der(attribute)
+                    && oid == CN
+                    // UTF8String, PrintableString, TeletexString, IA5String.
+                    && let Some((0x0c | 0x13 | 0x14 | 0x16, text, _)) = der(value)
+                    && let Ok(text) = std::str::from_utf8(text)
+                {
+                    names.push(text.to_string());
+                }
+            }
+        }
+        names
     }
 }

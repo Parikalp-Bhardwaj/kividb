@@ -399,6 +399,7 @@ list.
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
+| `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
 
 ### TLS
@@ -419,6 +420,14 @@ certificate signed by that CA; others are refused during the handshake.
 `--tls-auth-clients optional` accepts clients without a certificate but still refuses an
 invalid one, and `--tls-auth-clients no` does not ask for one. With `redis-cli`:
 `redis-cli --tls -p 6381 --cacert ca.pem --cert client.pem --key client.key`.
+
+**Pinning client certificates by name.** `--tls-auth-clients-allowed-names "*.db1.example
+admin.example"` (spaces or commas between names) accepts a client certificate only if its subject
+CN or one of its DNS names matches one of the names; others signed by the same CA fail the
+handshake, and the server logs the names they carried. `*` stands for exactly one label:
+`*.db1.example` takes `node-0.db1.example`, not `a.b.db1.example` or `db1.example`. Case does
+not matter. It applies to clients, replicas and, with `tls-cluster`, nodes on the cluster bus;
+empty (the default) is off. KiviDB's own setting: Redis has none.
 
 **Changed without a restart.** `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
 `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` and `tls-client-key-file` loads the

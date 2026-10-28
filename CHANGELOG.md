@@ -54,6 +54,24 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   timestamp is an error. A series keeps the policy it was made with. Config
   file and `CONFIG SET`; set it alike on a master and its replicas.
 
+- **Client certificates pinned by name: `tls-auth-clients-allowed-names`.**
+  A list of names, separated by spaces or commas; when it is set, a client
+  that presents a certificate is accepted only if the certificate's subject
+  CN or one of its DNS names matches one of them, and otherwise fails the
+  handshake, as a certificate from another CA does. A name is exact, or
+  starts with `*.`, where `*` stands for exactly one label, as in a
+  certificate: `*.db1.nodes.example` takes `node-0.db1.nodes.example`, not
+  `a.b.db1.nodes.example`, `db1.nodes.example` or `x.db2.nodes.example`.
+  Case does not matter. It is checked wherever a certificate is asked for:
+  clients and replicas on `tls-port` (with `tls-ca-cert-file` and
+  `tls-auth-clients yes` or `optional`), and nodes on a `tls-cluster` bus.
+  Empty, the default, is off. Config file, command line and `CONFIG SET`,
+  for connections from then on; `CONFIG GET` gives it back lower case, one
+  space apart. A refused certificate is logged (at most every 10 seconds)
+  with the names it carried. Redis has no such setting: with one CA for
+  many databases, it keeps the certificates of one from being taken by
+  another.
+
 - **TLS certificates are loaded again with `CONFIG SET`, without a restart
   (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
   `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or

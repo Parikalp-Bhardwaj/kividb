@@ -1161,6 +1161,22 @@ fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, 
             "argument(s) must be one of the following: no, yes, optional",
         ));
     }
+    // Written as `CONFIG GET` gives it back: lower case, one space apart.
+    let allowed_names = match changes
+        .iter()
+        .find(|(name, _)| name == "tls-auth-clients-allowed-names")
+    {
+        Some((_, value)) => match crate::config::allowed_names(value) {
+            Ok(names) => names.join(" "),
+            Err(e) => {
+                return Err(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'tls-auth-clients-allowed-names') - {e}"
+                )));
+            }
+        },
+        None => String::new(),
+    };
     let server = crate::listen::server_of(ctx.config);
     let before = TlsBefore {
         listener: Some(acceptor::files(server).unwrap_or_else(|| acceptor::Files::of(ctx.config))),
@@ -1169,10 +1185,10 @@ fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, 
     let changed = |files: &Option<acceptor::Files>| {
         files.clone().map(|mut files| {
             for (name, value) in changes {
-                let value = if name == "tls-auth-clients" {
-                    value.to_ascii_lowercase()
-                } else {
-                    value.clone()
+                let value = match name.as_str() {
+                    "tls-auth-clients" => value.to_ascii_lowercase(),
+                    "tls-auth-clients-allowed-names" => allowed_names.clone(),
+                    _ => value.clone(),
                 };
                 files.set(name, &value);
             }

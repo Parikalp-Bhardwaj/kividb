@@ -332,7 +332,12 @@ fn tls_replication_is_turned_on_at_runtime() {
 fn a_tls_only_replica_replicates_a_tls_only_master() {
     let _serial = serial();
     let master_tls = free_port();
-    let master = tls_config(0, master_tls);
+    // The replica is a client of its master: its certificate's names are
+    // checked as any client's.
+    let master = kividb::config::Config {
+        tls_auth_clients_allowed_names: "localhost".to_string(),
+        ..tls_config(0, master_tls)
+    };
     assert!(master.validate(true).is_ok());
     start(master);
     let replica_tls = free_port();
