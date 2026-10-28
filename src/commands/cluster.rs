@@ -1107,7 +1107,8 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
             // a real election: the other masters have to agree.
             let state = Arc::clone(ctx.cluster);
             bus.spawn(async move {
-                crate::cluster::bus::heartbeat::start_forced_election(&state, master_id).await;
+                crate::cluster::bus::heartbeat::start_forced_election(&state, master_id, None)
+                    .await;
             });
             resp_simple("OK")
         }

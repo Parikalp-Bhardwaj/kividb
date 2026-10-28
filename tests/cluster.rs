@@ -1594,11 +1594,7 @@ fn counting_writer(
 #[test]
 fn a_manual_failover_that_runs_out_of_time_loses_no_acknowledged_write() {
     let (nodes, ranges) = form_cluster(3);
-    let replica = add_replica_with_env(
-        &nodes,
-        &nodes[0],
-        &[("KIVIDB_TEST_VOTE_DELAY_MS", "6000")],
-    );
+    let replica = add_replica_with_env(&nodes, &nodes[0], &[("KIVIDB_TEST_VOTE_DELAY_MS", "6000")]);
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
         wait_cluster_ok(&all, 4);

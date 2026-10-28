@@ -56,6 +56,10 @@ pub struct ElectionState {
     /// voters are asked to grant the vote without it being FAIL, and the
     /// election is not abandoned just because the master is alive.
     pub manual: bool,
+    /// For a manual failover whose master is holding writes for it: the
+    /// time (Unix ms) by which it has to be won, or it is given up. See
+    /// `heartbeat::MANUAL_FAILOVER_TIMEOUT`.
+    pub deadline_ms: Option<u64>,
 }
 
 /// What the cluster layer needs from the rest of the server. Installed once
@@ -1679,8 +1683,8 @@ impl ClusterState {
 
     /// Begin an election to replace `master_id`. Returns the new epoch. Bumps
     /// current_epoch so the election claim takes the highest epoch in the
-    /// cluster.
-    pub fn start_election(&self, master_id: NodeId, manual: bool) -> u64 {
+    /// cluster. `deadline_ms`: see [`ElectionState::deadline_ms`].
+    pub fn start_election(&self, master_id: NodeId, manual: bool, deadline_ms: Option<u64>) -> u64 {
         let new_epoch = self.bump_epoch();
         let mut election = self.election.lock();
         *election = Some(ElectionState {
@@ -1690,6 +1694,7 @@ impl ClusterState {
             votes_received: ahash::AHashSet::new(),
             completed: false,
             manual,
+            deadline_ms,
         });
         new_epoch
     }
