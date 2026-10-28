@@ -702,6 +702,73 @@ fn test_tls_ping() {
     assert_eq!(resp, "PONG");
 }
 
+/// With the AOF on, a write over TLS is answered once its record is in the
+/// file, as over plaintext: in milliseconds. 1.2.0-rc1 answered each one at
+/// the next once-a-second sync, so a client doing SETs one after another got
+/// one reply a second. Only the server binary had that path (the in-process
+/// servers above never did), so this starts the binary: with its default
+/// I/O model, io_uring on Linux, and with tokio.
+#[test]
+fn writes_over_tls_with_the_aof_on_are_answered_at_once() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let bin = std::env::var("CARGO_BIN_EXE_kividb").expect("built with the kividb binary");
+    let certs = generate_certs();
+    for io_model in [None, Some("tokio")] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let mut args = vec![
+            "--port".to_string(),
+            plain.to_string(),
+            "--bind".into(),
+            "127.0.0.1".into(),
+            "--dir".into(),
+            dir.path().to_str().unwrap().into(),
+            "--aof".into(),
+            "--tls-port".into(),
+            tls.to_string(),
+            "--tls-cert-file".into(),
+            certs.cert_path.to_str().unwrap().into(),
+            "--tls-key-file".into(),
+            certs.key_path.to_str().unwrap().into(),
+        ];
+        if let Some(model) = io_model {
+            args.extend(["--io-model".into(), model.into()]);
+        }
+        let _server = Killed(
+            std::process::Command::new(&bin)
+                .args(&args)
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+
+        let mut conn = make_tls_client(tls, &certs.cert_der);
+        let started = std::time::Instant::now();
+        for i in 0..20 {
+            send_cmd(&mut conn, &["SET", &format!("k{i}"), "v"]);
+            assert_eq!(read_resp(&mut conn), "OK");
+        }
+        let took = started.elapsed();
+        // About a millisecond each; at the sync's pace, twenty took 10 to 20 s.
+        assert!(
+            took < Duration::from_secs(3),
+            "20 SETs over TLS with the AOF on took {took:?} (io model {io_model:?})"
+        );
+        send_cmd(&mut conn, &["DBSIZE"]);
+        assert_eq!(read_resp(&mut conn), "20");
+    }
+}
+
 /// SET and GET over TLS produce the expected value.
 #[test]
 fn test_tls_set_get() {
