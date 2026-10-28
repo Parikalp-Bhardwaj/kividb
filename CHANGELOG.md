@@ -241,6 +241,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **With the AOF on, a write over TLS is answered at once again, not at
+  the next once-a-second sync.** In 1.2.0-rc1 a reply to a write waits
+  until its record is in the AOF, and the connection writes the log itself
+  to get there. TLS connections queued their records on a channel of
+  their own, which a task copied onto the writer's. When the connection
+  wrote the log, its record had often not been copied yet, and nothing
+  else wrote it until the sync. A client doing SETs one after another over
+  TLS got about one reply a second. Plaintext connections, reads and
+  `aof-ack-after-write no` were not affected. TLS connections now queue on
+  the writer's channel, as plaintext ones do. Reported by KiviDB Cloud.
+
 - **A cluster node no longer stops answering for good after a `CONFIG
   GET`.** A node could stop answering everything, `PING` included, with
   its CPU idle, and never recover. It was seen on nodes of a sharded
