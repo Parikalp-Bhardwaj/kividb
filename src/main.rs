@@ -1236,31 +1236,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let tls_store = Arc::clone(&store);
         let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
-        // server::handle_client expects a tokio Sender; bridge from the std SyncSender once here.
-        let (tls_aof_tx, mut tls_aof_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        {
-            let std_tx = aof_tx.clone();
-            // io_uring `run_uring` has no Tokio runtime on the main thread — cannot use `tokio::spawn` here.
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async move {
-                        while let Some(msg) = tls_aof_bridge_rx.recv().await {
-                            // Same contract as AofSender: a record is
-                            // never dropped silently. The only failure
-                            // here is a gone consumer (shutdown).
-                            let sent = std_tx.send(msg);
-                            crate::aof::records_queued();
-                            if sent.is_err() {
-                                crate::aof::record_lost_aof_record();
-                                break;
-                            }
-                        }
-                    });
-            });
-        }
+        // The writer's own queue, as plaintext connections have. A reply to a
+        // write waits until a barrier sent on this queue is in the file, and
+        // the connection writes the queue itself to get there (`aof::written`).
+        // TLS connections used to have a queue of their own, copied onto this
+        // one by a task: the barrier was still on that queue when the
+        // connection wrote, and nothing else wrote it until the next
+        // once-a-second sync, so each write over TLS waited up to a second.
+        let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
         let tls_index_store = Arc::clone(&index_store);
         let tls_wait_table = Arc::clone(&wait_table);
@@ -1658,22 +1641,14 @@ async fn async_main_tokio(
         let tls_store = Arc::clone(&store);
         let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
-        // server::handle_client expects a tokio Sender; bridge from the std SyncSender once here.
-        let (tls_aof_tx, mut tls_aof_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        {
-            let std_tx = aof_tx.clone();
-            tokio::spawn(async move {
-                while let Some(msg) = tls_aof_bridge_rx.recv().await {
-                    // Same contract as AofSender: never drop silently.
-                    let sent = std_tx.send(msg);
-                    crate::aof::records_queued();
-                    if sent.is_err() {
-                        crate::aof::record_lost_aof_record();
-                        break;
-                    }
-                }
-            });
-        }
+        // The writer's own queue, as plaintext connections have. A reply to a
+        // write waits until a barrier sent on this queue is in the file, and
+        // the connection writes the queue itself to get there (`aof::written`).
+        // TLS connections used to have a queue of their own, copied onto this
+        // one by a task: the barrier was still on that queue when the
+        // connection wrote, and nothing else wrote it until the next
+        // once-a-second sync, so each write over TLS waited up to a second.
+        let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
         let tls_index_store = Arc::clone(&index_store);
         let tls_wait_table = Arc::clone(&wait_table);
