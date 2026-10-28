@@ -498,6 +498,9 @@ pub(crate) async fn broadcast_auth_request(
                     sender_id,
                     request_epoch,
                 })) => {
+                    if let Some(delay) = test_vote_delay() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let count = state.record_vote(sender_id, request_epoch);
                     log_verbose!(
                         "Cluster: Got vote from {} for epoch {} (total: {})",
@@ -522,6 +525,19 @@ pub(crate) async fn broadcast_auth_request(
             }
         });
     }
+}
+
+/// For the tests of an election that runs long, and never set otherwise:
+/// `KIVIDB_TEST_VOTE_DELAY_MS`, how long a vote this node was given is held
+/// before it is counted. A voter syncs its vote to disk before it answers,
+/// and on a disk every other test is syncing to as well that has taken
+/// seconds (#185).
+fn test_vote_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_VOTE_DELAY_MS").ok()?.parse().ok()?;
+        Some(Duration::from_millis(ms))
+    })
 }
 
 // ── Manual failover ──────────────────────────────────────────────────────────
