@@ -611,12 +611,72 @@ jobs:
   # Stable releases only. A release candidate (a tag with a `-`, v1.2.0-rc1)
   # gets no GitHub Release, no assets and no announcement: it is built, its
   # images are pushed to GHCR, and the smoke test runs against them; the
-  # Releases page lists only what was released. Its binaries stay as this
-  # run's artifacts.
+  # Releases page lists only what was released. Its binaries go to GHCR as
+  # well (`rc-binaries`).
   #
   # `darwin` is skipped for a release candidate, and a job that needs a
   # skipped job is skipped too unless it says otherwise: so this says what it
   # does need — every build that ran to have succeeded.
+  # ── Release candidates: binaries on GHCR, not on the Releases page ──────
+  #
+  # A candidate gets no GitHub Release (see `publish`), so its binaries,
+  # packages and checksums go to GHCR as one OCI artifact instead, at
+  # `ghcr.io/<owner>/kividb-binaries:<tag>`, beside its images: anyone can
+  # fetch them, with no sign-in, but nothing points people at them. With the
+  # ORAS CLI: `oras pull ghcr.io/kividbio/kividb-binaries:v1.2.0-rc1`. Signed
+  # like a release's files. Linux only: `darwin` is skipped for a candidate.
+  rc-binaries:
+    needs: [linux-amd64, linux-arm64]
+    if: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Assemble the files
+        run: |
+          set -euo pipefail
+          mkdir -p rc-assets
+          cp artifacts/* rc-assets/
+          cd rc-assets
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} \; | sort > SHA256SUMS.txt
+          ls -l
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: rc-assets/SHA256SUMS.txt
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Push to GHCR
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/kividb-binaries
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          cd rc-assets
+          # The source label links the package to this repository, whose
+          # visibility it takes.
+          oras push "${REPO}:${RELEASE_TAG}" \
+            --artifact-type application/vnd.kividb.binaries.v1 \
+            --annotation "org.opencontainers.image.source=${SOURCE}" \
+            --annotation "org.opencontainers.image.version=${RELEASE_TAG}" \
+            --annotation "org.opencontainers.image.description=KiviDB ${RELEASE_TAG} binaries and packages (a release candidate)" \
+            $(ls)
+          echo "Pushed ${REPO}:${RELEASE_TAG}: oras pull ${REPO}:${RELEASE_TAG}"
+
   publish:
     needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
     if: >-

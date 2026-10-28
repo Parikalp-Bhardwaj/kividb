@@ -5,7 +5,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0]
+
+See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
 
 **Read before upgrading:** in scripts, `pcall` and `assert` now behave as in
 Redis. A script that reads `e.err` from an error `pcall` caught no longer
@@ -155,8 +157,10 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 - **Release candidates are no longer published as GitHub Releases.** A tag
   such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
-  (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its binaries
-  stay with the workflow run; the Releases page lists only releases.
+  (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
+  binaries, packages and checksums are pushed to GHCR beside them, signed:
+  `oras pull ghcr.io/kividbio/kividb-binaries:v1.2.0-rc1`. The Releases page
+  lists only releases.
 
 - **Key specs come from Valkey's command files, and from KiviDB's own.**
   The key specs that `COMMAND INFO` and `COMMAND DOCS` report, and that a
