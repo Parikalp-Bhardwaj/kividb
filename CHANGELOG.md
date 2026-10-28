@@ -5,7 +5,9 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0]
+
+See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
 
 **Read before upgrading:** in scripts, `pcall` and `assert` now behave as in
 Redis. A script that reads `e.err` from an error `pcall` caught no longer
