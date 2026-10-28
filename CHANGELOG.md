@@ -622,6 +622,29 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   on as before once the pause ends. `CLUSTER FAILOVER FORCE` and `TAKEOVER`
   are unchanged.
 
+- **HyperLogLog values are Redis-compatible, with a rolling-upgrade path
+  (#62).** New values can be written in Redis's format — MurmurHash64A, a
+  dense body of encoding 0, or the sparse form Redis writes — and Redis
+  dense and sparse values are read and counted correctly, including the
+  overlapping 12,304-byte case, where a valid canonical sparse body is
+  taken as sparse and anything else at that size stays legacy dense.
+  Writing Redis's format is opt-in: `hll-write-format` defaults to `legacy`
+  and is a per-server setting, set in the config file or with `CONFIG SET`
+  (persisted by `CONFIG REWRITE`). Existing keys keep the format they were
+  written in; `PFADD` updates one in place, and `PFMERGE` gives a new
+  destination the format of its sources (or the configured default when it
+  has none). Legacy and Redis HLLs use different hash spaces, so `PFMERGE`
+  and multi-key `PFCOUNT` refuse a mixture rather than approximating, and a
+  corrupt sparse value is `INVALIDOBJ Corrupted HLL object detected`, not a
+  `WRONGTYPE` error. A value that is neither format is still `WRONGTYPE`.
+  Rolling upgrades: keep every node on `legacy` until all of them run this
+  release, then set `hll-write-format redis` on every node — a master and
+  its replicas must agree before the switch, since `PFADD` and `PFMERGE`
+  replicate as commands and each node writes new values in its own setting.
+  Values already written stay readable after the switch, and the setting is
+  in place before the AOF is replayed at startup. A KiviDB master whose
+  replicas are older, or a replica with a different setting, is not a
+  supported mixed-format deployment.
 - **A transaction, and a script, reach replicas and the AOF as one step
   (#172).** On the master a transaction ran as one step, but its writes went
   to replicas one by one, and a replica applied them one by one: a client

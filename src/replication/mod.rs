@@ -125,6 +125,11 @@ pub struct ReplState {
     /// runs several servers in one process and they need independent values.
     pub repl_timeout_secs: AtomicU64,
     pub repl_ping_period_secs: AtomicU64,
+    /// `hll-write-format`: whether new HyperLogLog values use Redis's dense
+    /// encoding and hash space, or the legacy KiviDB one. Per server rather
+    /// than process-wide: the test harness runs several servers in one
+    /// process, and an AOF-replaying server must have it before replay starts.
+    hll_write_redis: AtomicBool,
     /// Redis `min-replicas-to-write`: a master refuses writes while fewer
     /// replicas than this are good (see `min_replicas_max_lag`). 0 is off.
     pub min_replicas_to_write: AtomicU32,
@@ -399,6 +404,7 @@ impl ReplState {
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
+            hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
             min_replicas_max_lag: AtomicU64::new(10),
             full_sync_guard: AtomicU8::new(FullSyncGuard::Empty as u8),
@@ -579,11 +585,23 @@ impl ReplState {
         state
             .backlog_ttl_secs
             .store(config.repl_backlog_ttl, Ordering::Relaxed);
+        state.hll_write_redis.store(
+            config.hll_write_format.eq_ignore_ascii_case("redis"),
+            Ordering::Relaxed,
+        );
         state.flush_before_load.store(
             flush_before_load(&config.repl_diskless_load).unwrap_or(true),
             Ordering::Relaxed,
         );
         state
+    }
+
+    pub fn hll_write_redis(&self) -> bool {
+        self.hll_write_redis.load(Ordering::Relaxed)
+    }
+
+    pub fn set_hll_write_redis(&self, redis: bool) {
+        self.hll_write_redis.store(redis, Ordering::Relaxed);
     }
 
     pub fn full_sync_guard(&self) -> FullSyncGuard {

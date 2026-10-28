@@ -4,21 +4,6 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::{read_lock, write_lock};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static HLL_WRITE_REDIS: AtomicBool = AtomicBool::new(false);
-
-pub fn get_hll_write_format() -> String {
-    if HLL_WRITE_REDIS.load(Ordering::Relaxed) {
-        "redis".to_string()
-    } else {
-        "legacy".to_string()
-    }
-}
-
-pub fn set_hll_write_format(v: &str) {
-    HLL_WRITE_REDIS.store(v == "redis", Ordering::Relaxed);
-}
 
 // ── HyperLogLog constants ─────────────────────────────────────────────────────
 //
@@ -31,11 +16,11 @@ pub fn set_hll_write_format(v: &str) {
 // the cached cardinality. Redis dense HLLs have encoding 0 and are 12304 bytes
 // long. Sparse HLLs have encoding 1 and a variable length.
 //
-// KiviDB before 1.1.2 wrote a dense HLL of the same size with encoding 1 and a
-// different hash. 1.1.2 still writes the old (legacy) format by default
-// for rolling-upgrade compatibility. Those values are still read, and an old
-// value that is updated is written back in its original format, so an old
-// value does not lose elements when it is next changed.
+// KiviDB before 1.2.0 wrote a dense HLL of the same size with encoding 1 and a
+// different hash. 1.2.0 still writes the old (legacy) format by default for
+// rolling-upgrade compatibility. Those values are still read, and an old value
+// that is updated is written back in its original format, so an old value does
+// not lose elements when it is next changed.
 
 const HLL_P: u32 = 14;
 const HLL_Q: u32 = 64 - HLL_P; // 50 bits left for the leading-zero rank
@@ -59,16 +44,25 @@ const HLL_ALPHA_INF: f64 = 0.721_347_520_444_481_7;
 enum HllFormat {
     /// Redis dense: encoding 0, exactly 12304 bytes.
     Dense,
-    /// Redis sparse: encoding 1, anything but the legacy dense size.
+    /// Redis sparse: encoding 1, a body that decodes as sparse.
     Sparse,
-    /// KiviDB before 1.1.2/1.1.2: encoding 1, exactly 12304 bytes, FNV-1a hash.
+    /// KiviDB up to 1.2.0: encoding 1, exactly 12304 bytes, FNV-1a hash.
     LegacyDense,
 }
 
-/// What sort of HLL `blob` is, if it is one.
+/// Why a string is not a HyperLogLog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HllError {
+    /// Not an HLL at all: bad magic, wrong dense length, unknown encoding.
+    NotHll,
+    /// Claims to be sparse but the body does not decode.
+    Corrupt,
+}
+
+/// What sort of HLL `blob` is, classifying it without allocating.
 ///
 /// Encoding 1 and the legacy dense size overlap: a Redis sparse HLL can be
-/// exactly 12304 bytes, and KiviDB's pre-1.1.2 dense format is also encoding 1
+/// exactly 12304 bytes, and KiviDB's pre-1.2.0 dense format is also encoding 1
 /// at that size. The old format left no marker to tell them apart, so use the
 /// only validation available: a Redis sparse payload must decode completely
 /// and cover exactly 16384 registers with canonical sparse encoding. If it does,
@@ -76,28 +70,47 @@ enum HllFormat {
 ///
 /// When in doubt, prefer the legacy dense interpretation for 12304-byte
 /// encoding-1 blobs to be safe for rolling upgrades from old KiviDB builds.
-fn hll_format(blob: &[u8]) -> Option<HllFormat> {
+///
+/// Every other length has no such overlap, so a body that Redis can decode is
+/// sparse even if it is not canonical, and one it cannot decode is corrupt.
+fn classify_hll(blob: &[u8]) -> Result<HllFormat, HllError> {
     if blob.len() < HLL_HEADER_SIZE || blob[0..4] != *HLL_MAGIC {
-        return None;
+        return Err(HllError::NotHll);
     }
-    match blob[4] {
-        HLL_DENSE_ENCODING if blob.len() == HLL_TOTAL_SIZE => Some(HllFormat::Dense),
-        HLL_SPARSE_ENCODING if blob.len() == HLL_TOTAL_SIZE => {
-            match sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]) {
-                Ok(_) => Some(HllFormat::Sparse),
-                Err(()) => Some(HllFormat::LegacyDense),
+    match (blob[4], blob.len()) {
+        (HLL_DENSE_ENCODING, HLL_TOTAL_SIZE) => Ok(HllFormat::Dense),
+        (HLL_DENSE_ENCODING, _) => Err(HllError::NotHll),
+        (HLL_SPARSE_ENCODING, HLL_TOTAL_SIZE) => {
+            if sparse_walk(&blob[HLL_HEADER_SIZE..], true, None).is_ok() {
+                Ok(HllFormat::Sparse)
+            } else {
+                Ok(HllFormat::LegacyDense)
             }
         }
-        HLL_SPARSE_ENCODING => match sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]) {
-            Ok(_) => Some(HllFormat::Sparse),
-            Err(()) => None,
-        },
-        _ => None,
+        (HLL_SPARSE_ENCODING, _) => {
+            if sparse_walk(&blob[HLL_HEADER_SIZE..], false, None).is_ok() {
+                Ok(HllFormat::Sparse)
+            } else {
+                Err(HllError::Corrupt)
+            }
+        }
+        _ => Err(HllError::NotHll),
     }
 }
 
-fn is_hll(blob: &[u8]) -> bool {
-    hll_format(blob).is_some()
+/// Where an HLL keeps its cached cardinality, if `bytes` is one.
+///
+/// The digest leaves those bytes out: every node fills the cache in when it
+/// counts, and an HLL whose count differs only there is the same value (#28).
+pub(crate) fn hll_cache_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    classify_hll(bytes).ok().map(|_| 8..16)
+}
+
+fn hll_error(error: HllError) -> Vec<u8> {
+    match error {
+        HllError::NotHll => not_hll(),
+        HllError::Corrupt => corrupt_hll(),
+    }
 }
 
 // ── Hash function ─────────────────────────────────────────────────────────────
@@ -202,18 +215,14 @@ fn cached_count(blob: &[u8]) -> Option<u64> {
     (count != 0 && blob[15] & 0x80 == 0).then_some(count)
 }
 
-fn hll_write_redis() -> bool {
-    HLL_WRITE_REDIS.load(Ordering::Relaxed)
-}
-
-fn make_empty_hll() -> Vec<u8> {
+fn make_empty_hll(write_redis: bool) -> Vec<u8> {
     let mut blob = vec![0u8; HLL_TOTAL_SIZE];
     blob[0..4].copy_from_slice(HLL_MAGIC);
-    if hll_write_redis() {
-        blob[4] = HLL_DENSE_ENCODING;
+    blob[4] = if write_redis {
+        HLL_DENSE_ENCODING
     } else {
-        blob[4] = HLL_LEGACY_ENCODING;
-    }
+        HLL_LEGACY_ENCODING
+    };
     blob
 }
 
@@ -230,7 +239,7 @@ fn dense_blob(encoding: u8, cached: &[u8], registers: &[u8]) -> Vec<u8> {
 
 /// The error for a string that is not a HyperLogLog: wrong magic, unknown
 /// encoding, or a dense length that is not Redis's.
-fn not_hll(_blob: &[u8]) -> Vec<u8> {
+fn not_hll() -> Vec<u8> {
     resp_error("WRONGTYPE Key is not a valid HyperLogLog string value.")
 }
 
@@ -257,17 +266,18 @@ fn incompatible_hash_formats() -> Vec<u8> {
 //   01xxxxxx yyyyyyyy    XZERO: run length (x << 8 | y) + 1 (1..16384)
 //   1vvvvvxx             VAL:   value v + 1 (1..32), run length x + 1 (1..4)
 
-#[allow(dead_code)]
-fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
-    sparse_to_dense_canonical(body)
-}
-
 fn is_zero_run_opcode(opcode: u8) -> bool {
     (opcode & 0xC0) == 0x00 || (opcode & 0xC0) == 0x40
 }
 
-fn sparse_to_dense_canonical(body: &[u8]) -> Result<Vec<u8>, ()> {
-    let mut registers = vec![0u8; HLL_DENSE_SIZE];
+/// Walk a sparse body, checking that it covers exactly 16384 registers.
+///
+/// When `canonical`, consecutive zero runs are rejected, as a sparse HLL
+/// written by Redis never has them. The check is the only way to tell a
+/// 12304-byte sparse HLL from the old dense format at the same size.
+///
+/// With `registers`, the values are also decoded into it.
+fn sparse_walk(body: &[u8], canonical: bool, mut registers: Option<&mut [u8]>) -> Result<(), ()> {
     let mut index = 0usize;
     let mut at = 0usize;
     let mut last_was_zero_run = false;
@@ -275,7 +285,7 @@ fn sparse_to_dense_canonical(body: &[u8]) -> Result<Vec<u8>, ()> {
     while at < body.len() {
         let opcode = body[at];
         let is_zero = is_zero_run_opcode(opcode);
-        if is_zero && last_was_zero_run {
+        if canonical && is_zero && last_was_zero_run {
             return Err(());
         }
         match opcode & 0xC0 {
@@ -303,14 +313,13 @@ fn sparse_to_dense_canonical(body: &[u8]) -> Result<Vec<u8>, ()> {
             _ => {
                 let run = ((opcode & 0x03) as usize) + 1;
                 let value = ((opcode >> 2) & 0x1F) + 1;
-                if value == 0 || value > 32 {
-                    return Err(());
-                }
                 if index + run > HLL_REGISTERS {
                     return Err(());
                 }
-                for register in index..index + run {
-                    set_register(&mut registers, register, value);
+                if let Some(registers) = registers.as_deref_mut() {
+                    for register in index..index + run {
+                        set_register(registers, register, value);
+                    }
                 }
                 index += run;
                 at += 1;
@@ -322,6 +331,12 @@ fn sparse_to_dense_canonical(body: &[u8]) -> Result<Vec<u8>, ()> {
     if index != HLL_REGISTERS {
         return Err(());
     }
+    Ok(())
+}
+
+fn sparse_to_dense(body: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut registers = vec![0u8; HLL_DENSE_SIZE];
+    sparse_walk(body, false, Some(&mut registers))?;
     Ok(registers)
 }
 
@@ -361,12 +376,10 @@ fn sparse_description(body: &[u8]) -> Result<String, ()> {
     Ok(description)
 }
 
-fn registers_from_blob(blob: &[u8], format: HllFormat) -> Result<Vec<u8>, Vec<u8>> {
+fn hll_registers(blob: &[u8], format: HllFormat) -> Result<Vec<u8>, Vec<u8>> {
     match format {
         HllFormat::Dense | HllFormat::LegacyDense => Ok(blob[HLL_HEADER_SIZE..].to_vec()),
-        HllFormat::Sparse => {
-            sparse_to_dense_canonical(&blob[HLL_HEADER_SIZE..]).map_err(|_| corrupt_hll())
-        }
+        HllFormat::Sparse => sparse_to_dense(&blob[HLL_HEADER_SIZE..]).map_err(|_| corrupt_hll()),
     }
 }
 
@@ -475,18 +488,18 @@ fn delete_expired_key(ctx: &Ctx, key: &str) {
     }
 }
 
-fn get_or_create_hll(ctx: &mut Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
+/// The raw bytes of an HLL, or an empty blob in the configured write format.
+///
+/// The bytes are not classified here: every caller needs the format anyway,
+/// and classifying an ambiguous 12304-byte sparse value walks its body, so
+/// doing it once is the point.
+fn get_or_create_hll(ctx: &mut Ctx, key: &str, write_redis: bool) -> Result<Vec<u8>, Vec<u8>> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(ValueRef::String(b)) => {
-            if !is_hll(&b) {
-                return Err(not_hll(&b));
-            }
-            Ok(b.to_vec())
-        }
-        None => Ok(make_empty_hll()),
+        Some(ValueRef::String(b)) => Ok(b.to_vec()),
+        None => Ok(make_empty_hll(write_redis)),
         _ => Err(wrongtype()),
     }
 }
@@ -504,12 +517,7 @@ fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(ValueRef::String(b)) => {
-            if !is_hll(&b) {
-                return Err(not_hll(&b));
-            }
-            Ok(b.to_vec())
-        }
+        Some(ValueRef::String(b)) => Ok(b.to_vec()),
         None => Err(resp_error("ERR The specified key does not exist")),
         _ => Err(wrongtype()),
     }
@@ -520,15 +528,20 @@ fn get_optional_hll(ctx: &Ctx, key: &str) -> Result<Option<Vec<u8>>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(ValueRef::String(b)) => {
-            if !is_hll(&b) {
-                return Err(not_hll(&b));
-            }
-            Ok(Some(b.to_vec()))
-        }
+        Some(ValueRef::String(b)) => Ok(Some(b.to_vec())),
         None => Ok(None),
         _ => Err(wrongtype()),
     }
+}
+
+fn classify_for_reply(blob: &[u8]) -> Result<HllFormat, Vec<u8>> {
+    classify_hll(blob).map_err(hll_error)
+}
+
+fn get_classified_hll(ctx: &Ctx, key: &str) -> Result<(Vec<u8>, HllFormat), Vec<u8>> {
+    let blob = get_hll_blob(ctx, key)?;
+    let format = classify_for_reply(&blob)?;
+    Ok((blob, format))
 }
 
 // ── PFADD ─────────────────────────────────────────────────────────────────────
@@ -546,6 +559,8 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
 
     delete_expired_key(ctx, &key);
 
+    let write_redis = ctx.repl_state.hll_write_redis();
+
     // If no elements are given, create the key if it is missing and otherwise
     // just check that it is an HLL.
     if cmd.len() == 2 {
@@ -553,22 +568,25 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, &key);
         let exists = read_lock!(shard).contains_key(key.as_str());
         if exists {
-            return match get_hll_blob(ctx, &key) {
+            return match get_hll_blob(ctx, &key).and_then(|blob| classify_for_reply(&blob)) {
                 Ok(_) => resp_integer(0),
                 Err(e) => e,
             };
         }
-        save_hll(ctx, &key, make_empty_hll());
+        save_hll(ctx, &key, make_empty_hll(write_redis));
         return resp_integer(1);
     }
 
-    let blob = match get_or_create_hll(ctx, &key) {
+    let blob = match get_or_create_hll(ctx, &key, write_redis) {
         Ok(b) => b,
         Err(e) => return e,
     };
-    let format = hll_format(&blob).expect("get_or_create_hll validates the header");
+    let format = match classify_for_reply(&blob) {
+        Ok(format) => format,
+        Err(e) => return e,
+    };
     let legacy = format == HllFormat::LegacyDense;
-    let mut registers = match registers_from_blob(&blob, format) {
+    let mut registers = match hll_registers(&blob, format) {
         Ok(registers) => registers,
         Err(e) => return e,
     };
@@ -624,13 +642,14 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let counted = match map.get(key) {
             None => return resp_integer(0),
             Some(ValueRef::String(b)) => {
-                let Some(format) = hll_format(&b) else {
-                    return not_hll(&b);
+                let format = match classify_for_reply(&b) {
+                    Ok(format) => format,
+                    Err(e) => return e,
                 };
                 match cached_count(&b) {
                     Some(count) => return resp_integer(count as i64),
                     None => {
-                        let registers = match registers_from_blob(&b, format) {
+                        let registers = match hll_registers(&b, format) {
                             Ok(registers) => registers,
                             Err(e) => return e,
                         };
@@ -681,15 +700,16 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
 
         match map.get(key) {
             Some(ValueRef::String(b)) => {
-                let Some(format) = hll_format(&b) else {
-                    return not_hll(&b);
+                let format = match classify_for_reply(&b) {
+                    Ok(format) => format,
+                    Err(e) => return e,
                 };
                 let legacy = format == HllFormat::LegacyDense;
                 if matches!(legacy_space, Some(seen) if seen != legacy) {
                     return incompatible_hash_formats();
                 }
                 legacy_space = Some(legacy);
-                let registers = match registers_from_blob(&b, format) {
+                let registers = match hll_registers(&b, format) {
                     Ok(registers) => registers,
                     Err(e) => return e,
                 };
@@ -722,14 +742,20 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         Ok(blob) => blob,
         Err(e) => return e,
     };
+    let destination_format = match &destination {
+        Some(blob) => match classify_for_reply(blob) {
+            Ok(format) => Some(format),
+            Err(e) => return e,
+        },
+        None => None,
+    };
 
     let mut merged = vec![0u8; HLL_DENSE_SIZE];
     let mut legacy_space: Option<bool> = None;
 
-    if let Some(blob) = &destination {
-        let format = hll_format(blob).expect("get_optional_hll validates the header");
+    if let (Some(blob), Some(format)) = (&destination, destination_format) {
         legacy_space = Some(format == HllFormat::LegacyDense);
-        let registers = match registers_from_blob(blob, format) {
+        let registers = match hll_registers(blob, format) {
             Ok(registers) => registers,
             Err(e) => return e,
         };
@@ -749,28 +775,32 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
             Ok(None) => continue,
             Err(e) => return e,
         };
-        let format = hll_format(&source).expect("get_optional_hll validates the header");
+        let format = match classify_for_reply(&source) {
+            Ok(format) => format,
+            Err(e) => return e,
+        };
         let legacy = format == HllFormat::LegacyDense;
         if matches!(legacy_space, Some(seen) if seen != legacy) {
             return incompatible_hash_formats();
         }
         legacy_space = Some(legacy);
-        let registers = match registers_from_blob(&source, format) {
+        let registers = match hll_registers(&source, format) {
             Ok(registers) => registers,
             Err(e) => return e,
         };
         merge_registers(&mut merged, &registers);
     }
 
-    // A destination that exists keeps its format. A new one becomes legacy
-    // when every HLL merged into it is legacy: its registers then came from
-    // the old hash, and must keep being read with it. The checks above ensure
-    // every source shares that hash space, so no incompatible registers reach
-    // the destination.
-    let legacy = if let Some(blob) = &destination {
-        hll_format(blob).expect("get_optional_hll validates the header") == HllFormat::LegacyDense
+    // A destination that exists keeps its format. For a new destination,
+    // inherit the format from sources when any sources are merged; the checks
+    // above ensure all sources share the same hash space. Only if there are
+    // no sources to inherit from, fall back to the configured write default.
+    let legacy = if let Some(format) = destination_format {
+        format == HllFormat::LegacyDense
+    } else if let Some(space) = legacy_space {
+        space
     } else {
-        legacy_space == Some(true) || !hll_write_redis()
+        !ctx.repl_state.hll_write_redis()
     };
     let encoding = if legacy {
         HLL_LEGACY_ENCODING
@@ -788,13 +818,13 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
 // ── PFSELFTEST ────────────────────────────────────────────────────────────────
 // Runs a self-test of our HLL implementation.
 fn cmd_pfselftest(_ctx: &mut Ctx) -> Vec<u8> {
-    let empty = make_empty_hll();
+    let empty = make_empty_hll(true);
     let count = hll_count(&empty[HLL_HEADER_SIZE..]);
     if count != 0 {
         return resp_error("ERR HLL self-test failed: empty HLL returned non-zero count");
     }
 
-    let mut blob = make_empty_hll();
+    let mut blob = make_empty_hll(true);
     let n: u64 = 10_000;
     for i in 0..n {
         let element = i.to_le_bytes();
@@ -856,12 +886,11 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
 
     match subcmd.as_str() {
         "GETREG" => {
-            let blob = match get_hll_blob(ctx, &key) {
-                Ok(b) => b,
+            let (blob, format) = match get_classified_hll(ctx, &key) {
+                Ok(classified) => classified,
                 Err(e) => return e,
             };
-            let format = hll_format(&blob).expect("get_hll_blob validates the header");
-            let registers = match registers_from_blob(&blob, format) {
+            let registers = match hll_registers(&blob, format) {
                 Ok(registers) => registers,
                 Err(e) => return e,
             };
@@ -877,11 +906,10 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
         }
 
         "DECODE" => {
-            let blob = match get_hll_blob(ctx, &key) {
-                Ok(b) => b,
+            let (blob, format) = match get_classified_hll(ctx, &key) {
+                Ok(classified) => classified,
                 Err(e) => return e,
             };
-            let format = hll_format(&blob).expect("get_hll_blob validates the header");
             if format != HllFormat::Sparse {
                 return resp_error("ERR HLL encoding is not sparse");
             }
@@ -892,26 +920,25 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
         }
 
         "ENCODING" => {
-            let blob = match get_hll_blob(ctx, &key) {
-                Ok(b) => b,
+            let (_, format) = match get_classified_hll(ctx, &key) {
+                Ok(classified) => classified,
                 Err(e) => return e,
             };
-            match hll_format(&blob).expect("get_hll_blob validates the header") {
+            match format {
                 HllFormat::Sparse => resp_simple("sparse"),
                 HllFormat::Dense | HllFormat::LegacyDense => resp_simple("dense"),
             }
         }
 
         "TODENSE" => {
-            let blob = match get_hll_blob(ctx, &key) {
-                Ok(b) => b,
+            let (blob, format) = match get_classified_hll(ctx, &key) {
+                Ok(classified) => classified,
                 Err(e) => return e,
             };
-            let format = hll_format(&blob).expect("get_hll_blob validates the header");
             if format != HllFormat::Sparse {
                 return resp_integer(0);
             }
-            let registers = match registers_from_blob(&blob, format) {
+            let registers = match hll_registers(&blob, format) {
                 Ok(registers) => registers,
                 Err(e) => return e,
             };
@@ -921,11 +948,10 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
         }
 
         "RESET" => {
-            let blob = match get_hll_blob(ctx, &key) {
-                Ok(b) => b,
+            let (blob, format) = match get_classified_hll(ctx, &key) {
+                Ok(classified) => classified,
                 Err(e) => return e,
             };
-            let format = hll_format(&blob).expect("get_hll_blob validates the header");
             let encoding = if format == HllFormat::LegacyDense {
                 HLL_LEGACY_ENCODING
             } else {
@@ -1041,7 +1067,7 @@ mod tests {
     #[test]
     fn redis_sparse_fixture_decodes_to_its_count() {
         let blob = include_bytes!("../../tests/fixtures/redis-8.0-hll-small-sparse.bin");
-        assert_eq!(hll_format(blob), Some(HllFormat::Sparse));
+        assert_eq!(classify_hll(blob), Ok(HllFormat::Sparse));
         let registers = sparse_to_dense(&blob[HLL_HEADER_SIZE..]).unwrap();
         assert_eq!(hll_count(&registers), 3);
     }
@@ -1050,20 +1076,48 @@ mod tests {
     fn ambiguous_size_is_resolved_by_sparse_validation() {
         let sparse = include_bytes!("../../tests/fixtures/redis-8.0-hll-sparse-12304.bin");
         assert_eq!(sparse.len(), HLL_TOTAL_SIZE);
-        assert_eq!(hll_format(sparse), Some(HllFormat::Sparse));
+        assert_eq!(classify_hll(sparse), Ok(HllFormat::Sparse));
         let registers = sparse_to_dense(&sparse[HLL_HEADER_SIZE..]).unwrap();
         assert_eq!(hll_count(&registers), 31516);
 
         let legacy = include_bytes!("../../tests/fixtures/kividb-legacy-hll-abc.bin");
         assert_eq!(legacy.len(), HLL_TOTAL_SIZE);
-        assert_eq!(hll_format(legacy), Some(HllFormat::LegacyDense));
+        assert_eq!(classify_hll(legacy), Ok(HllFormat::LegacyDense));
 
         let mut malformed = vec![0xFFu8; HLL_TOTAL_SIZE];
         malformed[..4].copy_from_slice(HLL_MAGIC);
         malformed[4] = HLL_SPARSE_ENCODING;
         malformed[15] = 0x80;
         assert!(sparse_to_dense(&malformed[HLL_HEADER_SIZE..]).is_err());
-        assert_eq!(hll_format(&malformed), Some(HllFormat::LegacyDense));
+        assert_eq!(classify_hll(&malformed), Ok(HllFormat::LegacyDense));
+    }
+
+    #[test]
+    fn non_canonical_sparse_is_still_sparse_away_from_the_ambiguous_size() {
+        // Two consecutive XZERO runs cover the whole register space: Redis
+        // decodes this, so a short encoding-1 value is sparse even though a
+        // writer would have merged the runs.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(HLL_MAGIC);
+        blob.push(HLL_SPARSE_ENCODING);
+        blob.extend_from_slice(&[0; 11]);
+        // XZERO 8192 twice: 16384 registers, but not the single run Redis writes.
+        blob.extend_from_slice(&[0x5F, 0xFF, 0x5F, 0xFF]);
+
+        assert_eq!(blob.len(), HLL_HEADER_SIZE + 4);
+        assert_eq!(classify_hll(&blob), Ok(HllFormat::Sparse));
+        assert!(sparse_to_dense(&blob[HLL_HEADER_SIZE..]).is_ok());
+    }
+
+    #[test]
+    fn undecodable_sparse_body_is_corrupt() {
+        let mut blob = vec![0u8; HLL_HEADER_SIZE + 2];
+        blob[..4].copy_from_slice(HLL_MAGIC);
+        blob[4] = HLL_SPARSE_ENCODING;
+        // XZERO with no second byte.
+        blob[HLL_HEADER_SIZE] = 0x40;
+
+        assert_eq!(classify_hll(&blob), Err(HllError::Corrupt));
     }
 
     #[test]

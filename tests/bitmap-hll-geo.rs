@@ -793,6 +793,13 @@ fn get_blob(c: &mut Conn, key: &str) -> Vec<u8> {
     }
 }
 
+fn hll_write_format(c: &mut Conn) -> String {
+    match c.cmds(&["CONFIG", "GET", "hll-write-format"]) {
+        RespValue::Array(items) => items[1].as_str().to_string(),
+        other => panic!("CONFIG GET hll-write-format: {other:?}"),
+    }
+}
+
 #[test]
 fn pfadd_writes_redis_dense_layout() {
     let port = free_port();
@@ -1020,6 +1027,32 @@ fn mixed_legacy_and_redis_pfcount_is_refused() {
 }
 
 #[test]
+fn pfmerge_inherits_the_source_format_not_the_write_default() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // The write default is legacy, but the only source is Redis's format.
+    assert_eq!(hll_write_format(&mut c), "legacy");
+    assert!(c.cmd(&[b"SET", b"abc", REDIS_HLL_DENSE_ABC]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "dest", "abc"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "dest"), REDIS_HLL_DENSE_ABC);
+    assert_eq!(get_blob(&mut c, "dest")[4], 0, "Redis dense encoding");
+
+    // And the other way round: the write default is Redis, the source legacy.
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+    assert!(c.cmd(&[b"SET", b"legacy", LEGACY_HLL_ABC]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "legacy_dest", "legacy"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "legacy_dest"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "legacy_dest"), LEGACY_HLL_ABC);
+    assert_eq!(get_blob(&mut c, "legacy_dest")[4], 1, "legacy encoding");
+}
+
+#[test]
 fn pure_redis_pfmerge_stays_redis() {
     let port = free_port();
     start_server(port);
@@ -1045,8 +1078,61 @@ fn rejects_corrupt_sparse_hll_without_panicking() {
     let mut corrupt = stale(REDIS_HLL_SPARSE);
     corrupt.pop();
     assert!(c.cmd(&[b"SET", b"hll", &corrupt]).is_ok());
-    assert!(c.cmds(&["PFCOUNT", "hll"]).is_error());
-    assert!(c.cmds(&["PFDEBUG", "GETREG", "hll"]).is_error());
+    let commands: &[&[&str]] = &[
+        &["PFCOUNT", "hll"],
+        &["PFADD", "hll", "a"],
+        &["PFDEBUG", "GETREG", "hll"],
+        &["PFDEBUG", "DECODE", "hll"],
+        &["PFDEBUG", "ENCODING", "hll"],
+        &["PFDEBUG", "TODENSE", "hll"],
+        &["PFDEBUG", "RESET", "hll"],
+    ];
+    for command in commands {
+        let err = c.cmds(command);
+        assert!(err.is_error(), "{command:?}: {err:?}");
+        assert_eq!(
+            err.error_str(),
+            "INVALIDOBJ Corrupted HLL object detected",
+            "{command:?}"
+        );
+    }
+
+    assert!(c.cmds(&["PFMERGE", "hll", "hll"]).is_error());
+    assert!(c.cmds(&["PFMERGE", "dest", "hll"]).is_error());
+    assert_eq!(c.cmds(&["EXISTS", "dest"]).as_int(), 0);
+}
+
+#[test]
+fn hll_write_format_is_per_server() {
+    let (first_port, second_port) = (free_port(), free_port());
+    start_server(first_port);
+    start_server(second_port);
+    let mut first = Conn::connect(first_port);
+    let mut second = Conn::connect(second_port);
+
+    assert_eq!(hll_write_format(&mut first), "legacy");
+    assert_eq!(hll_write_format(&mut second), "legacy");
+
+    assert!(
+        first
+            .cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+    assert_eq!(hll_write_format(&mut first), "redis");
+    assert_eq!(
+        hll_write_format(&mut second),
+        "legacy",
+        "a setting on one server must not change another in the same process"
+    );
+
+    first.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    second.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(get_blob(&mut first, "hll")[4], 0, "redis dense encoding");
+    assert_eq!(get_blob(&mut second, "hll")[4], 1, "legacy encoding");
+
+    let err = second.cmds(&["CONFIG", "SET", "hll-write-format", "bogus"]);
+    assert!(err.is_error(), "{err:?}");
+    assert_eq!(hll_write_format(&mut second), "legacy");
 }
 
 #[test]
