@@ -774,21 +774,35 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             // bad value (#24).
             // Listen there instead (`listen`): refused, with nothing
             // changed, if the port cannot be had.
+            // 0 closes the plaintext port, as in Redis; connections already
+            // open stay open, as they do in Redis. Redis is then reached on
+            // its TLS port or a Unix socket; there is no Unix socket here, so
+            // 0 needs the TLS port open.
             "port" => match value.parse::<u16>() {
-                Ok(port) if port > 0 => match crate::listen::move_to(
-                    crate::listen::server_of(ctx.config),
-                    crate::listen::Kind::Plain,
-                    port,
-                ) {
-                    Ok(()) => Some(resp_simple("OK")),
-                    Err(e) => Some(resp_error(&format!(
-                        "ERR Unable to listen on this port: {e}"
-                    ))),
-                },
-                // Redis takes 0, for no TCP at all, with a Unix socket to be
-                // reached on; there is none here.
-                _ => Some(resp_error(
-                    "ERR argument must be between 1 and 65535 inclusive",
+                Ok(port) => {
+                    let server = crate::listen::server_of(ctx.config);
+                    let tls = crate::listen::current_port(server, crate::listen::Kind::Tls);
+                    if port == 0 && tls == 0 {
+                        Some(resp_error(
+                            "ERR port 0 turns the plaintext port off, which leaves no port to \
+                             reach this server on: open the TLS port (tls-port) first",
+                        ))
+                    } else if port == 0 && ctx.config.cluster_enabled && !ctx.config.tls_cluster {
+                        Some(resp_error(
+                            "ERR a cluster node without tls-cluster is known by its plaintext \
+                             port: it cannot be closed",
+                        ))
+                    } else {
+                        match crate::listen::move_to(server, crate::listen::Kind::Plain, port) {
+                            Ok(()) => Some(resp_simple("OK")),
+                            Err(e) => Some(resp_error(&format!(
+                                "ERR Unable to listen on this port: {e}"
+                            ))),
+                        }
+                    }
+                }
+                Err(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 65535 inclusive",
                 )),
             },
             // Open, move or close the TLS port: see `config_set_tls_port`.

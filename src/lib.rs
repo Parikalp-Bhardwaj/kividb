@@ -231,7 +231,12 @@ async fn server_tokio(
     }
 
     let addr: SocketAddr = config.addr().parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    // Port 0: no plaintext port, until `CONFIG SET port` opens one.
+    let listener = if addr.port() == 0 {
+        None
+    } else {
+        Some(TcpListener::bind(addr).await?)
+    };
 
     // Also with no TLS port: `CONFIG SET tls-port` opens one.
     #[cfg(feature = "tls")]
@@ -357,7 +362,7 @@ async fn server_tokio(
     }
 
     let mut listener = crate::listen::Listener::new(
-        Some(listener),
+        listener,
         addr,
         crate::listen::server_of(&config),
         crate::listen::Kind::Plain,

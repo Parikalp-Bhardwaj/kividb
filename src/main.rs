@@ -167,7 +167,11 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
         println!("  * Memory         : {mem_gb}GiB available");
     }
     println!("  * CPUs           : {cores} cores detected");
-    println!("  * Listening on   : {bind}:{port}");
+    if port == 0 {
+        println!("  * Listening on   : no plaintext port (port 0): TLS only");
+    } else {
+        println!("  * Listening on   : {bind}:{port}");
+    }
 
     #[cfg(feature = "tls")]
     if config.tls_enabled() {
@@ -176,7 +180,7 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
 
     // Cluster-specific lines, only when enabled
     if config.cluster_enabled {
-        let bus_port = port + 10000;
+        let bus_port = config.cluster_bus_port();
         println!("  * Cluster bus    : {bind}:{bus_port}");
         println!("  * Node timeout   : {}ms", config.cluster_node_timeout);
         // The node ID isn't known here — it's generated/loaded inside
@@ -601,6 +605,15 @@ fn claim_port(addr: &SocketAddr) -> std::io::Result<Option<std::os::unix::net::U
     }
 }
 
+/// Log that clients are taken on `addr`, or with port 0 that they are not.
+fn ready(addr: &SocketAddr) {
+    if addr.port() == 0 {
+        log_info!("No plaintext port (port 0): accepting TLS connections only");
+    } else {
+        log_info!("Ready to accept connections on {addr}");
+    }
+}
+
 /// The client listener, or a fatal error that says what to do about it.
 #[allow(dead_code)]
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -697,7 +710,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             "Cluster: Node ID        : {}",
             crate::cluster::node_id_str(&cluster_state.myself())
         );
-        log_info!("Cluster: Bus port       : {}", config.port + 10000);
+        log_info!("Cluster: Bus port       : {}", config.cluster_bus_port());
     }
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
@@ -947,11 +960,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // KiviDB started on it by mistake: it would come up "ready", and the
     // kernel would hand each of the two a share of the clients. Claim the
     // port first, and refuse to start if it is taken — as Redis would.
-    let _port_claim = match claim_port(&addr) {
-        Ok(claim) => claim,
-        Err(e) => {
-            log_fatal!("{}", cant_listen(&addr, &e));
-            std::process::exit(1);
+    // Port 0: no plaintext port, until `CONFIG SET port` opens one.
+    let _port_claim = if addr.port() == 0 {
+        None
+    } else {
+        match claim_port(&addr) {
+            Ok(claim) => claim,
+            Err(e) => {
+                log_fatal!("{}", cant_listen(&addr, &e));
+                std::process::exit(1);
+            }
         }
     };
 
@@ -1009,26 +1027,28 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio_uring::start(async move {
-                        let socket =
-                            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-                                .unwrap();
-                        socket.set_reuse_address(true).unwrap();
-                        socket.set_reuse_port(true).unwrap();
-                        socket.set_nonblocking(true).unwrap();
-                        if let Err(e) = socket.bind(&addr.into()).and_then(|()| socket.listen(1024)) {
-                            log_fatal!("{}", cant_listen(&addr, &e));
-                            std::process::exit(1);
-                        }
-
-                        let listener = tokio_uring::net::TcpListener::from_std(socket.into());
+                        // Port 0: none, until `CONFIG SET port` opens one.
+                        let listener = (addr.port() != 0).then(|| {
+                            let socket =
+                                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                                    .unwrap();
+                            socket.set_reuse_address(true).unwrap();
+                            socket.set_reuse_port(true).unwrap();
+                            socket.set_nonblocking(true).unwrap();
+                            if let Err(e) = socket.bind(&addr.into()).and_then(|()| socket.listen(1024)) {
+                                log_fatal!("{}", cant_listen(&addr, &e));
+                                std::process::exit(1);
+                            }
+                            tokio_uring::net::TcpListener::from_std(socket.into())
+                        });
                         // `CONFIG SET port` moves it.
                         let mut listener = crate::listen::UringListener::new(
-                            Some(listener),
+                            listener,
                             crate::listen::server_of(&config),
                             addr,
                         );
                         static READY: std::sync::Once = std::sync::Once::new();
-                        READY.call_once(|| log_info!("Ready to accept connections on {addr}"));
+                        READY.call_once(|| ready(&addr));
 
                         /// One connection in a worker's count, until it is dropped.
                         struct Counted(Arc<Vec<std::sync::atomic::AtomicUsize>>, usize);
@@ -1450,7 +1470,7 @@ async fn async_main_tokio(
             "Cluster: Node ID        : {}",
             crate::cluster::node_id_str(&cluster_state.myself())
         );
-        log_info!("Cluster: Bus port       : {}", config.port + 10000);
+        log_info!("Cluster: Bus port       : {}", config.cluster_bus_port());
     }
 
     if !config.aclfile.is_empty() {
@@ -1521,7 +1541,9 @@ async fn async_main_tokio(
         }
         if !loaded.index_names.is_empty() {
             vector::SNAPSHOT_INDEX_REBUILD.store(true, std::sync::atomic::Ordering::Release);
-            listener_early = Some(bind_listener(addr).await?);
+            if addr.port() != 0 {
+                listener_early = Some(bind_listener(addr).await?);
+            }
             if loaded.hnsw_loaded {
                 log_info!(
                     "Listening on {addr} — HNSW graph(s) loaded from snapshot; running text/numeric index pass in background"
@@ -1594,18 +1616,20 @@ async fn async_main_tokio(
     start_configured_replication(&config, &cluster_state, &replica_starter);
 
     // ONE listener — tokio's multi-thread runtime handles distribution
+    // Port 0: none, until `CONFIG SET port` opens one.
     let listener = match listener_early {
-        Some(l) => l,
-        None => bind_listener(addr).await?,
+        Some(l) => Some(l),
+        None if addr.port() == 0 => None,
+        None => Some(bind_listener(addr).await?),
     };
     // `CONFIG SET port` moves it.
     let mut listener = crate::listen::Listener::new(
-        Some(listener),
+        listener,
         addr,
         crate::listen::server_of(&config),
         crate::listen::Kind::Plain,
     );
-    log_info!("Ready to accept connections on {addr}");
+    ready(&addr);
 
     // Also with no TLS port: `CONFIG SET tls-port` opens one.
     #[cfg(feature = "tls")]
