@@ -241,6 +241,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A graceful shutdown no longer loses writes it acknowledged.** On SIGTERM
+  or `SHUTDOWN`, the server stopped accepting connections but let the ones
+  already open go on running commands while it wrote its final snapshot.
+  The snapshot is cut at one moment, so a write made after that moment was
+  acknowledged, then lost when the process exited. A test that wrote from
+  six clients through a `SHUTDOWN` lost 2,000 to 3,700 acknowledged INCRs of
+  about 23,000. Found by a Kubernetes test: deleting a master pod lost 92
+  acknowledged writes. No command runs now from the start of the final
+  snapshot to the exit, as in Redis; clients waiting on a reply see their
+  connection close.
 - **With the AOF on, a write over TLS is answered at once again, not at
   the next once-a-second sync.** In 1.2.0-rc1 a reply to a write waits
   until its record is in the AOF, and the connection writes the log itself

@@ -864,6 +864,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
                 if m != crate::shutdown::mode::NOSAVE {
                     log_info!("Writing final snapshot...");
+                    // No command runs from here to the exit: the snapshot is
+                    // cut at one moment (#148), and a write a connection
+                    // already open made after that moment was acknowledged
+                    // and then lost with the process. Taken alone, the gate
+                    // waits for the commands running now and lets no other
+                    // start; it is never let go. Forgotten, not kept in a
+                    // binding: one dropped at the end of this block opened
+                    // the gate again before `process::exit` below, and the
+                    // writes that ran in between were acknowledged and lost.
+                    std::mem::forget(crate::command_gate::enter_alone());
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
                     let result = crate::replication::save_dataset(
@@ -1986,7 +1996,14 @@ async fn async_main_tokio(
         // With the replica's position in its master's stream beside it, so
         // that the restart can ask to continue.
         let result = tokio::task::spawn_blocking(move || {
-            crate::replication::save_dataset(&store_c, &expiry_c, &index_c, &repl_c)
+            // No command runs from here to the exit, as on io_uring above:
+            // the connections already open keep running, and a write one
+            // made after the snapshot's cut was acknowledged and then lost.
+            // The guard is this thread's, and is never let go.
+            let _no_more_commands = crate::command_gate::enter_alone();
+            let saved = crate::replication::save_dataset(&store_c, &expiry_c, &index_c, &repl_c);
+            std::mem::forget(_no_more_commands);
+            saved
         })
         .await;
         match result {
