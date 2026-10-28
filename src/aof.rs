@@ -1062,6 +1062,9 @@ pub struct ReplayStats {
     /// Keys restored from the KDB preamble, before a single record was
     /// replayed. Zero for a log with no preamble.
     pub preamble_keys: u64,
+    /// Records of a transaction whose `EXEC` is not in the file, its `MULTI`
+    /// included: dropped, and cut off with the tail (`truncated_tail`).
+    pub reverted: u64,
 }
 
 /// Split a raw AOF into its optional KDB image and the command stream.
@@ -1200,6 +1203,45 @@ fn parse_aof_commands(buf: &[u8]) -> (Vec<Vec<Vec<u8>>>, usize) {
         }
     }
     (out, pos)
+}
+
+/// `MULTI` or `EXEC`, the marks around a transaction's records.
+fn is_transaction_mark(cmd: &[Vec<u8>]) -> bool {
+    cmd.len() == 1
+        && (cmd[0].eq_ignore_ascii_case(b"MULTI") || cmd[0].eq_ignore_ascii_case(b"EXEC"))
+}
+
+/// The index of the `MULTI` of a transaction that has no `EXEC` after it,
+/// if the log ends inside one.
+///
+/// As in Redis, a `MULTI` inside a transaction is not a second one, and an
+/// `EXEC` with no transaction open closes nothing.
+fn unfinished_transaction(commands: &[Vec<Vec<u8>>]) -> Option<usize> {
+    let mut open = None;
+    for (i, cmd) in commands.iter().enumerate() {
+        if cmd.len() != 1 {
+            continue;
+        }
+        if cmd[0].eq_ignore_ascii_case(b"MULTI") {
+            open = open.or(Some(i));
+        } else if cmd[0].eq_ignore_ascii_case(b"EXEC") {
+            open = None;
+        }
+    }
+    open
+}
+
+/// Where record `index` starts in `buf`, whose first `index` records are
+/// whole.
+fn record_offset(buf: &[u8], index: usize) -> usize {
+    let mut pos = 0;
+    for _ in 0..index {
+        match parse_one_command(&buf[pos..]) {
+            Some((_, used)) => pos += used,
+            None => break,
+        }
+    }
+    pos
 }
 
 /// What the bytes after the last whole record are.
@@ -1408,6 +1450,19 @@ pub fn replay_aof(
             }
         }
     }
+    // A transaction whose `EXEC` is not in the file — the process died while
+    // it was being written — is dropped whole, and the file cut before its
+    // `MULTI`, as Redis does ("Revert incomplete MULTI/EXEC transaction in AOF
+    // file"). Half of it is a dataset no client ever saw. Everything after
+    // that `MULTI` is in it: one whose `EXEC` never came is unfinished however
+    // much follows, in Redis as here.
+    let mut commands = commands;
+    if let Some(multi) = unfinished_transaction(&commands) {
+        stats.reverted = (commands.len() - multi) as u64;
+        stats.valid_len = (buf.len() - tail.len() + record_offset(tail, multi)) as u64;
+        stats.truncated_tail = true;
+        commands.truncate(multi);
+    }
     let live = live_after_flushes(&commands);
 
     // A `FLUSHALL` in the tail discards the image along with everything else
@@ -1452,7 +1507,10 @@ pub fn replay_aof(
     let _indexing = DeferIndexing::start();
 
     for (cmd, live) in commands.into_iter().zip(live) {
-        if cmd.is_empty() {
+        // What is left of a transaction here is whole: its commands are
+        // applied in order, and nothing runs beside a replay to see them
+        // half done. Its `MULTI` and `EXEC` have nothing more to do.
+        if cmd.is_empty() || is_transaction_mark(&cmd) {
             continue;
         }
         if !live {
@@ -1901,9 +1959,16 @@ pub fn recover_from_aof(
                 // Normal after a hard kill: the process died part-way through
                 // appending. Say so explicitly rather than leaving a silently
                 // shorter dataset to be discovered later.
+                if stats.reverted > 0 {
+                    log_warn!(
+                        "Revert incomplete MULTI/EXEC transaction in AOF file: its EXEC is \
+                         not in the file, and its {} record(s) are dropped",
+                        stats.reverted
+                    );
+                }
                 log_warn!(
-                    "AOF ended with a partial record (likely an unclean shutdown); \
-                     the incomplete tail ({} bytes) is cut off",
+                    "AOF ended with a partial record or transaction (likely an unclean \
+                     shutdown); the incomplete tail ({} bytes) is cut off",
                     stats.bytes - stats.valid_len
                 );
                 // Cut it off the file, too. Left there, the next record
@@ -2028,6 +2093,36 @@ mod replay_parse_tests {
         let (cmds, used) = parse_aof_commands(buf);
         assert!(cmds.is_empty());
         assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn a_transaction_without_its_exec_is_found_where_it_starts() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["MULTI"]));
+        buf.extend_from_slice(&enc(&["SET", "b", "1"]));
+        buf.extend_from_slice(&enc(&["SET", "c", "1"]));
+        buf.extend_from_slice(&enc(&["EXEC"]));
+        let whole = enc(&["SET", "a", "1"]).len();
+        let first_multi = buf.len() - whole;
+        buf.extend_from_slice(&enc(&["MULTI"]));
+        buf.extend_from_slice(&enc(&["SET", "d", "1"]));
+        let (cmds, _) = parse_aof_commands(&buf);
+        assert_eq!(
+            unfinished_transaction(&cmds[..5]),
+            None,
+            "closed by its EXEC"
+        );
+        assert_eq!(unfinished_transaction(&cmds), Some(5));
+        assert_eq!(record_offset(&buf, 5), whole + first_multi);
+        assert_eq!(record_offset(&buf, 1), whole);
+        // A `MULTI` inside one is not a second: the first is where it starts.
+        let mut nested = cmds.clone();
+        nested.push(vec![b"MULTI".to_vec()]);
+        assert_eq!(unfinished_transaction(&nested), Some(5));
+        // An `EXEC` with nothing open closes nothing.
+        assert_eq!(unfinished_transaction(&[vec![b"EXEC".to_vec()]]), None);
+        assert!(is_transaction_mark(&cmds[1]) && is_transaction_mark(&cmds[4]));
+        assert!(!is_transaction_mark(&cmds[0]));
     }
 }
 
