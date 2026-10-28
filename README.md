@@ -353,6 +353,17 @@ curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd6
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo rpm -i kividb.x86_64.rpm
 ```
 
+From 1.2.0 on, every file in a release and every image carries signed build provenance: a
+[GitHub artifact attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+that says it was built by this repository's release workflow, from the tagged commit. A
+checksum proves a download arrived whole; the attestation proves who built it. With the
+[GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify kividb-linux-x86_64.tar.gz --repo kividbio/kividb
+gh attestation verify oci://ghcr.io/kividbio/kividb:v1.2.0 --repo kividbio/kividb
+```
+
 ## Configuration
 
 KiviDB is configured with command-line flags, or with a Redis-style configuration file
