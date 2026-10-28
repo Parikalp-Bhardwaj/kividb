@@ -7,7 +7,8 @@
 // TLS port as the port to reach it on; so everything one node opens to
 // another's client port — replication, slot migration, MIGRATE, index
 // definitions — is TLS as well. `tls-replication yes` does the same for a
-// replica of a standalone master.
+// replica of a standalone master; `CONFIG SET` changes it, for the
+// replica's next connection. `tls-cluster` is set at startup only.
 //
 // Both ends present `tls-cert-file` (or `tls-client-cert-file` when
 // connecting, as in Redis) and check the other's against
@@ -39,6 +40,11 @@ mod imp {
 
     /// Set at startup; replaced by `CONFIG SET` of a TLS file (#156).
     static SETTINGS: parking_lot::RwLock<Option<Arc<Settings>>> = parking_lot::const_rwlock(None);
+
+    /// `tls-replication` as it was set, which `CONFIG GET` answers with:
+    /// `tls-cluster` implies it without setting it.
+    static REPLICATION_SET: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     fn settings() -> Option<Arc<Settings>> {
         SETTINGS.read().clone()
@@ -104,6 +110,9 @@ mod imp {
         if !config.tls_cluster && !config.tls_replication {
             return Ok(());
         }
+        if config.tls_replication {
+            REPLICATION_SET.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let built = build(
             crate::tls::acceptor::Files::of(config),
             config.tls_cluster,
@@ -128,6 +137,27 @@ mod imp {
         let built = build(files, now.cluster, now.replication)?;
         *SETTINGS.write() = Some(Arc::new(built));
         Ok(())
+    }
+
+    /// `CONFIG SET tls-replication`: whether a replica connects to its
+    /// master over TLS, set up from `files`, from its next connection on;
+    /// a link already up stays as it is. Nothing changes if they cannot be
+    /// loaded. `tls-cluster` implies it, and is not changed here.
+    pub fn set_replication(on: bool, files: crate::tls::acceptor::Files) -> Result<(), String> {
+        let cluster = cluster();
+        if !on && !cluster {
+            *SETTINGS.write() = None;
+        } else {
+            let built = build(files, cluster, on || cluster)?;
+            *SETTINGS.write() = Some(Arc::new(built));
+        }
+        REPLICATION_SET.store(on, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `tls-replication` as it was set.
+    pub fn replication_set() -> bool {
+        REPLICATION_SET.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn build(
@@ -161,7 +191,10 @@ mod imp {
             .with_client_auth_cert(chain, key)
             .map_err(|e| format!("client certificate: {e}"))?;
         // The bus asks every node for its certificate.
-        let bus = crate::tls::acceptor::build(&files.cert, &files.key, &files.ca, "yes")?;
+        let bus = crate::tls::acceptor::build(&crate::tls::acceptor::Files {
+            auth_clients: "yes".to_string(),
+            ..files.clone()
+        })?;
         Ok(Settings {
             cluster,
             replication,
@@ -221,7 +254,10 @@ mod imp {
 }
 
 #[cfg(feature = "tls")]
-pub use imp::{accept_bus, cluster, connect_async, connect_sync, files, init, reload, replication};
+pub use imp::{
+    accept_bus, cluster, connect_async, connect_sync, files, init, reload, replication,
+    replication_set, set_replication,
+};
 
 #[cfg(not(feature = "tls"))]
 pub fn init(config: &crate::config::Config) -> Result<(), String> {

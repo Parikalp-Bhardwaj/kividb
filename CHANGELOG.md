@@ -66,6 +66,26 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   change nothing: `Unable to update TLS configuration. Check server logs.`
   These were answered `OK` and changed nothing.
 
+- **TLS is turned on, moved and off without a restart: `tls-port`,
+  `tls-replication`.** As in Redis, `CONFIG SET tls-port <port>` opens the
+  TLS port, also on a server that started without TLS, moves it, or closes
+  it with `0`; `CONFIG GET tls-port` and `INFO tls` show the port open now.
+  Opening or moving it loads `tls-cert-file` and `tls-key-file` first, so a
+  server is given TLS with `CONFIG SET tls-cert-file … tls-key-file …
+  tls-port 6380` in one command, or one setting after another. Closing the
+  port closes only the port: TLS connections already open stay open. A port
+  that cannot be had (`Unable to listen on this port`), files that cannot be
+  loaded (`Unable to update TLS configuration. Check server logs.`) or a
+  port with no certificate and key is refused, and nothing changes. While
+  the port is closed, a certificate and its key are loaded once both are
+  set. `CONFIG SET tls-replication yes|no` decides whether a replica's next
+  connection to its master is TLS (the link that is up stays as it is); it
+  needs `tls-cert-file`, `tls-key-file` and `tls-ca-cert-file`. Until now
+  `tls-port` and `tls-replication` were fixed at startup, and the TLS files
+  could not be set at all on a server that started without TLS.
+  `tls-cluster` still is, and so is `tls-port` on a node with `tls-cluster
+  yes`, which announces that port to the rest of the cluster.
+
 - **Active defrag (#113): memory freed by deletes goes back to the system.**
   After a reshard or a big delete at random, nearly every page still held
   a key that stayed, and the process kept its memory: 10 million keys of

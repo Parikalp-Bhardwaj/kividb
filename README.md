@@ -417,6 +417,15 @@ certificate signed by that CA; others are refused during the handshake.
 invalid one, and `--tls-auth-clients no` does not ask for one. With `redis-cli`:
 `redis-cli --tls -p 6381 --cacert ca.pem --cert client.pem --key client.key`.
 
+**Changed without a restart.** `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
+`tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` and `tls-client-key-file` loads the
+files again for every handshake from then on. `CONFIG SET tls-port <port>` opens the TLS port
+(also on a server that started without TLS: `CONFIG SET tls-cert-file cert.pem tls-key-file
+key.pem tls-port 6381`), moves it, or closes it with `0`; connections already open stay open.
+`CONFIG SET tls-replication yes` makes a replica's next connection to its master TLS. What cannot
+be loaded or listened on is refused, and nothing changes. `tls-cluster` needs a restart, and so
+does `tls-port` on a node with `tls-cluster yes`.
+
 **Clients must use TLS on the TLS port.** A plain connection to it (for example `redis-cli -p 6381`
 without `--tls`) fails the handshake, and the server logs `[TLS] handshake failed`. For
 memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
