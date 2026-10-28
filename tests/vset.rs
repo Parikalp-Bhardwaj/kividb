@@ -1005,7 +1005,9 @@ fn test_vset_full_workflow() {
 // 3. VSIM / VLINKS — distance metric honoured
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Scenario: cosine similarity (default) — identical vectors score 1.0
+// Scenario: cosine similarity (default), scored as Redis does (#171):
+// (1 + cosine) / 2, so identical vectors score 1.0, vectors at right angles
+// 0.5, and opposite vectors 0.0
 //   VADD vs VALUES 3 1 0 0 a
 //   VADD vs VALUES 3 1 0 0 b  (identical to a)
 //   VSIM vs ELE a WITHSCORES → b first with score ~1.0
@@ -1018,8 +1020,9 @@ fn test_vsim_cosine_default() {
     c.cmds(&["VADD", "vs", "VALUES", "3", "1", "0", "0", "a"]);
     c.cmds(&["VADD", "vs", "VALUES", "3", "1", "0", "0", "b"]); // identical direction
     c.cmds(&["VADD", "vs", "VALUES", "3", "0", "1", "0", "c"]); // orthogonal to a
+    c.cmds(&["VADD", "vs", "VALUES", "3", "-1", "0", "0", "d"]); // opposite to a
 
-    let r = c.cmds(&["VSIM", "vs", "ELE", "a", "WITHSCORES", "COUNT", "3"]);
+    let r = c.cmds(&["VSIM", "vs", "ELE", "a", "WITHSCORES", "COUNT", "4"]);
     let arr = r.as_array();
     // Results: a(1.0), b(1.0), c(0.0) — a and b are identical, c is orthogonal
     // a itself may or may not be included depending on implementation
@@ -1043,10 +1046,16 @@ fn test_vsim_cosine_default() {
             bs > 0.99,
             "identical vectors should have similarity ~1.0, got {bs}"
         );
-        // c should be ~0.0 similarity with a (orthogonal)
+        // c is at right angles to a: 0.5, as in Redis
         assert!(
-            cs < 0.01,
-            "orthogonal vectors should have similarity ~0.0, got {cs}"
+            (cs - 0.5).abs() < 0.01,
+            "orthogonal vectors should have similarity ~0.5, got {cs}"
+        );
+        let d_score = pairs.iter().find(|(n, _)| *n == "d").map(|(_, s)| *s);
+        // d is opposite: 0.0, the lowest score, never negative
+        assert!(
+            d_score.is_some_and(|ds| ds.abs() < 0.01),
+            "opposite vectors should have similarity ~0.0, got {d_score:?}"
         );
     }
 }
