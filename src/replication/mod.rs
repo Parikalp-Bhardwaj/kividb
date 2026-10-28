@@ -1943,6 +1943,9 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             }
         }
         if ctx.aof_enabled {
+            // Part of a transaction its master sent, applied as one: see
+            // `PropagationGroup`.
+            note_group_write(true);
             append_to_own_aof(ctx, cmd0, parts, payloads);
         } else if tapped {
             advance_stream_db(ctx, cmd0, parts);
@@ -1956,6 +1959,12 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     if !has_replicas && !ctx.aof_enabled && !tapped {
         return;
     }
+    // One thread-local read, for a write that is not part of a transaction
+    // or a script.
+    let grouped = in_group();
+    if grouped {
+        note_group_write(ctx.aof_enabled);
+    }
 
     for payload_bytes in payloads {
         if tapped {
@@ -1963,16 +1972,25 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         }
         let mut raw_opt = Some(payload_bytes);
         let enc_len = raw_opt.as_ref().expect("just encoded").len() as u64;
-        ctx.repl_state
-            .repl_offset
-            .fetch_add(enc_len, Ordering::Relaxed);
-        if has_replicas {
-            let hub_payload = if ctx.aof_enabled {
-                raw_opt.as_ref().expect("just encoded").clone()
-            } else {
-                raw_opt.take().expect("just encoded")
-            };
-            propagate(ctx.hub_tx, hub_payload);
+        if grouped && has_replicas {
+            // Into the stream with the rest of the group, when it ends.
+            GROUP_STREAM.with(|stream| {
+                stream
+                    .borrow_mut()
+                    .extend_from_slice(raw_opt.as_ref().expect("just encoded"))
+            });
+        } else {
+            ctx.repl_state
+                .repl_offset
+                .fetch_add(enc_len, Ordering::Relaxed);
+            if has_replicas {
+                let hub_payload = if ctx.aof_enabled {
+                    raw_opt.as_ref().expect("just encoded").clone()
+                } else {
+                    raw_opt.take().expect("just encoded")
+                };
+                propagate(ctx.hub_tx, hub_payload);
+            }
         }
         if ctx.aof_enabled {
             crate::aof::AOF_WRITTEN.fetch_add(enc_len, std::sync::atomic::Ordering::Relaxed);
@@ -1984,7 +2002,173 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     advance_stream_db(ctx, cmd0, parts);
 }
 
-/// Propagate a write made by the server itself rather than by a client's
+/// Hand something other than a write — a `PUBLISH` — to replicas: now, or,
+/// inside a transaction or a script, in its place among the group's writes.
+pub fn propagate_in_order(repl_state: &ReplState, hub_tx: &HubTx, payload: Vec<u8>) {
+    if in_group() {
+        GROUP_STREAM.with(|stream| stream.borrow_mut().extend_from_slice(&payload));
+        return;
+    }
+    repl_state
+        .repl_offset
+        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+    propagate(hub_tx, payload);
+}
+
+// ── Transactions and scripts in the stream ─────────────────────────────────
+//
+// On the master an `EXEC` is one step: it holds the command gate alone, so no
+// client sees half of it. Its writes used to reach replicas, and the AOF, as
+// one command after another. A replica applying them one by one showed its
+// readers half a transfer for as long as the second half took to arrive, and
+// a process killed while the AOF held half of them replayed half (#172).
+//
+// So, as in Redis, the writes of a transaction — and of a script, which is
+// one step in the same way — go into the stream between a `MULTI` and an
+// `EXEC`. A replica keeps what follows a `MULTI` until the `EXEC` has
+// arrived, then applies it as one step (`replica_client`); an AOF replay
+// drops a `MULTI` whose `EXEC` never made it to the file (`aof::replay_aof`).
+//
+// As in Redis 7, only a group that writes twice or more is wrapped: one
+// write is one step already. A group that writes nothing sends nothing.
+//
+// What the group puts in the stream is held until it ends and handed to the
+// hub as one piece, as its AOF records are (`aof::RecordGroup`). Sent as it
+// was made, it could be split by what other threads put in the stream
+// meanwhile: the hub's heartbeat, a slot migration's deletes — and, with
+// scripts running beside each other by hash tag (`tag_locks`), another
+// script's writes, whose own `MULTI` would then land inside this one. Holding
+// it back changes no order that matters: no other command touches the
+// group's keys until it ends — an `EXEC` runs alone, a script beside others
+// holds its tag.
+//
+// The stream's taps (a backup, a slot migration) still get each write as it
+// is made, without the `MULTI` and `EXEC`: a migration reads one command per
+// piece, and a backup's file is replayed whole, by itself.
+
+/// `MULTI` and `EXEC` as they go into the stream and the AOF.
+pub(crate) const MULTI_RECORD: &[u8] = b"*1\r\n$5\r\nMULTI\r\n";
+pub(crate) const EXEC_RECORD: &[u8] = b"*1\r\n$4\r\nEXEC\r\n";
+
+/// What an open [`PropagationGroup`] has written so far.
+#[derive(Default)]
+struct GroupState {
+    writes: u32,
+    /// Its `MULTI` is at the front of its part of the stream.
+    stream_wrapped: bool,
+    /// Its `MULTI` is at the front of the AOF records held for it.
+    aof_wrapped: bool,
+}
+
+thread_local! {
+    /// Whether this thread has a [`PropagationGroup`] open: the one thing a
+    /// write that is not in one has to read.
+    static IN_GROUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GROUP: std::cell::RefCell<GroupState> = const {
+        std::cell::RefCell::new(GroupState { writes: 0, stream_wrapped: false, aof_wrapped: false })
+    };
+    /// The group's part of the replication stream, sent when it ends. Empty
+    /// when nothing it wrote is for the hub.
+    static GROUP_STREAM: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn in_group() -> bool {
+    IN_GROUP.with(|g| g.get())
+}
+
+/// Count a write of the open group, if one is open. At the second, the group
+/// becomes a transaction: its `MULTI` goes in front of the first.
+#[inline]
+fn note_group_write(aof: bool) {
+    if !in_group() {
+        return;
+    }
+    GROUP.with(|group| {
+        let mut group = group.borrow_mut();
+        group.writes += 1;
+        if group.writes != 2 {
+            return;
+        }
+        GROUP_STREAM.with(|stream| {
+            let mut stream = stream.borrow_mut();
+            if !stream.is_empty() {
+                stream.splice(0..0, MULTI_RECORD.iter().copied());
+                group.stream_wrapped = true;
+            }
+        });
+        if aof && crate::aof::put_in_front_of_group(MULTI_RECORD) {
+            crate::aof::AOF_WRITTEN.fetch_add(MULTI_RECORD.len() as u64, Ordering::Relaxed);
+            group.aof_wrapped = true;
+        }
+    });
+}
+
+/// The writes of one transaction or script, as one step to replicas and the
+/// AOF: its part of the stream handed to the hub as one piece when it ends,
+/// its AOF records queued as one (an [`crate::aof::RecordGroup`]), and both
+/// wrapped in `MULTI` ... `EXEC` when it wrote more than once.
+///
+/// Open it where the transaction or script starts, holding what makes it one
+/// step on this node — the command gate alone, or the script's tag; the write
+/// gate — and let it be dropped before they are. A group opened inside
+/// another (a script queued in a transaction) is part of that one.
+pub struct PropagationGroup<'a> {
+    repl_state: &'a ReplState,
+    hub_tx: &'a HubTx,
+    aof_tx: &'a dyn crate::commands::ctx::AofSender,
+    /// False for a group opened inside another.
+    outermost: bool,
+    /// Dropped after [`Drop::drop`] has queued the `EXEC`: the records go
+    /// to the AOF with it.
+    _records: crate::aof::RecordGroup<'a>,
+    /// Its state is this thread's.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl<'a> PropagationGroup<'a> {
+    pub fn begin(
+        repl_state: &'a ReplState,
+        hub_tx: &'a HubTx,
+        aof_tx: &'a dyn crate::commands::ctx::AofSender,
+    ) -> Self {
+        let outermost = !IN_GROUP.with(|g| g.replace(true));
+        PropagationGroup {
+            repl_state,
+            hub_tx,
+            aof_tx,
+            outermost,
+            _records: crate::aof::RecordGroup::begin(aof_tx),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for PropagationGroup<'_> {
+    fn drop(&mut self) {
+        if !self.outermost {
+            return;
+        }
+        IN_GROUP.with(|g| g.set(false));
+        let group = GROUP.with(|g| std::mem::take(&mut *g.borrow_mut()));
+        if group.aof_wrapped {
+            crate::aof::AOF_WRITTEN.fetch_add(EXEC_RECORD.len() as u64, Ordering::Relaxed);
+            crate::aof::queue_record(self.aof_tx, EXEC_RECORD.to_vec());
+        }
+        let mut stream = GROUP_STREAM.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        if !stream.is_empty() {
+            if group.stream_wrapped {
+                stream.extend_from_slice(EXEC_RECORD);
+            }
+            self.repl_state
+                .repl_offset
+                .fetch_add(stream.len() as u64, Ordering::Relaxed);
+            propagate(self.hub_tx, stream);
+        }
+    }
+}
+
+// Propagate a write made by the server itself rather than by a client's
 /// command — a slot migration deleting the keys it has moved away, say —
 /// to replicas, taps and the AOF, as [`replicate_one_write`] does for a
 /// command. Call it holding the write gate, with the store already changed.

@@ -1505,6 +1505,15 @@ pub async fn handle_client(
                         // before it or after it, never between two of its commands
                         // (#148). The writes it runs are inside this one.
                         let _whole = crate::write_gate::enter();
+                        // And to replicas and the AOF as one: its writes in the
+                        // stream between a `MULTI` and an `EXEC`, its records
+                        // written together (#172). Dropped first, while the
+                        // gates are still held.
+                        let _propagation = crate::replication::PropagationGroup::begin(
+                            &repl_state,
+                            &hub_tx,
+                            &aof_tx,
+                        );
                         if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys

@@ -1051,6 +1051,143 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
 }
 
+/// `parts` as a record of the AOF.
+fn record(parts: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        out.extend_from_slice(format!("${}\r\n{p}\r\n", p.len()).as_bytes());
+    }
+    out
+}
+
+fn holds(log: &[u8], records: &[&[&str]]) -> bool {
+    let wanted: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
+    log.windows(wanted.len()).any(|w| w == wanted.as_slice())
+}
+
+/// A transaction's records are in the AOF between a `MULTI` and an `EXEC`,
+/// as in Redis, so that a replay can tell a whole one from one cut off by a
+/// crash; a script's too. One that wrote once is logged as that one write
+/// (#172).
+#[test]
+fn a_transaction_is_logged_between_multi_and_exec() {
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    // The stream's first write says which database it is for.
+    assert!(c.cmd(&["SET", "first", "0"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "x", "1"]);
+    c.cmd(&["GET", "x"]);
+    c.cmd(&["SET", "y", "2"]);
+    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 3);
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "z", "3"]);
+    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 1);
+    #[cfg(feature = "lua")]
+    {
+        c.cmd(&[
+            "EVAL",
+            "redis.call('SET', KEYS[1], 'a') return redis.call('SET', KEYS[2], 'b')",
+            "2",
+            "s1",
+            "s2",
+        ]);
+        c.cmd(&["EVAL", "return redis.call('SET', KEYS[1], 'c')", "1", "s3"]);
+    }
+    assert!(c.cmd(&["SET", "last", "4"]).ok());
+
+    // Acknowledged after it is written: the file holds it now.
+    let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+    assert!(
+        holds(
+            &log,
+            &[
+                &["MULTI"],
+                &["SET", "x", "1"],
+                &["SET", "y", "2"],
+                &["EXEC"]
+            ]
+        ),
+        "{}",
+        String::from_utf8_lossy(&log)
+    );
+    let multis = log
+        .windows(record(&["MULTI"]).len())
+        .filter(|w| *w == record(&["MULTI"]).as_slice())
+        .count();
+    #[cfg(feature = "lua")]
+    {
+        assert!(holds(
+            &log,
+            &[
+                &["MULTI"],
+                &["SET", "s1", "a"],
+                &["SET", "s2", "b"],
+                &["EXEC"]
+            ]
+        ));
+        assert!(holds(&log, &[&["SET", "s3", "c"], &["SET", "last", "4"]]));
+        assert_eq!(multis, 2, "{}", String::from_utf8_lossy(&log));
+    }
+    #[cfg(not(feature = "lua"))]
+    assert_eq!(multis, 1, "{}", String::from_utf8_lossy(&log));
+    assert!(holds(&log, &[&["EXEC"], &["SET", "z", "3"]]));
+}
+
+/// A transaction cut off at the end of the AOF â€” its `EXEC` never written â€”
+/// is dropped whole and cut off the file, as Redis reverts it; everything
+/// before it is kept. Whether the cut fell between two of its records or in
+/// the middle of one (#172).
+#[test]
+fn a_transaction_cut_off_at_the_end_of_the_aof_is_dropped_whole() {
+    for torn in [false, true] {
+        let mut server = Server::start(&["--aof"]);
+        let mut c = server.conn();
+        for i in 0..10 {
+            assert!(c.cmd(&["SET", &format!("k{i}"), "v"]).ok());
+        }
+        assert!(c.cmd(&["MULTI"]).ok());
+        c.cmd(&["SET", "whole1", "v"]);
+        c.cmd(&["SET", "whole2", "v"]);
+        assert_eq!(c.cmd(&["EXEC"]).arr().len(), 2);
+        drop(c);
+        std::thread::sleep(Duration::from_millis(1500));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+
+        let aof = server.dir.join("appendonly.aof");
+        let mut log = std::fs::read(&aof).unwrap();
+        for r in [&["MULTI"][..], &["SET", "cut1", "v"], &["SET", "cut2", "v"]] {
+            log.extend_from_slice(&record(r));
+        }
+        if torn {
+            log.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\ncu");
+        }
+        std::fs::write(&aof, &log).unwrap();
+
+        let mut c = restart_with_aof(&mut server);
+        assert_eq!(c.cmd(&["DBSIZE"]).i(), 12, "torn {torn}");
+        assert_eq!(c.cmd(&["EXISTS", "cut1", "cut2"]).i(), 0, "torn {torn}");
+        assert_eq!(c.cmd(&["EXISTS", "whole1", "whole2"]).i(), 2, "torn {torn}");
+        assert!(c.cmd(&["SET", "after", "v"]).ok());
+        drop(c);
+        std::thread::sleep(Duration::from_millis(1500));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        let log = std::fs::read(&aof).unwrap();
+        assert!(
+            !log.windows(3).any(|w| w == b"cut"),
+            "torn {torn}: the unfinished transaction was left in the file"
+        );
+
+        // What was written after it follows whole transactions: this loads,
+        // and has nothing to revert.
+        let mut c = restart_with_aof(&mut server);
+        assert_eq!(c.cmd(&["DBSIZE"]).i(), 13, "torn {torn}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
+    }
+}
+
 /// A server with the AOF on, a key written, a checkpoint (SAVE), another
 /// key written after it, and then killed: the files a checkpoint starts from.
 fn checkpointed_then_written(server: &mut Server) {

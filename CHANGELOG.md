@@ -237,6 +237,27 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A transaction, and a script, reach replicas and the AOF as one step
+  (#172).** On the master a transaction ran as one step, but its writes went
+  to replicas one by one, and a replica applied them one by one: a client
+  reading from a replica could see half of a transfer, the money gone from
+  one account and not yet in the other. The same was true of a script that
+  writes more than once. In the AOF, a transaction's records were written
+  separately, so a process killed between two of them left half the
+  transaction in the log, and the restart replayed that half. Now, as in
+  Redis, the writes of a transaction or a script that writes more than once
+  go to replicas and to the AOF between a `MULTI` and an `EXEC`. A replica
+  applies them together, with no command of its own clients in between,
+  and a restart drops a transaction whose `EXEC` never reached the file
+  (`Revert incomplete MULTI/EXEC transaction in AOF file` in the log) and
+  cuts it off the file. One that writes once is sent as that one write, as
+  before. A KiviDB replica following a Redis master, which has always sent
+  `MULTI` and `EXEC`, now applies those transactions as one step too.
+  Rolling upgrades: upgrade replicas before their master, as usual. A 1.1.x
+  replica of an upgraded master still applies every write, one by one as
+  before, but logs `Replicated command error (non-fatal): ERR unknown
+  command 'MULTI'` (and `'EXEC'`) for every transaction; a 1.1.x server
+  started on an AOF this version wrote logs the same while it replays it.
 - **`VSIM` and `VLINKS` `WITHSCORES` score cosine as Redis does (#171).**
   They gave the cosine itself, from -1 to 1. Redis gives `(1 + cosine) / 2`,
   from 0 to 1: identical vectors score 1 in both, but vectors at right
