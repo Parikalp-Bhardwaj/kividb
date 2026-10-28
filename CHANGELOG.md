@@ -172,6 +172,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`VSIM` and `VLINKS` `WITHSCORES` score cosine as Redis does (#171).**
+  They gave the cosine itself, from -1 to 1. Redis gives `(1 + cosine) / 2`,
+  from 0 to 1: identical vectors score 1 in both, but vectors at right
+  angles scored 0 here and 0.5 in Redis, and opposite ones -1 and 0. The
+  order of the results was always the same. A threshold an application
+  sets on the score (`score > 0.8`) now means what it means on Redis.
+  Sets made with KiviDB's own `METRIC IP` or `METRIC L2` keep their scores.
+
 - **`XREAD BLOCK` left its registration behind when it ended without data
   (#170).** A reader that timed out, was unblocked, disconnected or was
   woken by another of its streams stayed registered on every stream it

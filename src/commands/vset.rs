@@ -602,6 +602,21 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── VLINKS ────────────────────────────────────────────────────────────────────
 //
+/// The score `VSIM` and `VLINKS` give an element, from its distance to the
+/// query. Cosine, the only metric Redis's vector sets have, is Redis's
+/// `1 - distance / 2`: from 1 (the same direction) through 0.5 (at right
+/// angles) to 0 (opposite), as `(1 + cosine) / 2`. It was the cosine
+/// itself, from -1 to 1, which put a threshold such as `score > 0.8` in
+/// another place than on Redis (#171). The other metrics are KiviDB's own
+/// (`METRIC`): the dot product, and `1 / (1 + distance)` for L2.
+fn similarity(metric: &crate::vector::DistanceMetric, distance: f32) -> f32 {
+    match metric {
+        crate::vector::DistanceMetric::Cosine => 1.0 - distance / 2.0,
+        crate::vector::DistanceMetric::InnerProduct => 1.0 - distance,
+        crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + distance),
+    }
+}
+
 // VLINKS key element [WITHSCORES]
 // Returns the HNSW graph neighbours of an element.
 // Since we use brute-force, every other element is a "neighbour".
@@ -662,11 +677,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .flat_map(|(score, name)| {
                     let mut items = vec![resp_bulk_str(name)];
                     if with_scores {
-                        let similarity = match inner.metric {
-                            crate::vector::DistanceMetric::Cosine => 1.0 - score,
-                            crate::vector::DistanceMetric::InnerProduct => 1.0 - score,
-                            crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + score),
-                        };
+                        let similarity = similarity(&inner.metric, *score);
                         items.push(resp_bulk_str(&format!("{:.6}", similarity)));
                     }
                     items
@@ -1051,16 +1062,10 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     for (score, name) in &scored {
         out.push(resp_bulk_str(name));
         if with_scores {
-            // Convert distance to similarity score matching Redis semantics per metric:
-            // Cosine:       similarity = 1.0 - cosine_distance  (range 0..1)
-            // InnerProduct: similarity = 1.0 - ip_distance = dot product (Redis uses this)
-            // L2:           Redis returns 1 / (1 + l2_distance) — bounded 0..1
-            let similarity = match inner.metric {
-                crate::vector::DistanceMetric::Cosine => 1.0 - score,
-                crate::vector::DistanceMetric::InnerProduct => 1.0 - score,
-                crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + score),
-            };
-            out.push(resp_bulk_str(&format!("{:.6}", similarity)));
+            out.push(resp_bulk_str(&format!(
+                "{:.6}",
+                similarity(&inner.metric, *score)
+            )));
         }
         if with_attribs {
             let attrs = inner
