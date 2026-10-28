@@ -74,4 +74,4 @@ KiviDB's index settings were HNSW with `M 16`, `EF_CONSTRUCTION 200`, `EF_RUNTIM
 
    The first run downloads the dataset (about 3 GB), loads it (about 47 minutes on the machines above), and searches. To try another `EF_RUNTIME` on the same index, add `--skip-drop-old --skip-load` to the `vectordbbench` command and set `EF_RUNTIME`. A higher value gives higher recall and lower QPS.
 
-The KiviDB client for VectorDBBench is in [zilliztech/VectorDBBench#884](https://github.com/zilliztech/VectorDBBench/pull/884). Until that is merged, `client.sh` installs it from the branch the pull request comes from.
+The KiviDB client is part of VectorDBBench since [zilliztech/VectorDBBench#884](https://github.com/zilliztech/VectorDBBench/pull/884). It was merged after the 2.0.0 release, so until a release on PyPI has it, `client.sh` installs VectorDBBench from its `main` branch.
