@@ -165,15 +165,23 @@ fn list_at(ctx: &Ctx, key: &str) -> Result<Option<List>, Vec<u8>> {
     }
 }
 
+/// What [`move_elements`] moved: the elements in destination order, and
+/// whether that emptied the source, which is then deleted. The caller tells
+/// of the delete last, after the move itself, as Redis does.
+pub(super) struct Moved {
+    pub elements: Vec<Element>,
+    pub source_deleted: bool,
+}
+
 /// Move elements from `src` to `dst`. `Ok(None)` means the source could not
 /// satisfy the request (missing, empty, or short of an `EXACTLY` count) and
-/// nothing changed; otherwise the moved elements in destination order.
+/// nothing changed.
 pub(super) fn move_elements(
     ctx: &Ctx,
     src: &str,
     dst: &str,
     spec: &MoveSpec,
-) -> Result<Option<Vec<Element>>, Vec<u8>> {
+) -> Result<Option<Moved>, Vec<u8>> {
     let db = *ctx.selected_db;
     lazy_expire_key(ctx.store, ctx.expiry_store, db, src);
     // The source first, as in Redis: with nothing to move, what the
@@ -198,7 +206,10 @@ pub(super) fn move_elements(
         place(&mut inner, &ordered, spec.to_left);
         drop(inner);
         ctx.wait_table.notify_signal(dst);
-        return Ok(Some(ordered));
+        return Ok(Some(Moved {
+            elements: ordered,
+            source_deleted: false,
+        }));
     }
 
     let popped = {
@@ -243,6 +254,7 @@ pub(super) fn move_elements(
     ctx.wait_table.notify_signal(dst);
 
     // A list that has been emptied is deleted, as in Redis.
+    let mut source_deleted = false;
     if src_list.read().is_empty() {
         let shard = store::get_shard(&ctx.store[db], src);
         let mut map = write_lock!(shard);
@@ -254,10 +266,20 @@ pub(super) fn move_elements(
             map.remove(src);
             drop(map);
             clear_expiry(ctx.expiry_store, db, src);
-            notify(ctx.pubsub, db, KS_GENERIC, "del", src);
+            source_deleted = true;
         }
     }
-    Ok(Some(ordered))
+    Ok(Some(Moved {
+        elements: ordered,
+        source_deleted,
+    }))
+}
+
+/// The `del` event of a source a move emptied, after the move's own events.
+fn tell_source_deleted(ctx: &Ctx, moved: &Moved, src: &str) {
+    if moved.source_deleted {
+        notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", src);
+    }
 }
 
 /// Whether `key` holds something, and it is not a list.
@@ -285,18 +307,16 @@ pub(super) fn move_one(
     from_left: bool,
     to_left: bool,
 ) -> Result<Option<Element>, Vec<u8>> {
-    let moved = move_elements(ctx, src, dst, &MoveSpec::single(from_left, to_left))?;
-    let element = moved.and_then(|mut v| v.pop());
+    let Some(mut moved) = move_elements(ctx, src, dst, &MoveSpec::single(from_left, to_left))?
+    else {
+        return Ok(None);
+    };
+    let element = moved.elements.pop();
     if element.is_some() {
         let db = *ctx.selected_db;
-        // As Redis: the pop from the source, the push to the destination.
-        notify(
-            ctx.pubsub,
-            db,
-            KS_LIST,
-            if from_left { "lpop" } else { "rpop" },
-            src,
-        );
+        // As Redis (`lmoveGenericCommand`): the push to the destination, the
+        // pop from the source, and then, if that emptied it, its delete. The
+        // delete came first, and the pop before the push (#173).
         notify(
             ctx.pubsub,
             db,
@@ -304,6 +324,14 @@ pub(super) fn move_one(
             if to_left { "lpush" } else { "rpush" },
             dst,
         );
+        notify(
+            ctx.pubsub,
+            db,
+            KS_LIST,
+            if from_left { "lpop" } else { "rpop" },
+            src,
+        );
+        tell_source_deleted(ctx, &moved, src);
     }
     Ok(element)
 }
@@ -333,7 +361,8 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let db = *ctx.selected_db;
                     notify(ctx.pubsub, db, KS_LIST, "lmovem", &src);
                     notify(ctx.pubsub, db, KS_LIST, "lmovem", &dst);
-                    elements_reply(&moved)
+                    tell_source_deleted(ctx, &moved, &src);
+                    elements_reply(&moved.elements)
                 }
                 Ok(None) if spec.exactly => resp_null_array(),
                 Ok(None) => resp_array(Vec::new()),
@@ -373,8 +402,9 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         let db = *ctx.selected_db;
                         notify(ctx.pubsub, db, KS_LIST, "lmovem", &src);
                         notify(ctx.pubsub, db, KS_LIST, "lmovem", &dst);
+                        tell_source_deleted(ctx, &moved, &src);
                         crate::stats::record_hit();
-                        Some(elements_reply(&moved))
+                        Some(elements_reply(&moved.elements))
                     }
                     Ok(None) => None,
                 },

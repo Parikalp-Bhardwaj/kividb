@@ -570,6 +570,12 @@ fn memory_doctor() -> Vec<u8> {
     let msg = if used < 5 << 20 {
         "Hi Sam, this instance is empty or is using very little memory, my issues detector \
          can't be used in these conditions."
+    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 && crate::compaction::enabled() {
+        // Active defrag is on (the default since 1.2): it told the reader to
+        // turn it on (#173).
+        "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
+         than it has allocated). Active defrag is on and works through it as the server runs; \
+         MEMORY PURGE gives freed memory back to the system at once."
     } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 {
         "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
          than it has allocated). Consider MEMORY PURGE, or turn on activedefrag."
