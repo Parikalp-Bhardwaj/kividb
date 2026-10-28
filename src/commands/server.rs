@@ -42,6 +42,26 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     let tls_replication = crate::node_tls::replication_set();
     #[cfg(not(feature = "tls"))]
     let tls_replication = ctx.config.tls_replication;
+    // This node's own hostname and client port, read under one guard that is
+    // dropped here. Each used to be read inside the `vec!` below with a
+    // `nodes.read()` of its own; a temporary lives to the end of its
+    // statement, so the first guard was still held when the second was
+    // taken. A read of a lock the thread already holds waits behind any
+    // writer that queued in between (parking_lot lets no new reader past a
+    // waiting writer), and the writer waits for the first guard: neither
+    // ever moved again. The cluster bus writes `nodes` on every heartbeat,
+    // and a `CONFIG GET` that met one stopped the node for good, every
+    // command that reads the topology queued behind it.
+    let (announce_hostname, announce_client_port) = {
+        let nodes = ctx.cluster.nodes.read();
+        let me = nodes.get(&ctx.cluster.myself());
+        (
+            me.map(|me| me.hostname.clone())
+                .unwrap_or_else(|| ctx.config.cluster_announce_hostname.clone()),
+            me.map(|me| me.announced_client_port)
+                .unwrap_or(ctx.config.cluster_announce_client_port),
+        )
+    };
     vec![
         (
             "repl-timeout",
@@ -86,15 +106,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "cluster-announce-ip",
             ctx.config.cluster_announce_ip.clone(),
         ),
-        (
-            "cluster-announce-hostname",
-            ctx.cluster
-                .nodes
-                .read()
-                .get(&ctx.cluster.myself())
-                .map(|me| me.hostname.clone())
-                .unwrap_or_else(|| ctx.config.cluster_announce_hostname.clone()),
-        ),
+        ("cluster-announce-hostname", announce_hostname),
         (
             "cluster-preferred-endpoint-type",
             if ctx.cluster.enabled {
@@ -109,13 +121,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "cluster-announce-client-port",
-            ctx.cluster
-                .nodes
-                .read()
-                .get(&ctx.cluster.myself())
-                .map(|me| me.announced_client_port)
-                .unwrap_or(ctx.config.cluster_announce_client_port)
-                .to_string(),
+            announce_client_port.to_string(),
         ),
         (
             "cluster-announce-bus-port",

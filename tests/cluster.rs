@@ -1119,6 +1119,61 @@ fn nodes_announce_a_client_port_of_their_own() {
     );
 }
 
+/// `CONFIG GET` while this node's entry in the node table is being written
+/// does not stop the node. It read the table twice in one statement, still
+/// holding the first read when it took the second, and a writer that queued
+/// in between waited for the first while the second waited for the writer:
+/// for good, and every command that reads the topology queued behind them.
+/// In a cluster the writer is the bus, on every heartbeat; the operator asks
+/// `CONFIG GET cluster-announce-hostname` of every node it looks after. Here
+/// `CONFIG SET cluster-announce-client-port` writes, to hit it in seconds.
+#[test]
+fn config_get_while_the_node_table_is_written_does_not_hang_the_node() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let node = Node::start(&[]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let mut workers = Vec::new();
+    for i in 0..8 {
+        let (stop, done, port) = (Arc::clone(&stop), Arc::clone(&done), node.port);
+        workers.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let port = (30_000 + n % 2).to_string();
+                let args: &[&str] = if i % 4 == 0 {
+                    &["CONFIG", "SET", "cluster-announce-client-port", &port]
+                } else {
+                    &["CONFIG", "GET", "cluster-announce-hostname"]
+                };
+                // A reply that does not come (10 s) ends the loop.
+                if c.try_cmd(args).is_err() {
+                    return;
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    let mut c = Conn::connect(node.port);
+    c.stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let info = c.try_cmd(&["CLUSTER", "INFO"]);
+    assert!(
+        info.is_ok(),
+        "the node stopped answering after {} commands: {info:?}",
+        done.load(Ordering::Relaxed)
+    );
+    assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()));
+}
+
 /// Heartbeats go over one connection per peer, kept open (#112): pinging
 /// every peer every second used to open a new connection each time, N x
 /// (N - 1) a second across the cluster. A peer that restarts is reached
