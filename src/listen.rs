@@ -1,4 +1,5 @@
-//! The port clients connect to, and `CONFIG SET port` moving it (#24).
+//! The ports clients connect to, and `CONFIG SET port` and `tls-port`
+//! moving them (#24).
 //!
 //! Every accept loop wraps its listener in one of the types here. To move
 //! the port, `CONFIG SET` binds a new socket for each loop, before it
@@ -7,8 +8,12 @@
 //! of the new sockets and drops its old one, which closes the old port.
 //! Connections already open stay open.
 //!
-//! Servers are told apart by the port they were started on: a test process
-//! runs many, each with its own.
+//! Port 0 is no port: a loop then has no socket and waits, until the port
+//! is set again. That is how the TLS port is off, and how it is opened
+//! with `CONFIG SET tls-port` on a server that started without it.
+//!
+//! Servers are told apart by the ports they were started on: a test
+//! process runs many, each with its own.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -18,9 +23,35 @@ use std::sync::{Arc, LazyLock};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+/// Which of a server's ports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// `port`: plaintext.
+    Plain,
+    /// `tls-port`.
+    Tls,
+}
+
+impl Kind {
+    fn what(self) -> &'static str {
+        match self {
+            Kind::Plain => "connections",
+            Kind::Tls => "TLS connections",
+        }
+    }
+}
+
+/// A server, by the `port` and `tls-port` it was started with.
+pub type Server = (u16, u16);
+
+/// The server `config` started.
+pub fn server_of(config: &crate::config::Config) -> Server {
+    (config.port, config.tls_port)
+}
+
 struct ServerPort {
     ip: IpAddr,
-    /// What clients connect to now.
+    /// What clients connect to now; 0 when there is none.
     current: AtomicU16,
     /// Accept loops listening: as many sockets are bound for a new port.
     loops: AtomicUsize,
@@ -31,16 +62,23 @@ struct ServerPort {
     moved: watch::Sender<u64>,
 }
 
-static SERVERS: LazyLock<Mutex<HashMap<u16, Arc<ServerPort>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type Ports = HashMap<(Server, Kind), Arc<ServerPort>>;
 
-fn server(configured: u16) -> Option<Arc<ServerPort>> {
-    SERVERS.lock().get(&configured).cloned()
+static SERVERS: LazyLock<Mutex<Ports>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn server_port(server: Server, kind: Kind) -> Option<Arc<ServerPort>> {
+    SERVERS.lock().get(&(server, kind)).cloned()
 }
 
-/// The port the server started on `configured` listens on now.
-pub fn current_port(configured: u16) -> u16 {
-    server(configured).map_or(configured, |s| s.current.load(Ordering::SeqCst))
+/// The port of `kind` that `server` listens on now; 0 when it has none.
+pub fn current_port(server: Server, kind: Kind) -> u16 {
+    server_port(server, kind).map_or(
+        match kind {
+            Kind::Plain => server.0,
+            Kind::Tls => server.1,
+        },
+        |s| s.current.load(Ordering::SeqCst),
+    )
 }
 
 /// One accept loop's part: told when the port moves.
@@ -50,11 +88,17 @@ pub struct PortWatch {
 }
 
 impl PortWatch {
-    fn register(configured: u16, addr: SocketAddr, reuse_port: bool) -> Self {
-        let server = Arc::clone(SERVERS.lock().entry(configured).or_insert_with(|| {
+    fn register(
+        server: Server,
+        kind: Kind,
+        addr: SocketAddr,
+        open: bool,
+        reuse_port: bool,
+    ) -> Self {
+        let server = Arc::clone(SERVERS.lock().entry((server, kind)).or_insert_with(|| {
             Arc::new(ServerPort {
                 ip: addr.ip(),
-                current: AtomicU16::new(addr.port()),
+                current: AtomicU16::new(if open { addr.port() } else { 0 }),
                 loops: AtomicUsize::new(0),
                 reuse_port,
                 pending: Mutex::new(Vec::new()),
@@ -66,15 +110,19 @@ impl PortWatch {
         PortWatch { server, moved }
     }
 
-    /// The socket for the new port, once the port has moved.
-    async fn next(&mut self) -> std::net::TcpListener {
+    /// The socket for the new port once the port has moved, or `None` once
+    /// it is closed.
+    async fn next(&mut self) -> Option<std::net::TcpListener> {
         loop {
             if self.moved.changed().await.is_err() {
                 // The sender lives as long as `server`: never.
                 std::future::pending::<()>().await;
             }
+            if self.server.current.load(Ordering::SeqCst) == 0 {
+                return None;
+            }
             if let Some(socket) = self.server.pending.lock().pop() {
-                return socket;
+                return Some(socket);
             }
         }
     }
@@ -86,12 +134,25 @@ impl Drop for PortWatch {
     }
 }
 
-/// `CONFIG SET port`: listen on `port` instead, or say why not.
-pub fn move_to(configured: u16, port: u16) -> Result<(), String> {
-    let Some(server) = server(configured) else {
+/// `CONFIG SET port` or `tls-port`: listen on `port` instead, or on none
+/// for 0, or say why not.
+pub fn move_to(server: Server, kind: Kind, port: u16) -> Result<(), String> {
+    let Some(server) = server_port(server, kind) else {
         return Err("the server is not listening".into());
     };
-    if port == server.current.load(Ordering::SeqCst) {
+    let old = server.current.load(Ordering::SeqCst);
+    if port == old {
+        return Ok(());
+    }
+    if port == 0 {
+        server.pending.lock().clear();
+        server.current.store(0, Ordering::SeqCst);
+        server.moved.send_modify(|n| *n += 1);
+        crate::log_info!(
+            "No longer accepting {} on {}; the ones open stay open",
+            kind.what(),
+            SocketAddr::new(server.ip, old)
+        );
         return Ok(());
     }
     let addr = SocketAddr::new(server.ip, port);
@@ -103,7 +164,7 @@ pub fn move_to(configured: u16, port: u16) -> Result<(), String> {
     *server.pending.lock() = sockets;
     server.current.store(port, Ordering::SeqCst);
     server.moved.send_modify(|n| *n += 1);
-    crate::log_info!("Ready to accept connections on {addr}");
+    crate::log_info!("Ready to accept {} on {addr}", kind.what());
     Ok(())
 }
 
@@ -142,16 +203,20 @@ fn bind(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpList
 
 /// A Tokio accept loop's listener.
 pub struct Listener {
-    inner: tokio::net::TcpListener,
+    inner: Option<tokio::net::TcpListener>,
     watch: PortWatch,
 }
 
 impl Listener {
-    pub fn new(inner: tokio::net::TcpListener, configured: u16) -> Self {
-        let addr = inner
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], configured)));
-        let watch = PortWatch::register(configured, addr, false);
+    /// The loop of `server`'s port of `kind`, listening with `inner` on
+    /// `addr`; with no `inner`, on no port until one is set.
+    pub fn new(
+        inner: Option<tokio::net::TcpListener>,
+        addr: SocketAddr,
+        server: Server,
+        kind: Kind,
+    ) -> Self {
+        let watch = PortWatch::register(server, kind, addr, inner.is_some(), false);
         Listener { inner, watch }
     }
 
@@ -159,10 +224,16 @@ impl Listener {
     pub async fn accept(&mut self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
         loop {
             tokio::select! {
-                accepted = self.inner.accept() => return accepted,
-                socket = self.watch.next() => match tokio::net::TcpListener::from_std(socket) {
-                    Ok(moved) => self.inner = moved,
-                    Err(e) => crate::log_warn!("CONFIG SET port: {e}"),
+                accepted = async {
+                    match &self.inner {
+                        Some(inner) => inner.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => return accepted,
+                socket = self.watch.next() => match socket.map(tokio::net::TcpListener::from_std) {
+                    None => self.inner = None,
+                    Some(Ok(moved)) => self.inner = Some(moved),
+                    Some(Err(e)) => crate::log_warn!("CONFIG SET port: {e}"),
                 },
             }
         }
@@ -172,14 +243,19 @@ impl Listener {
 /// An io_uring worker's listener.
 #[cfg(target_os = "linux")]
 pub struct UringListener {
-    inner: tokio_uring::net::TcpListener,
+    inner: Option<tokio_uring::net::TcpListener>,
     watch: PortWatch,
 }
 
 #[cfg(target_os = "linux")]
 impl UringListener {
-    pub fn new(inner: tokio_uring::net::TcpListener, configured: u16, addr: SocketAddr) -> Self {
-        let watch = PortWatch::register(configured, addr, true);
+    /// As [`Listener::new`], for the plaintext port.
+    pub fn new(
+        inner: Option<tokio_uring::net::TcpListener>,
+        server: Server,
+        addr: SocketAddr,
+    ) -> Self {
+        let watch = PortWatch::register(server, Kind::Plain, addr, inner.is_some(), true);
         UringListener { inner, watch }
     }
 
@@ -187,9 +263,14 @@ impl UringListener {
     pub async fn accept(&mut self) -> std::io::Result<(tokio_uring::net::TcpStream, SocketAddr)> {
         loop {
             tokio::select! {
-                accepted = self.inner.accept() => return accepted,
+                accepted = async {
+                    match &self.inner {
+                        Some(inner) => inner.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => return accepted,
                 socket = self.watch.next() => {
-                    self.inner = tokio_uring::net::TcpListener::from_std(socket);
+                    self.inner = socket.map(tokio_uring::net::TcpListener::from_std);
                 }
             }
         }

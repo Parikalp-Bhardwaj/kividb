@@ -347,6 +347,211 @@ fn config_set_loads_a_new_certificate() {
     assert!(handshake_ok(tls, &renewed.cert_der));
 }
 
+// ── TLS port changed at runtime ───────────────────────────────────────────────
+
+/// Wait until something listens on `port`.
+fn wait_open(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server port {port} never opened"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether nothing listens on `port`: a connection to it is refused.
+fn closed(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_err()
+}
+
+/// A server with a plaintext port only, as one starts without TLS.
+fn start_server_without_tls() -> u16 {
+    let plain = free_port();
+    let cfg = kividb::config::Config {
+        port: plain,
+        bind: "127.0.0.1".to_string(),
+        ..Default::default()
+    };
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(plain);
+    plain
+}
+
+/// `CONFIG SET tls-port` moves the TLS port, closes it with 0 and opens it
+/// again; a TLS connection made before stays up through all of it.
+#[test]
+fn config_set_tls_port_moves_closes_and_opens_it() {
+    let certs = generate_certs();
+    let plain = free_port();
+    let first = free_port();
+    start_server_with_tls(plain, first, &certs);
+    let mut kept = make_tls_client(first, &certs.cert_der);
+    send_cmd(&mut kept, &["SET", "kept", "1"]);
+    assert_eq!(read_resp(&mut kept), "OK");
+
+    let second = free_port();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &second.to_string()]);
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(second, &certs.cert_der));
+    assert!(closed(first), "the old TLS port is still open");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        format!("tls-port {second}")
+    );
+    assert!(plain_cmd(plain, &["INFO", "tls"]).contains(&format!("tls_port:{second}")));
+    send_cmd(&mut kept, &["GET", "kept"]);
+    assert_eq!(read_resp(&mut kept), "1");
+
+    // Closed: the port only; the connection made before stays.
+    assert_eq!(plain_cmd(plain, &["CONFIG", "SET", "tls-port", "0"]), "OK");
+    assert!(closed(second), "the TLS port is still open");
+    let info = plain_cmd(plain, &["INFO", "tls"]);
+    assert!(
+        info.contains("tls_enabled:0") && info.contains("tls_port:0"),
+        "{info}"
+    );
+    send_cmd(&mut kept, &["PING"]);
+    assert_eq!(read_resp(&mut kept), "PONG");
+
+    // And opened again.
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-port", &first.to_string()]),
+        "OK"
+    );
+    assert!(handshake_ok(first, &certs.cert_der));
+    send_cmd(&mut kept, &["PING"]);
+    assert_eq!(read_resp(&mut kept), "PONG");
+}
+
+/// A server that started without TLS is given it with `CONFIG SET`: the
+/// certificate, its key and the port in one, or one after the other.
+#[test]
+fn config_set_turns_tls_on_at_runtime() {
+    let certs = generate_certs();
+    let cert = certs.cert_path.to_str().unwrap();
+    let key = certs.key_path.to_str().unwrap();
+
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-port",
+            &tls.to_string(),
+            "tls-cert-file",
+            cert,
+            "tls-key-file",
+            key,
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &certs.cert_der));
+    let mut conn = make_tls_client(tls, &certs.cert_der);
+    send_cmd(&mut conn, &["SET", "over", "tls"]);
+    assert_eq!(read_resp(&mut conn), "OK");
+    assert_eq!(plain_cmd(plain, &["GET", "over"]), "tls");
+
+    // One at a time: the port is refused until there is a certificate and
+    // a key to serve it with.
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &tls.to_string()]);
+    assert!(reply.contains("tls-cert-file and tls-key-file"), "{reply}");
+    assert!(closed(tls));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        "tls-port 0"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", cert]),
+        "OK"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-key-file", key]),
+        "OK"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-port", &tls.to_string()]),
+        "OK"
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
+
+/// What cannot be done is refused with an error, and changes nothing.
+#[test]
+fn config_set_tls_refuses_what_it_cannot_do() {
+    let certs = generate_certs();
+    let cert = certs.cert_path.to_str().unwrap();
+    let key = certs.key_path.to_str().unwrap();
+
+    // Files that cannot be loaded, on a server without TLS.
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            "/no/such/file",
+            "tls-key-file",
+            key,
+            "tls-port",
+            &tls.to_string(),
+        ],
+    );
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    assert!(closed(tls));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        "tls-cert-file "
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        "tls-port 0"
+    );
+
+    // Not a port.
+    for bad in ["abc", "-1", "65536"] {
+        let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", bad]);
+        assert!(reply.starts_with("ERR CONFIG SET failed"), "{bad}: {reply}");
+    }
+
+    // A port something else has.
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &certs);
+    let taken = free_port();
+    let _holder = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &taken.to_string()]);
+    assert!(reply.contains("Unable to listen on this port"), "{reply}");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        format!("tls-port {tls}")
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    // With the TLS port open, a certificate that does not load is refused.
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", "/no/such/file"]);
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        format!("tls-cert-file {cert}")
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
+
 /// Basic TLS: PING over TLS returns PONG.
 #[test]
 fn test_tls_ping() {

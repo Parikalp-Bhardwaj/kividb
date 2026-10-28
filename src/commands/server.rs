@@ -37,6 +37,11 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     let yes_no = |b: bool| if b { "yes" } else { "no" }.to_string();
     let rs = ctx.repl_state;
     let (master_user, master_auth) = rs.master_credentials();
+    // `CONFIG SET` changes it in a build with TLS.
+    #[cfg(feature = "tls")]
+    let tls_replication = crate::node_tls::replication_set();
+    #[cfg(not(feature = "tls"))]
+    let tls_replication = ctx.config.tls_replication;
     vec![
         (
             "repl-timeout",
@@ -126,7 +131,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             yes_no(crate::eviction::key_access_tracking()),
         ),
         ("tls-cluster", yes_no(ctx.config.tls_cluster)),
-        ("tls-replication", yes_no(ctx.config.tls_replication)),
+        ("tls-replication", yes_no(tls_replication)),
         (
             "cluster-bus-secret",
             if ctx.config.cluster_bus_secret.is_empty() {
@@ -706,7 +711,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             | "cluster-bus-port-protected-mode"
             | "cluster-bus-secret"
             | "tls-cluster"
-            | "tls-replication"
             | "cluster-node-timeout"
             | "cluster-require-full-coverage" => {
                 // To what it already is, is no change.
@@ -771,7 +775,11 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             // Listen there instead (`listen`): refused, with nothing
             // changed, if the port cannot be had.
             "port" => match value.parse::<u16>() {
-                Ok(port) if port > 0 => match crate::listen::move_to(ctx.config.port, port) {
+                Ok(port) if port > 0 => match crate::listen::move_to(
+                    crate::listen::server_of(ctx.config),
+                    crate::listen::Kind::Plain,
+                    port,
+                ) {
                     Ok(()) => Some(resp_simple("OK")),
                     Err(e) => Some(resp_error(&format!(
                         "ERR Unable to listen on this port: {e}"
@@ -783,6 +791,24 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument must be between 1 and 65535 inclusive",
                 )),
             },
+            // Open, move or close the TLS port: see `config_set_tls_port`.
+            "tls-port" => match value.parse::<u16>() {
+                Ok(port) => Some(config_set_tls_port(ctx, port)),
+                Err(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 65535 inclusive",
+                )),
+            },
+            // From the replica's next connection to its master on; a link
+            // that is up stays as it is. `tls-cluster` implies it, and is
+            // fixed at startup.
+            "tls-replication" => {
+                let on = match value.to_ascii_lowercase().as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Some(resp_error("ERR argument must be 'yes' or 'no'")),
+                };
+                Some(config_set_tls_replication(ctx, on))
+            }
             // Redis's ranges: 1 second to a day, 1 to 10000 entries.
             "stream-idmp-duration" | "stream-idmp-maxsize" => {
                 let (slot, max) = if param == "stream-idmp-duration" {
@@ -1101,6 +1127,10 @@ struct TlsBefore {
 /// already open keep theirs. Several are taken together, so that a
 /// certificate and its key can change in one `CONFIG SET`. If they cannot be
 /// loaded, nothing changes.
+///
+/// While the TLS port is closed they are loaded only once both the
+/// certificate and the key are set, so that one can be set before the
+/// other; `CONFIG SET tls-port` loads them when it opens the port.
 #[cfg(feature = "tls")]
 fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, Vec<u8>> {
     use crate::tls::acceptor;
@@ -1117,16 +1147,11 @@ fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, 
             "argument(s) must be one of the following: no, yes, optional",
         ));
     }
-    let port = ctx.config.tls_port;
+    let server = crate::listen::server_of(ctx.config);
     let before = TlsBefore {
-        listener: acceptor::files(port),
+        listener: Some(acceptor::files(server).unwrap_or_else(|| acceptor::Files::of(ctx.config))),
         nodes: crate::node_tls::files(),
     };
-    if before.listener.is_none() && before.nodes.is_none() {
-        // Nothing to load them into: what they would be for starts only
-        // with the server.
-        return Err(failed("can't set immutable config"));
-    }
     let changed = |files: &Option<acceptor::Files>| {
         files.clone().map(|mut files| {
             for (name, value) in changes {
@@ -1145,13 +1170,18 @@ fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, 
         failed("Unable to update TLS configuration. Check server logs.")
     };
     if let Some(files) = changed(&before.listener) {
-        acceptor::install(port, &files).map_err(unable)?;
+        let open = crate::listen::current_port(server, crate::listen::Kind::Tls) != 0;
+        if open || (!files.cert.is_empty() && !files.key.is_empty()) {
+            acceptor::install(server, &files).map_err(unable)?;
+        } else {
+            acceptor::keep(server, &files);
+        }
     }
     if let Some(files) = changed(&before.nodes)
         && let Err(e) = crate::node_tls::reload(files)
     {
         if let Some(files) = &before.listener {
-            let _ = acceptor::install(port, files);
+            restore_tls_files(server, files);
         }
         return Err(unable(e));
     }
@@ -1162,14 +1192,108 @@ fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, 
     Ok(before)
 }
 
+/// Put `files` back as what `server`'s TLS is set up from: loaded, if
+/// they can be, as they were.
+#[cfg(feature = "tls")]
+fn restore_tls_files(server: crate::listen::Server, files: &crate::tls::acceptor::Files) {
+    if crate::tls::acceptor::install(server, files).is_err() {
+        crate::tls::acceptor::keep(server, files);
+    }
+}
+
 /// Put TLS back as it was before [`config_set_tls`].
 #[cfg(feature = "tls")]
 fn config_set_tls_undo(ctx: &Ctx, before: TlsBefore) {
     if let Some(files) = before.listener {
-        let _ = crate::tls::acceptor::install(ctx.config.tls_port, &files);
+        restore_tls_files(crate::listen::server_of(ctx.config), &files);
     }
     if let Some(files) = before.nodes {
         let _ = crate::node_tls::reload(files);
+    }
+}
+
+/// `CONFIG SET tls-port`: open the TLS port, as Redis does, also on a
+/// server that started without one; move it; or close it with 0. Opening
+/// or moving it loads the certificate and key again first. Connections
+/// already open stay open, as they do when `port` moves. Refused, with
+/// nothing changed, if the files cannot be loaded or the port cannot be
+/// had.
+#[cfg(feature = "tls")]
+fn config_set_tls_port(ctx: &Ctx, port: u16) -> Vec<u8> {
+    use crate::listen::Kind;
+    use crate::tls::acceptor;
+    let server = crate::listen::server_of(ctx.config);
+    if port == crate::listen::current_port(server, Kind::Tls) {
+        return resp_simple("OK");
+    }
+    // The port a node of a TLS cluster is known by: the other nodes and
+    // its nodes.conf would not follow.
+    if ctx.config.tls_cluster {
+        return resp_error(
+            "ERR CONFIG SET failed (possibly related to argument 'tls-port') - can't set \
+             immutable config",
+        );
+    }
+    if port == 0 {
+        if crate::listen::current_port(server, Kind::Plain) == 0 {
+            return resp_error(
+                "ERR the plaintext port is off (port 0), so the TLS port is the only one \
+                 clients can reach: set port first",
+            );
+        }
+        return match crate::listen::move_to(server, Kind::Tls, 0) {
+            Ok(()) => resp_simple("OK"),
+            Err(e) => resp_error(&format!("ERR {e}")),
+        };
+    }
+    let files = acceptor::files(server).unwrap_or_else(|| acceptor::Files::of(ctx.config));
+    if files.cert.is_empty() || files.key.is_empty() {
+        return resp_error("ERR TLS needs tls-cert-file and tls-key-file: set them first");
+    }
+    if let Err(e) = acceptor::install(server, &files) {
+        log_warn!("TLS: CONFIG SET tls-port {port}: {e}");
+        return resp_error("ERR Unable to update TLS configuration. Check server logs.");
+    }
+    match crate::listen::move_to(server, Kind::Tls, port) {
+        Ok(()) => resp_simple("OK"),
+        Err(e) => resp_error(&format!("ERR Unable to listen on this port: {e}")),
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+fn config_set_tls_port(_ctx: &Ctx, port: u16) -> Vec<u8> {
+    if port == 0 {
+        resp_simple("OK")
+    } else {
+        resp_error("ERR this build has no TLS (the `tls` feature)")
+    }
+}
+
+/// `CONFIG SET tls-replication`: see `node_tls::set_replication`. It needs
+/// the certificate, key and CA files, as at startup.
+#[cfg(feature = "tls")]
+fn config_set_tls_replication(ctx: &Ctx, on: bool) -> Vec<u8> {
+    if on == crate::node_tls::replication_set() {
+        return resp_simple("OK");
+    }
+    let server = crate::listen::server_of(ctx.config);
+    let files = crate::tls::acceptor::files(server)
+        .unwrap_or_else(|| crate::tls::acceptor::Files::of(ctx.config));
+    match crate::node_tls::set_replication(on, files) {
+        Ok(()) => resp_simple("OK"),
+        Err(e) => {
+            log_warn!("TLS: CONFIG SET tls-replication: {e}");
+            resp_error("ERR Unable to update TLS configuration. Check server logs.")
+        }
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+fn config_set_tls_replication(_ctx: &Ctx, on: bool) -> Vec<u8> {
+    if on {
+        resp_error("ERR this build has no TLS (the `tls` feature)")
+    } else {
+        resp_simple("OK")
     }
 }
 
@@ -1281,7 +1405,20 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("bind", ctx.config.bind.clone()),
         (
             "port",
-            crate::listen::current_port(ctx.config.port).to_string(),
+            crate::listen::current_port(
+                crate::listen::server_of(ctx.config),
+                crate::listen::Kind::Plain,
+            )
+            .to_string(),
+        ),
+        // The TLS port open now; 0 when there is none.
+        (
+            "tls-port",
+            crate::listen::current_port(
+                crate::listen::server_of(ctx.config),
+                crate::listen::Kind::Tls,
+            )
+            .to_string(),
         ),
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
@@ -1426,7 +1563,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     // TLS's files, as `CONFIG SET` last loaded them.
     #[cfg(feature = "tls")]
     {
-        let files = crate::tls::acceptor::files(ctx.config.tls_port)
+        let files = crate::tls::acceptor::files(crate::listen::server_of(ctx.config))
             .or_else(crate::node_tls::files)
             .unwrap_or_else(|| crate::tls::acceptor::Files::of(ctx.config));
         for name in crate::tls::acceptor::SETTINGS {
@@ -3362,7 +3499,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "tcp_port:{}\r\n",
-                    crate::listen::current_port(ctx.config.port)
+                    crate::listen::current_port(
+                        crate::listen::server_of(ctx.config),
+                        crate::listen::Kind::Plain,
+                    )
                 ));
                 out.push_str(&format!("process_id:{}\r\n", std::process::id()));
                 out.push_str(&format!("run_id:{}\r\n", crate::stats::RUN_ID.as_str()));
@@ -3404,22 +3544,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("tls") {
                 let tls_section = {
-                    #[cfg(feature = "tls")]
-                    let (tls_port, tls_enabled) = if ctx.config.tls_enabled() {
-                        (ctx.config.tls_port, 1u8)
-                    } else {
-                        (0, 0u8)
-                    };
-
-                    #[cfg(not(feature = "tls"))]
-                    let (tls_port, tls_enabled) = (0u16, 0u8);
+                    // As they are now: `CONFIG SET tls-port` opens, moves
+                    // and closes the port.
+                    let tls_port = crate::listen::current_port(
+                        crate::listen::server_of(ctx.config),
+                        crate::listen::Kind::Tls,
+                    );
+                    let tls_enabled = u8::from(tls_port != 0);
+                    let tls_replication = u8::from(crate::node_tls::replication());
+                    let tls_cluster = u8::from(crate::node_tls::cluster());
 
                     format!(
                         "# tls\r\n\
                          tls_enabled:{tls_enabled}\r\n\
                          tls_port:{tls_port}\r\n\
-                         tls_replication:0\r\n\
-                         tls_cluster:0\r\n\
+                         tls_replication:{tls_replication}\r\n\
+                         tls_cluster:{tls_cluster}\r\n\
                          \r\n"
                     )
                 };
@@ -4139,11 +4279,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             )
                         })
                         .collect();
-                    // The port last: moving it is what can fail after the
-                    // values are found good (the port is taken), and it is
-                    // not to be moved back, so it is moved only once the
-                    // others are set.
-                    settings.sort_by_key(|(name, _)| name == "port");
+                    // The ports last: moving one is what can fail after the
+                    // values are found good (the port is taken), so they
+                    // are moved only once the others are set. A port closed
+                    // (0) goes after one opened, so that `tls-port 6380
+                    // port 0` and `port 6379 tls-port 0` always leave one
+                    // to be reached on.
+                    settings.sort_by_key(|(name, value)| match name.as_str() {
+                        "port" | "tls-port" => 1 + u8::from(value.parse::<u16>() == Ok(0)),
+                        _ => 0,
+                    });
                     if let Some((_, (twice, _))) =
                         settings.iter().enumerate().find(|(i, (name, _))| {
                             settings[..*i]
