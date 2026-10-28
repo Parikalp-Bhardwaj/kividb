@@ -3,6 +3,54 @@ use clap::Parser;
 /// The values `tls-auth-clients` accepts.
 pub const TLS_AUTH_CLIENTS: [&str; 3] = ["yes", "no", "optional"];
 
+/// `tls-auth-clients-allowed-names` as a list of names, lower case: words
+/// separated by spaces or commas, each a DNS name, or `*.` and one, where
+/// `*` stands for exactly one label, as it does in a certificate. Empty:
+/// any name. `Err` says which word is neither.
+pub fn allowed_names(value: &str) -> Result<Vec<String>, String> {
+    value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            let label = |label: &str| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            };
+            if name
+                .strip_prefix("*.")
+                .unwrap_or(&name)
+                .split('.')
+                .all(label)
+            {
+                Ok(name)
+            } else {
+                Err(format!(
+                    "'{name}' is not a DNS name, nor '*.' and one: '*' may only be the whole \
+                     first label"
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Whether `name`, as a certificate gives it, matches `pattern`, one of
+/// [`allowed_names`]: the same name, in any case, or for `*.parent` one label
+/// more than `parent`.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+pub fn allowed_name_matches(pattern: &str, name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(parent) => name
+            .strip_suffix(parent)
+            .and_then(|head| head.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+        None => name == pattern,
+    }
+}
+
 #[derive(clap::ValueEnum, Debug, Clone, Default, PartialEq)]
 pub enum IoModel {
     #[default]
@@ -231,6 +279,16 @@ pub struct Config {
     /// Has no effect while `tls-ca-cert-file` is empty.
     #[arg(long, default_value = "yes")]
     pub tls_auth_clients: String,
+
+    /// The names a client certificate must carry to be accepted, separated
+    /// by spaces or commas: a client (or replica, or node on the cluster
+    /// bus) that presents a certificate is refused unless its subject CN or
+    /// one of its DNS names matches one of them. A name is exact, or starts
+    /// with `*.`, where `*` stands for exactly one label: `*.db.example`
+    /// takes `node-0.db.example`, not `a.b.db.example`. Case does not
+    /// matter. Empty (the default): any certificate the CA signed.
+    #[arg(long, default_value = "")]
+    pub tls_auth_clients_allowed_names: String,
 
     /// The cluster bus over TLS, and the TLS port announced as this node's
     /// port, so that what nodes open to each other is TLS (Redis
@@ -505,6 +563,7 @@ impl Default for Config {
             tls_key_file: "".into(),
             tls_ca_cert_file: "".into(),
             tls_auth_clients: "yes".into(),
+            tls_auth_clients_allowed_names: String::new(),
             tls_cluster: false,
             tls_replication: false,
             tls_client_cert_file: String::new(),
@@ -621,6 +680,7 @@ impl Config {
             tls_key_file: String::new(),
             tls_ca_cert_file: String::new(),
             tls_auth_clients: "yes".into(),
+            tls_auth_clients_allowed_names: String::new(),
             tls_cluster: false,
             tls_replication: false,
             tls_client_cert_file: String::new(),
@@ -719,6 +779,19 @@ impl Config {
             ));
         }
 
+        if let Err(e) = allowed_names(&self.tls_auth_clients_allowed_names) {
+            return Err(format!("invalid tls-auth-clients-allowed-names: {e}"));
+        }
+        if !self.tls_auth_clients_allowed_names.trim().is_empty()
+            && (self.tls_ca_cert_file.is_empty() || self.tls_auth_clients == "no")
+        {
+            warnings.push(
+                "tls-auth-clients-allowed-names has no effect: clients are asked for a \
+                 certificate only with tls-ca-cert-file and tls-auth-clients yes or optional"
+                    .to_string(),
+            );
+        }
+
         if self.tls_cluster || self.tls_replication {
             if !tls_compiled {
                 return Err(
@@ -742,6 +815,25 @@ impl Config {
         }
         if self.tls_cluster && (!self.cluster_enabled || self.tls_port == 0) {
             return Err("tls-cluster needs cluster-enabled yes and a tls-port".into());
+        }
+        // Port 0 is no plaintext port, as in Redis; with no Unix socket here,
+        // the TLS port is then the only one to reach the server on.
+        if self.port == 0 {
+            if self.tls_port == 0 {
+                return Err(
+                    "port 0 turns the plaintext port off, which leaves no port to \
+                            reach this server on: set tls-port (with tls-cert-file and \
+                            tls-key-file) to serve TLS only, or give port a number"
+                        .into(),
+                );
+            }
+            if self.cluster_enabled && !self.tls_cluster {
+                return Err(
+                    "port 0 on a cluster node needs tls-cluster yes: the node is \
+                            then known to the cluster and its clients by its TLS port"
+                        .into(),
+                );
+            }
         }
 
         match self.replica_full_sync_guard.as_str() {
@@ -783,10 +875,10 @@ impl Config {
                         .into(),
                 );
             }
-            if self.port > u16::MAX - 10000 {
+            if self.client_port() > u16::MAX - 10000 {
                 return Err(format!(
                     "port {} leaves no room for the cluster bus port (port + 10000)",
-                    self.port
+                    self.client_port()
                 ));
             }
             if self.cluster_bus_secret.is_empty() {
@@ -809,9 +901,20 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The port the cluster bus listens on.
+    /// The port the cluster bus listens on: 10000 above the client port.
     pub fn cluster_bus_port(&self) -> u16 {
-        self.port.saturating_add(10000)
+        self.client_port().saturating_add(10000)
+    }
+
+    /// The port the server started with for clients: `port`, or with port 0
+    /// (no plaintext port) `tls-port`. Redis derives the bus port from the
+    /// TLS port the same way when the node is reached over TLS.
+    pub fn client_port(&self) -> u16 {
+        if self.port == 0 {
+            self.tls_port
+        } else {
+            self.port
+        }
     }
 
     /// Returns true if TLS should be enabled.
@@ -1433,6 +1536,12 @@ impl Config {
             "tls-replication" => set!(tls_replication, yes_no(key, one()?)?),
             "tls-client-cert-file" => set!(tls_client_cert_file, one()?.to_string()),
             "tls-client-key-file" => set!(tls_client_key_file, one()?.to_string()),
+            // A list: one word or several, as `bind`.
+            "tls-auth-clients-allowed-names" => {
+                let names = allowed_names(&args.join(" "))
+                    .map_err(|e| format!("invalid value for '{key}': {e}"))?;
+                set!(tls_auth_clients_allowed_names, names.join(" "))
+            }
             "tls-auth-clients" => {
                 let value = one()?.to_ascii_lowercase();
                 if !TLS_AUTH_CLIENTS.contains(&value.as_str()) {
@@ -2027,6 +2136,67 @@ mod validate_tests {
     fn tls_port_without_cert_is_fatal_on_a_tls_build() {
         let c = Config {
             tls_port: 6380,
+            ..cfg()
+        };
+        assert!(c.validate(true).is_err());
+    }
+
+    /// Port 0 is no plaintext port: only with a TLS port, and in a cluster
+    /// only with `tls-cluster`, whose bus is then 10000 above the TLS port.
+    #[test]
+    fn port_0_needs_a_tls_port() {
+        let plain_off = Config { port: 0, ..cfg() };
+        let err = plain_off.validate(true).unwrap_err();
+        assert!(err.contains("port 0"), "{err}");
+        assert!(plain_off.validate(false).is_err());
+
+        let tls_only = Config {
+            port: 0,
+            tls_port: 6381,
+            tls_cert_file: "cert.pem".into(),
+            tls_key_file: "key.pem".into(),
+            ..cfg()
+        };
+        assert!(tls_only.validate(true).is_ok());
+        assert_eq!(tls_only.client_port(), 6381);
+        assert_eq!(tls_only.cluster_bus_port(), 16381);
+
+        let cluster = Config {
+            cluster_enabled: true,
+            ..tls_only.clone()
+        };
+        let err = cluster.validate(true).unwrap_err();
+        assert!(err.contains("tls-cluster"), "{err}");
+        let tls_cluster = Config {
+            tls_cluster: true,
+            tls_ca_cert_file: "ca.pem".into(),
+            ..cluster
+        };
+        assert!(tls_cluster.validate(true).is_ok());
+    }
+
+    /// `*` is one label, case does not matter, and what is not a name is
+    /// refused.
+    #[test]
+    fn allowed_names_match_one_label_for_a_star() {
+        use super::{allowed_name_matches, allowed_names};
+        let names = allowed_names("*.DB1.nodes.kividb.internal, admin.example ").unwrap();
+        assert_eq!(names, ["*.db1.nodes.kividb.internal", "admin.example"]);
+        let ok = |name: &str| names.iter().any(|p| allowed_name_matches(p, name));
+        assert!(ok("node-0.db1.nodes.kividb.internal"));
+        assert!(ok("Node-1.DB1.Nodes.Kividb.Internal."));
+        assert!(ok("ADMIN.example"));
+        assert!(!ok("db1.nodes.kividb.internal"));
+        assert!(!ok("a.b.db1.nodes.kividb.internal"));
+        assert!(!ok("x.db2.nodes.kividb.internal"));
+        assert!(!ok("x.xdb1.nodes.kividb.internal"));
+        assert!(!ok("other.admin.example"));
+        for bad in ["*", "a.*.b", "*.*.b", "a*.b", "a..b", "*.", "a b/c"] {
+            assert!(allowed_names(bad).is_err(), "{bad} was taken");
+        }
+        assert_eq!(allowed_names(" , ").unwrap(), Vec::<String>::new());
+        let c = Config {
+            tls_auth_clients_allowed_names: "a.*".into(),
             ..cfg()
         };
         assert!(c.validate(true).is_err());

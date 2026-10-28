@@ -374,7 +374,7 @@ list.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `6380` | Port to listen on |
+| `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
 | `--threads` | `0` (auto) | Worker threads; auto is the number of cores minus 2 (all cores below 4) |
@@ -390,20 +390,24 @@ list.
 | `--requirepass <password>` | none | Password for the `default` user |
 | `--aclfile <path>` | none | ACL file to load users from |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
-| `--replica-announced-port <port>` | server port | Port announced to the primary via `REPLCONF listening-port` |
+| `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
 | `--slowlog-log-slower-than <us>` | off | Slowlog threshold in microseconds (`0` logs every command) |
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
 | `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
-| `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only) |
+| `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
+| `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
 
 ### TLS
 
-TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`.
+TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`. With
+`--port 0` there is no plaintext port, and the server is reached over TLS only (it needs a
+`--tls-port`; a cluster node needs `--tls-cluster yes` as well, and its bus is then
+`<tls-port> + 10000`). A replica of such a master connects with `--tls-replication yes`.
 
 ```bash
 cargo build --release --features tls
@@ -416,6 +420,23 @@ certificate signed by that CA; others are refused during the handshake.
 `--tls-auth-clients optional` accepts clients without a certificate but still refuses an
 invalid one, and `--tls-auth-clients no` does not ask for one. With `redis-cli`:
 `redis-cli --tls -p 6381 --cacert ca.pem --cert client.pem --key client.key`.
+
+**Pinning client certificates by name.** `--tls-auth-clients-allowed-names "*.db1.example
+admin.example"` (spaces or commas between names) accepts a client certificate only if its subject
+CN or one of its DNS names matches one of the names; others signed by the same CA fail the
+handshake, and the server logs the names they carried. `*` stands for exactly one label:
+`*.db1.example` takes `node-0.db1.example`, not `a.b.db1.example` or `db1.example`. Case does
+not matter. It applies to clients, replicas and, with `tls-cluster`, nodes on the cluster bus;
+empty (the default) is off. KiviDB's own setting: Redis has none.
+
+**Changed without a restart.** `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
+`tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` and `tls-client-key-file` loads the
+files again for every handshake from then on. `CONFIG SET tls-port <port>` opens the TLS port
+(also on a server that started without TLS: `CONFIG SET tls-cert-file cert.pem tls-key-file
+key.pem tls-port 6381`), moves it, or closes it with `0`; connections already open stay open.
+`CONFIG SET tls-replication yes` makes a replica's next connection to its master TLS. What cannot
+be loaded or listened on is refused, and nothing changes. `tls-cluster` needs a restart, and so
+does `tls-port` on a node with `tls-cluster yes`.
 
 **Clients must use TLS on the TLS port.** A plain connection to it (for example `redis-cli -p 6381`
 without `--tls`) fails the handshake, and the server logs `[TLS] handshake failed`. For

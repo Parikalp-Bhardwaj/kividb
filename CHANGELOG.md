@@ -54,6 +54,24 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   timestamp is an error. A series keeps the policy it was made with. Config
   file and `CONFIG SET`; set it alike on a master and its replicas.
 
+- **Client certificates pinned by name: `tls-auth-clients-allowed-names`.**
+  A list of names, separated by spaces or commas; when it is set, a client
+  that presents a certificate is accepted only if the certificate's subject
+  CN or one of its DNS names matches one of them, and otherwise fails the
+  handshake, as a certificate from another CA does. A name is exact, or
+  starts with `*.`, where `*` stands for exactly one label, as in a
+  certificate: `*.db1.nodes.example` takes `node-0.db1.nodes.example`, not
+  `a.b.db1.nodes.example`, `db1.nodes.example` or `x.db2.nodes.example`.
+  Case does not matter. It is checked wherever a certificate is asked for:
+  clients and replicas on `tls-port` (with `tls-ca-cert-file` and
+  `tls-auth-clients yes` or `optional`), and nodes on a `tls-cluster` bus.
+  Empty, the default, is off. Config file, command line and `CONFIG SET`,
+  for connections from then on; `CONFIG GET` gives it back lower case, one
+  space apart. A refused certificate is logged (at most every 10 seconds)
+  with the names it carried. Redis has no such setting: with one CA for
+  many databases, it keeps the certificates of one from being taken by
+  another.
+
 - **TLS certificates are loaded again with `CONFIG SET`, without a restart
   (#156).** As in Redis, `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
   `tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` or
@@ -65,6 +83,43 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   certificate and its key change as a pair. Files that cannot be loaded
   change nothing: `Unable to update TLS configuration. Check server logs.`
   These were answered `OK` and changed nothing.
+
+- **TLS is turned on, moved and off without a restart: `tls-port`,
+  `tls-replication`.** As in Redis, `CONFIG SET tls-port <port>` opens the
+  TLS port, also on a server that started without TLS, moves it, or closes
+  it with `0`; `CONFIG GET tls-port` and `INFO tls` show the port open now.
+  Opening or moving it loads `tls-cert-file` and `tls-key-file` first, so a
+  server is given TLS with `CONFIG SET tls-cert-file … tls-key-file …
+  tls-port 6380` in one command, or one setting after another. Closing the
+  port closes only the port: TLS connections already open stay open. A port
+  that cannot be had (`Unable to listen on this port`), files that cannot be
+  loaded (`Unable to update TLS configuration. Check server logs.`) or a
+  port with no certificate and key is refused, and nothing changes. While
+  the port is closed, a certificate and its key are loaded once both are
+  set. `CONFIG SET tls-replication yes|no` decides whether a replica's next
+  connection to its master is TLS (the link that is up stays as it is); it
+  needs `tls-cert-file`, `tls-key-file` and `tls-ca-cert-file`. Until now
+  `tls-port` and `tls-replication` were fixed at startup, and the TLS files
+  could not be set at all on a server that started without TLS.
+  `tls-cluster` still is, and so is `tls-port` on a node with `tls-cluster
+  yes`, which announces that port to the rest of the cluster.
+
+- **TLS only: `port 0` turns the plaintext port off, with a `tls-port`.**
+  As in Redis, `port 0` (`--port 0`, the config file, or `CONFIG SET port
+  0`) means no plaintext port. There is no Unix socket here, so it needs
+  the TLS port: a server started with `port 0` and no `tls-port` stops with
+  an error that says so, and `CONFIG SET port 0` with no TLS port open, or
+  `tls-port 0` with no plaintext port, is refused. `CONFIG SET port 0`
+  closes only the port: plaintext connections already open stay open, as in
+  Redis (`CLIENT KILL` them if they must go); `CONFIG SET port <n>` opens it
+  again. With no plaintext port, `CONFIG GET port` and INFO's `tcp_port`
+  say `0`. A replica tells its master its TLS port to be reached on
+  (`REPLCONF listening-port`) when it has no plaintext port, and now also
+  with `tls-replication yes`, as Redis does, unless `replica-announce-port`
+  says otherwise. A cluster node with `port 0` needs `tls-cluster yes`; it
+  is known to the cluster and its clients by its TLS port, and its bus is
+  10000 above that port, as in Redis. A replica of a TLS-only master
+  connects with `tls-replication yes`.
 
 - **Active defrag (#113): memory freed by deletes goes back to the system.**
   After a reshard or a big delete at random, nearly every page still held

@@ -380,8 +380,9 @@ impl ClusterState {
             })?;
         // With `tls-cluster` the port to reach this node on is its TLS port,
         // for clients and for the other nodes alike (see `node_tls`); the bus
-        // stays where it is.
-        let client_port = if config.tls_cluster {
+        // stays where it is. A node with no plaintext port (port 0) has
+        // `tls-cluster`: see `Config::validate`.
+        let client_port = if config.tls_cluster || config.port == 0 {
             config.tls_port
         } else {
             config.port

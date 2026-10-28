@@ -4,13 +4,14 @@
 #
 #   KIVIDB_HOST=10.20.0.5 KIVIDB_PASSWORD=... ./client.sh
 #
-# The KiviDB client is in zilliztech/VectorDBBench#884; until that is merged,
-# it is installed from the branch the pull request comes from.
+# The KiviDB client was merged in zilliztech/VectorDBBench#884, after the
+# 2.0.0 release on PyPI: until a release has it, VectorDBBench is installed
+# from its main branch.
 set -eu
 : "${KIVIDB_HOST:?set KIVIDB_HOST}"
 : "${KIVIDB_PASSWORD:?set KIVIDB_PASSWORD}"
-REPO=${VDBBENCH_REPO:-https://github.com/kividbio/VectorDBBench}
-BRANCH=${VDBBENCH_BRANCH:-feat/kividb-client}
+REPO=${VDBBENCH_REPO:-https://github.com/zilliztech/VectorDBBench}
+BRANCH=${VDBBENCH_BRANCH:-main}
 
 cd "$HOME"
 sudo apt-get update -qq >/dev/null

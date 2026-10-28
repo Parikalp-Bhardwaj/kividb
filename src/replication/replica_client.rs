@@ -513,11 +513,21 @@ async fn run_replication_session(
     // ── Phase 2: REPLCONF listening-port ────────────────────────────────
     // The port clients reach *this* node on, so the master's `INFO` and `ROLE`
     // list the replica by an address someone can actually connect to rather
-    // than this connection's ephemeral source port.
+    // than this connection's ephemeral source port. As in Redis, that is the
+    // TLS port when the replica replicates over TLS, and it is when there is
+    // no plaintext port (port 0); otherwise the plaintext port. Both as they
+    // are now: `CONFIG SET` moves them.
     let listening_port = if config.replica_announced_port != 0 {
         config.replica_announced_port
     } else {
-        config.port
+        use crate::listen::{Kind, current_port, server_of};
+        let plain = current_port(server_of(config), Kind::Plain);
+        let tls = current_port(server_of(config), Kind::Tls);
+        if tls != 0 && (plain == 0 || crate::node_tls::replication()) {
+            tls
+        } else {
+            plain
+        }
     };
     send_command(
         &mut writer,
