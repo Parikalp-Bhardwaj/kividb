@@ -86,6 +86,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `tls-cluster` still is, and so is `tls-port` on a node with `tls-cluster
   yes`, which announces that port to the rest of the cluster.
 
+- **TLS only: `port 0` turns the plaintext port off, with a `tls-port`.**
+  As in Redis, `port 0` (`--port 0`, the config file, or `CONFIG SET port
+  0`) means no plaintext port. There is no Unix socket here, so it needs
+  the TLS port: a server started with `port 0` and no `tls-port` stops with
+  an error that says so, and `CONFIG SET port 0` with no TLS port open, or
+  `tls-port 0` with no plaintext port, is refused. `CONFIG SET port 0`
+  closes only the port: plaintext connections already open stay open, as in
+  Redis (`CLIENT KILL` them if they must go); `CONFIG SET port <n>` opens it
+  again. With no plaintext port, `CONFIG GET port` and INFO's `tcp_port`
+  say `0`. A replica tells its master its TLS port to be reached on
+  (`REPLCONF listening-port`) when it has no plaintext port, and now also
+  with `tls-replication yes`, as Redis does, unless `replica-announce-port`
+  says otherwise. A cluster node with `port 0` needs `tls-cluster yes`; it
+  is known to the cluster and its clients by its TLS port, and its bus is
+  10000 above that port, as in Redis. A replica of a TLS-only master
+  connects with `tls-replication yes`.
+
 - **Active defrag (#113): memory freed by deletes goes back to the system.**
   After a reshard or a big delete at random, nearly every page still held
   a key that stayed, and the process kept its memory: 10 million keys of
