@@ -374,7 +374,7 @@ list.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `6380` | Port to listen on |
+| `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
 | `--threads` | `0` (auto) | Worker threads; auto is the number of cores minus 2 (all cores below 4) |
@@ -390,12 +390,12 @@ list.
 | `--requirepass <password>` | none | Password for the `default` user |
 | `--aclfile <path>` | none | ACL file to load users from |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
-| `--replica-announced-port <port>` | server port | Port announced to the primary via `REPLCONF listening-port` |
+| `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
 | `--slowlog-log-slower-than <us>` | off | Slowlog threshold in microseconds (`0` logs every command) |
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
 | `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
-| `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only) |
+| `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
@@ -403,7 +403,10 @@ list.
 
 ### TLS
 
-TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`.
+TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`. With
+`--port 0` there is no plaintext port, and the server is reached over TLS only (it needs a
+`--tls-port`; a cluster node needs `--tls-cluster yes` as well, and its bus is then
+`<tls-port> + 10000`). A replica of such a master connects with `--tls-replication yes`.
 
 ```bash
 cargo build --release --features tls

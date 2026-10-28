@@ -324,3 +324,45 @@ fn tls_replication_is_turned_on_at_runtime() {
         cmd(&mut r, &["GET", "k"]) == "w"
     });
 }
+
+/// A master and a replica with no plaintext port (port 0): the replica
+/// connects over TLS, and tells its master its TLS port as the one to
+/// reach it on.
+#[test]
+fn a_tls_only_replica_replicates_a_tls_only_master() {
+    let _serial = serial();
+    let master_tls = free_port();
+    let master = tls_config(0, master_tls);
+    assert!(master.validate(true).is_ok());
+    start(master);
+    let replica_tls = free_port();
+    let replica = kividb::config::Config {
+        tls_replication: true,
+        replicaof: Some(vec!["127.0.0.1".to_string(), master_tls.to_string()]),
+        ..tls_config(0, replica_tls)
+    };
+    assert!(replica.validate(true).is_ok());
+    start(replica);
+
+    let mut m = tls(master_tls);
+    assert_eq!(cmd(&mut m, &["SET", "only", "tls"]), "OK");
+    let mut r = tls(replica_tls);
+    wait_until("the replica to sync over TLS", || {
+        info_field(&mut r, "replication", "master_link_status").as_deref() == Some("up")
+    });
+    wait_until("the key to reach the replica", || {
+        cmd(&mut r, &["GET", "only"]) == "tls"
+    });
+    let slave = info_field(&mut m, "replication", "slave0").unwrap_or_default();
+    assert!(slave.contains(&format!("port={replica_tls},")), "{slave}");
+    assert_eq!(
+        info_field(&mut r, "server", "tcp_port").as_deref(),
+        Some("0")
+    );
+
+    // TLS between nodes off again, for the other tests here.
+    assert_eq!(
+        cmd(&mut r, &["CONFIG", "SET", "tls-replication", "no"]),
+        "OK"
+    );
+}

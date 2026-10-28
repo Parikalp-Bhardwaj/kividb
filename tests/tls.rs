@@ -552,6 +552,129 @@ fn config_set_tls_refuses_what_it_cannot_do() {
     assert!(handshake_ok(tls, &certs.cert_der));
 }
 
+// ── No plaintext port (port 0) ────────────────────────────────────────────────
+
+/// A command's reply on `conn`, arrays joined by spaces, as `plain_cmd`.
+fn cmd_on(conn: &mut (impl Read + Write), args: &[&str]) -> String {
+    send_cmd(conn, args);
+    let line = read_resp(conn);
+    match line.strip_prefix('*') {
+        Some(n) => (0..n.parse::<usize>().unwrap())
+            .map(|_| read_resp(conn))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => line,
+    }
+}
+
+/// `port 0` with a TLS port: the server listens on the TLS port only, and
+/// `CONFIG SET port` opens a plaintext port and closes it again.
+#[test]
+fn port_0_at_startup_serves_tls_only() {
+    let certs = generate_certs();
+    let tls = free_port();
+    let cfg = kividb::config::Config {
+        port: 0,
+        bind: "127.0.0.1".to_string(),
+        tls_port: tls,
+        tls_cert_file: certs.cert_path.to_str().unwrap().to_string(),
+        tls_key_file: certs.key_path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate(true).is_ok());
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(tls);
+
+    let mut conn = make_tls_client(tls, &certs.cert_der);
+    assert_eq!(cmd_on(&mut conn, &["PING"]), "PONG");
+    assert_eq!(cmd_on(&mut conn, &["CONFIG", "GET", "port"]), "port 0");
+    assert!(cmd_on(&mut conn, &["INFO", "server"]).contains("tcp_port:0\r\n"));
+    // Nothing to close the TLS port in favour of.
+    let reply = cmd_on(&mut conn, &["CONFIG", "SET", "tls-port", "0"]);
+    assert!(reply.contains("set port first"), "{reply}");
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    let plain = free_port();
+    assert_eq!(
+        cmd_on(&mut conn, &["CONFIG", "SET", "port", &plain.to_string()]),
+        "OK"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+    assert_eq!(cmd_on(&mut conn, &["CONFIG", "SET", "port", "0"]), "OK");
+    assert!(closed(plain), "the plaintext port is still open");
+    assert_eq!(cmd_on(&mut conn, &["PING"]), "PONG");
+}
+
+/// `CONFIG SET port 0` closes the plaintext port: connections already open
+/// on it stay open, as in Redis, and TLS goes on; `CONFIG SET port` opens it
+/// again.
+#[test]
+fn config_set_port_0_closes_the_plaintext_port() {
+    let certs = generate_certs();
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &certs);
+    let mut kept = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+    kept.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut over_tls = make_tls_client(tls, &certs.cert_der);
+
+    assert_eq!(cmd_on(&mut kept, &["CONFIG", "SET", "port", "0"]), "OK");
+    assert!(closed(plain), "the plaintext port is still open");
+    assert_eq!(cmd_on(&mut kept, &["SET", "still", "here"]), "OK");
+    assert_eq!(cmd_on(&mut over_tls, &["GET", "still"]), "here");
+    assert_eq!(cmd_on(&mut over_tls, &["CONFIG", "GET", "port"]), "port 0");
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    assert_eq!(
+        cmd_on(
+            &mut over_tls,
+            &["CONFIG", "SET", "port", &plain.to_string()]
+        ),
+        "OK"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+}
+
+/// Port 0 leaves a server without TLS no port: refused. On one that is
+/// given TLS in the same `CONFIG SET`, it is taken.
+#[test]
+fn config_set_port_0_without_tls_is_refused() {
+    let plain = start_server_without_tls();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "port", "0"]);
+    assert!(
+        reply.starts_with("ERR CONFIG SET failed") && reply.contains("port 0"),
+        "{reply}"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "port"]),
+        format!("port {plain}")
+    );
+
+    let certs = generate_certs();
+    let tls = free_port();
+    let mut conn = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let reply = cmd_on(
+        &mut conn,
+        &[
+            "CONFIG",
+            "SET",
+            "port",
+            "0",
+            "tls-port",
+            &tls.to_string(),
+            "tls-cert-file",
+            certs.cert_path.to_str().unwrap(),
+            "tls-key-file",
+            certs.key_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(closed(plain));
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
+
 /// Basic TLS: PING over TLS returns PONG.
 #[test]
 fn test_tls_ping() {
