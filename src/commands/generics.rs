@@ -723,7 +723,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &src);
                 let mut map = write_lock!(shard);
                 match map.remove(src.as_str()) {
-                    Some(v) => v,
+                    Some(v) => v.into_value(),
                     None => return Some(resp_error("ERR no such key")),
                 }
             };
@@ -997,7 +997,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &key);
                 let mut map = write_lock!(shard);
                 match map.remove(key.as_str()) {
-                    Some(v) => v,
+                    Some(v) => v.into_value(),
                     None => return Some(resp_integer(0)),
                 }
             };

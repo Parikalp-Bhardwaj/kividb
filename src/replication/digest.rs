@@ -171,10 +171,7 @@ mod tests {
         let ea = crate::store::new_expiry_store(1);
         let eb = crate::store::new_expiry_store(1);
         let set = |store: &crate::store::Store, k: &str, v: &str| {
-            crate::write_lock!(crate::store::get_shard(&store[0], k)).insert(
-                k,
-                KiviDBValue::String(crate::types::SharedBytes::from(v.as_bytes())),
-            );
+            crate::write_lock!(crate::store::get_shard(&store[0], k)).insert_str(k, v.as_bytes());
         };
         for i in 0..100 {
             set(&a, &format!("k{i}"), "v");

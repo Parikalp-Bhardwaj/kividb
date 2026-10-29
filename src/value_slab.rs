@@ -7,7 +7,7 @@
 //! allocator measured did better. None of them gives that memory back
 //! without moving data, and none but jemalloc says which data to move.
 //!
-//! Here every block of a string value of up to [`MAX_BLOCK`] bytes, header
+//! Here every block of up to [`MAX_BLOCK`] bytes, header
 //! included, is in a slab of one size class whose fill is known, so that
 //! compaction can tell the sparse slabs and empty them, and an empty slab's
 //! pages go back to the kernel at once. A block also costs only its class's
@@ -47,12 +47,15 @@ pub const REGION: usize = 2 << 20;
 pub const SLAB: usize = 64 << 10;
 /// Slabs in a region, the first of them the headers.
 const SLABS: usize = REGION / SLAB;
-/// How far apart the size classes are.
-const STEP: usize = 16;
-/// The largest block a slab holds. A value's block larger than this is the
-/// system allocator's.
-pub const MAX_BLOCK: usize = 512;
-const CLASSES: usize = MAX_BLOCK / STEP;
+/// The largest block a slab holds. A block larger than this is the system
+/// allocator's.
+///
+/// Up to 512 bytes the classes are 16 bytes apart, then 32 bytes apart to
+/// 2 KiB and 64 to 4 KiB: 32, 48 and 32 classes. A key of 15 bytes and a
+/// value of 1,024 make an entry of 1,051 bytes, in the class of 1,056.
+pub const MAX_BLOCK: usize = 4096;
+const CLASSES: usize = 112;
+const _: () = assert!(block_size(CLASSES - 1) == MAX_BLOCK);
 
 // What a slab is doing.
 /// A thread's, which takes blocks from it.
@@ -143,18 +146,59 @@ fn slab_of(block: *const u8) -> &'static Slab {
 /// The class of a block of `size` bytes, if a slab holds it.
 #[inline]
 pub fn class_of(size: usize) -> Option<usize> {
-    (size <= MAX_BLOCK).then(|| size.saturating_sub(1) / STEP)
+    let size = size.max(1);
+    Some(if size <= 512 {
+        (size - 1) / 16
+    } else if size <= 2048 {
+        32 + (size - 513) / 32
+    } else if size <= MAX_BLOCK {
+        80 + (size - 2049) / 64
+    } else {
+        return None;
+    })
 }
+
+/// Each class's block size, looked up: on every block given and taken.
+const SIZES: [u16; CLASSES] = {
+    let mut sizes = [0; CLASSES];
+    let mut class = 0;
+    while class < CLASSES {
+        sizes[class] = size_of_class(class) as u16;
+        class += 1;
+    }
+    sizes
+};
 
 /// The size of a block of class `class`.
 #[inline]
 pub const fn block_size(class: usize) -> usize {
-    (class + 1) * STEP
+    SIZES[class] as usize
 }
+
+const fn size_of_class(class: usize) -> usize {
+    if class < 32 {
+        (class + 1) * 16
+    } else if class < 80 {
+        512 + (class - 31) * 32
+    } else {
+        2048 + (class - 79) * 64
+    }
+}
+
+/// Blocks in a slab of each class.
+const CAPACITY: [i32; CLASSES] = {
+    let mut capacity = [0; CLASSES];
+    let mut class = 0;
+    while class < CLASSES {
+        capacity[class] = (SLAB / size_of_class(class)) as i32;
+        class += 1;
+    }
+    capacity
+};
 
 #[inline]
 fn capacity(class: usize) -> i32 {
-    (SLAB / block_size(class)) as i32
+    CAPACITY[class]
 }
 
 /// The most blocks a slab nobody owns may hold and be in its class's list:
@@ -297,11 +341,16 @@ pub unsafe fn free(block: NonNull<u8>, class: usize) {
             Err(now) => head = now,
         }
     }
-    let before = slab.live.fetch_sub(1, Ordering::AcqRel);
+    // Sequentially consistent, as `let_go`'s store of the state and
+    // `settle`'s load of the count: this free counts itself out and then
+    // reads the state, the owner letting go writes the state and then reads
+    // the count. With weaker orders both could read the old value (seen
+    // under Miri), and the last free of a slab would settle it nowhere.
+    let before = slab.live.fetch_sub(1, Ordering::SeqCst);
     // A slab nobody owns that now has room enough to be listed, or holds
     // nothing, changes list. An owned one is settled when its owner lets go
     // of it.
-    if (before == listable(class) + 1 || before == 1) && slab.state.load(Ordering::Acquire) != OWNED
+    if (before == listable(class) + 1 || before == 1) && slab.state.load(Ordering::SeqCst) != OWNED
     {
         let partial = PARTIAL_SLABS[class].lock();
         if slab.generation.load(Ordering::Relaxed) == generation {
@@ -350,7 +399,8 @@ unsafe fn let_go(slab: &Slab, class: usize) {
     slab.live.fetch_add(pending, Ordering::AcqRel);
     let partial = PARTIAL_SLABS[class].lock();
     slab.owner.store(0, Ordering::Relaxed);
-    slab.state.store(FULL, Ordering::Release);
+    // See `free`.
+    slab.state.store(FULL, Ordering::SeqCst);
     settle(partial, slab, class);
 }
 
@@ -361,7 +411,7 @@ fn settle(mut partial: parking_lot::MutexGuard<'_, Vec<SlabPtr>>, slab: &Slab, c
     if state != FULL && state != PARTIAL && state != EVACUATING {
         return;
     }
-    let live = slab.live.load(Ordering::Acquire);
+    let live = slab.live.load(Ordering::SeqCst);
     if live == 0 {
         if state == PARTIAL {
             unlist(&mut partial, slab);

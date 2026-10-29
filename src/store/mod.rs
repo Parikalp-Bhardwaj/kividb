@@ -7,8 +7,12 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
+mod entry;
 mod shard_map;
-pub use shard_map::{Relocated, ShardMap, ValueRef};
+#[allow(unused_imports)] // Not every item is named outside the store yet.
+pub use shard_map::{
+    EntryRef, EntryView, Leftover, NewEntry, Relocated, ShardMap, StrRef, Taken, ValueRef,
+};
 
 /// Which shard `key` is in, of `shards` (a power of two). The keyspace and
 /// the expiry store have the same number, so one index serves both: a

@@ -3703,13 +3703,15 @@ pub struct FrozenDataset {
     functions: Option<Vec<u8>>,
 }
 
-/// What one thread of the capture took: strings, and everything else laid out.
-type FrozenPart = (Vec<(Key, SharedBytes)>, Vec<u8>);
+/// What one thread of the capture took: a hold on each string's entry
+/// (its key and bytes, which do not change while held), and everything else
+/// laid out.
+type FrozenPart = (Vec<store::EntryRef>, Vec<u8>);
 
 #[derive(Default)]
 struct FrozenDb {
     /// One part per thread of the capture (see [`freeze`]).
-    strings: Vec<Vec<(Key, SharedBytes)>>,
+    strings: Vec<Vec<store::EntryRef>>,
     /// Complete KDB entries for every non-string key, likewise.
     encoded: Vec<Vec<u8>>,
 }
@@ -3768,12 +3770,12 @@ fn freeze(
                         for shard in run {
                             let map = read_lock!(shard);
                             strings.reserve(map.len());
-                            for (key, value) in map.iter() {
-                                match value {
-                                    ValueRef::String(bytes) => {
-                                        strings.push((Key::from(key), bytes.to_shared()));
-                                    }
-                                    other => write_kdb_entry(&mut encoded, key, other)?,
+                            for entry in map.entries() {
+                                match entry.value() {
+                                    // Eight bytes and a count: no copy of
+                                    // the key, nor of the bytes.
+                                    ValueRef::String(_) => strings.push(entry.hold()),
+                                    other => write_kdb_entry(&mut encoded, entry.key(), other)?,
                                 }
                             }
                         }
@@ -3851,6 +3853,14 @@ fn freeze(
     })
 }
 
+/// The bytes of a string [`freeze`] held.
+fn frozen_string(entry: &store::EntryRef) -> &[u8] {
+    match entry.value() {
+        ValueRef::String(bytes) => bytes.as_bytes(),
+        _ => unreachable!("only strings are held"),
+    }
+}
+
 impl FrozenDataset {
     /// Lay the captured dataset out as a KDB image.
     pub fn into_payload(self) -> std::io::Result<Vec<u8>> {
@@ -3858,7 +3868,7 @@ impl FrozenDataset {
             .dbs
             .iter()
             .flat_map(|db| db.strings.iter().flatten())
-            .map(|(k, v)| k.len() + v.len() + 9)
+            .map(|e| e.key().len() + frozen_string(e).len() + 9)
             .sum();
         let encoded_bytes: usize = self
             .dbs
@@ -3887,10 +3897,10 @@ impl FrozenDataset {
     fn write_to(self, out: &mut impl Write) -> std::io::Result<()> {
         write_kdb_header(out, self.dbs.len() as u32)?;
         for db in self.dbs {
-            for (key, bytes) in db.strings.iter().flatten() {
-                write_bytes(out, key.as_bytes())?;
+            for entry in db.strings.iter().flatten() {
+                write_bytes(out, entry.key().as_bytes())?;
                 out.write_all(&[TAG_STRING])?;
-                write_bytes(out, bytes)?;
+                write_bytes(out, frozen_string(entry))?;
             }
             for encoded in &db.encoded {
                 out.write_all(encoded)?;

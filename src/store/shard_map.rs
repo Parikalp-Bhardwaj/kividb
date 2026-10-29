@@ -3,58 +3,81 @@
 //!
 //! Commands ask for a key's value and get a [`ValueRef`], a view of it that
 //! lives as long as the shard's lock. They never see a `&KiviDBValue` from
-//! the table: that is what lets the table change how it keeps a key and its
-//! value (one allocation for both)
-//! without every command changing again. A value going in, coming out or
-//! moving between keys is still an owned [`KiviDBValue`].
+//! the table. A value going in, coming out or moving between keys is an
+//! owned [`KiviDBValue`] (or, coming out, a [`Taken`] entry that can give
+//! one).
 //!
-//! The table is hashbrown's, as the standard library's `HashMap` is, used
-//! directly: its buckets can be reached by index, which is what a cursor
-//! that survives the lock being let go (compaction), and a key picked at
-//! random (`RANDOMKEY`, eviction), need. Through a `HashMap` the only way
-//! to the n-th key was to walk past the n before it.
+//! The table is hashbrown's, used directly: its buckets can be reached by
+//! index, which is what a cursor that survives the lock being let go
+//! (compaction), and a key picked at random (`RANDOMKEY`, eviction), need.
+//! Each bucket is an eight-byte [`Slot`]: the address of one block holding
+//! the key and its value together (`entry`).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hashbrown::HashTable;
-use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 
+use super::entry::{Entry, Left, Relocation, Slot};
+pub use super::entry::{EntryRef, Taken};
 use crate::shared_bytes::SharedBytes;
-use crate::store::Key;
 use crate::types::{
     ArrayInner, HashFields, HashInner, KiviDBValue, SortedSetInner, StreamInner, TsInner,
     VectorSetInner,
 };
 
-/// A key's string value, borrowed from its shard.
+/// A key's string value, borrowed from its shard: its bytes, kept in the
+/// key's entry, or a `SharedBytes` of their own when they are too long.
 #[derive(Clone, Copy)]
-pub struct StrRef<'a>(&'a SharedBytes);
+pub struct StrRef<'a>(Bytes<'a>);
+
+#[derive(Clone, Copy)]
+enum Bytes<'a> {
+    Inline(&'a [u8]),
+    Shared(&'a SharedBytes),
+}
 
 impl<'a> StrRef<'a> {
     #[inline]
-    pub fn as_bytes(self) -> &'a [u8] {
-        self.0.as_slice()
+    pub(super) fn bytes(bytes: &'a [u8]) -> Self {
+        StrRef(Bytes::Inline(bytes))
     }
 
-    /// The bytes, to keep once the shard is let go of: a second hold on the
-    /// same block, not a copy.
+    #[inline]
+    pub fn as_bytes(self) -> &'a [u8] {
+        match self.0 {
+            Bytes::Inline(bytes) => bytes,
+            Bytes::Shared(shared) => shared.as_slice(),
+        }
+    }
+
+    /// The bytes, to keep once the shard is let go of: a second hold on
+    /// the same block when they have one of their own, a copy when they are
+    /// in the key's entry.
     #[inline]
     pub fn to_shared(self) -> SharedBytes {
-        self.0.clone()
+        match self.0 {
+            Bytes::Inline(bytes) => SharedBytes::from(bytes),
+            Bytes::Shared(shared) => shared.clone(),
+        }
     }
 
-    /// Whether `other` is this very value, not merely equal bytes.
+    /// The `SharedBytes` the bytes are in, when they are not in the entry.
+    #[inline]
+    pub(super) fn shared(self) -> Option<&'a SharedBytes> {
+        match self.0 {
+            Bytes::Inline(_) => None,
+            Bytes::Shared(shared) => Some(shared),
+        }
+    }
+
+    /// Whether `other` is this very value, not merely equal bytes. Bytes
+    /// in an entry are no `SharedBytes`: never.
     #[inline]
     pub fn is(self, other: &SharedBytes) -> bool {
-        SharedBytes::ptr_eq(self.0, other)
-    }
-
-    /// Where the bytes are, for compaction (`value_slab::is_evacuating`).
-    #[inline]
-    pub fn block(self) -> *const u8 {
-        self.0.block()
+        self.shared()
+            .is_some_and(|shared| SharedBytes::ptr_eq(shared, other))
     }
 }
 
@@ -62,14 +85,14 @@ impl std::ops::Deref for StrRef<'_> {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &[u8] {
-        self.0.as_slice()
+        self.as_bytes()
     }
 }
 
 impl AsRef<[u8]> for StrRef<'_> {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
+        self.as_bytes()
     }
 }
 
@@ -95,7 +118,7 @@ impl<'a> From<&'a KiviDBValue> for ValueRef<'a> {
     #[inline]
     fn from(value: &'a KiviDBValue) -> Self {
         match value {
-            KiviDBValue::String(v) => ValueRef::String(StrRef(v)),
+            KiviDBValue::String(v) => ValueRef::String(StrRef(Bytes::Shared(v))),
             KiviDBValue::List(v) => ValueRef::List(v),
             KiviDBValue::Hash(v) => ValueRef::Hash(v),
             KiviDBValue::Json(v) => ValueRef::Json(v),
@@ -161,24 +184,6 @@ impl ValueRef<'_> {
         }
     }
 
-    /// [`KiviDBValue::same_value`].
-    pub fn same_value(self, other: &KiviDBValue) -> bool {
-        match (self, other) {
-            (ValueRef::String(a), KiviDBValue::String(b)) => a.is(b),
-            (ValueRef::List(a), KiviDBValue::List(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::Hash(a), KiviDBValue::Hash(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::Json(a), KiviDBValue::Json(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::Set(a), KiviDBValue::Set(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::VectorSet(a), KiviDBValue::VectorSet(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::SortedSet(a), KiviDBValue::SortedSet(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::Stream(a), KiviDBValue::Stream(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::TimeSeries(a), KiviDBValue::TimeSeries(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::HashEx(a), KiviDBValue::HashEx(b)) => Arc::ptr_eq(a, b),
-            (ValueRef::Array(a), KiviDBValue::Array(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
-
     /// [`KiviDBValue::type_name`].
     pub fn type_name(self) -> &'static str {
         match self {
@@ -197,25 +202,39 @@ impl ValueRef<'_> {
     }
 }
 
-/// What [`ShardMap::relocate_string`] did.
+/// What [`ShardMap::relocate_at`] did.
 pub enum Relocated {
-    /// Moved: the old block, to be let go of once the shard is unlocked.
-    Moved(SharedBytes),
+    /// Moved: what was left behind, to be let go of once the shard is
+    /// unlocked (freeing it can give a slab back to the kernel).
+    Moved(Leftover),
     /// In a slab being emptied, but held by something besides its key.
     Held,
-    /// Not a string, not there, or not in a slab being emptied.
+    /// Nothing there, or nothing in a slab being emptied.
     Stays,
 }
 
-/// One shard's keys and values.
+/// A block compaction moved a key's entry, or its string, out of.
+pub enum Leftover {
+    Entry(Left),
+    Bytes(SharedBytes),
+}
+
+/// One shard's keys and values: a table of [`Slot`]s, each the address of
+/// an entry holding a key and its value (`entry`).
 pub struct ShardMap {
-    table: HashTable<(Key, KiviDBValue)>,
+    table: HashTable<Slot>,
     hash: ahash::RandomState,
 }
 
 impl Default for ShardMap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ShardMap {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -234,50 +253,104 @@ impl ShardMap {
         }
     }
 
-    #[inline]
-    fn hash_of(&self, key: &str) -> u64 {
+    #[inline(always)]
+    fn hash_of(&self, key: &[u8]) -> u64 {
         self.hash.hash_one(key)
     }
 
-    #[inline]
+    /// The slot of `key`, hashed `hash`.
+    #[inline(always)]
+    fn find(&self, hash: u64, key: &[u8]) -> Option<Slot> {
+        self.table
+            .find(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+            .copied()
+    }
+
+    #[inline(always)]
     pub fn get(&self, key: &str) -> Option<ValueRef<'_>> {
-        self.table
-            .find(self.hash_of(key), |(k, _)| k.as_str() == key)
-            .map(|(_, v)| ValueRef::from(v))
+        let key = key.as_bytes();
+        self.find(self.hash_of(key), key).map(|s| s.entry().value())
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.table
-            .find(self.hash_of(key), |(k, _)| k.as_str() == key)
-            .is_some()
+        let key = key.as_bytes();
+        self.find(self.hash_of(key), key).is_some()
     }
 
-    /// Set `key` to `value`, and give back the value it had. A key that was
-    /// there keeps its stored name: no new one is made for it.
-    #[inline]
-    pub fn insert(&mut self, key: impl AsRef<str>, value: KiviDBValue) -> Option<KiviDBValue> {
-        let key = key.as_ref();
+    /// A hold on `key`'s entry: its key and value, readable once the shard
+    /// is let go of, and unchanged for as long as it is held.
+    pub fn get_ref(&self, key: &str) -> Option<EntryRef> {
+        let key = key.as_bytes();
+        // SAFETY: the entry is in this table, which the caller has locked.
+        self.find(self.hash_of(key), key)
+            .map(|s| unsafe { EntryRef::new(s.entry()) })
+    }
+
+    /// Whether `key`'s entry is the one `held` holds: whether the key's
+    /// value is the very one it had when `held` was taken.
+    pub fn holds(&self, key: &str, held: &EntryRef) -> bool {
+        let key = key.as_bytes();
+        self.find(self.hash_of(key), key)
+            .is_some_and(|s| held.is(s.entry()))
+    }
+
+    /// Put `entry` in the table under its key, and give back what the key
+    /// had. One probe, whether the key is there or not.
+    fn put(&mut self, entry: Entry) -> Option<Taken> {
+        let key = entry.key();
         let hash = self.hash_of(key);
+        let slot = Slot::new(entry, hash);
         let hasher = &self.hash;
         match self.table.entry(
             hash,
-            |(k, _)| k.as_str() == key,
-            |(k, _)| hasher.hash_one(k.as_str()),
+            |s| s.may_be(hash) && s.entry().has_key(key),
+            |s| hasher.hash_one(s.entry().key()),
         ) {
-            Entry::Occupied(mut slot) => Some(std::mem::replace(&mut slot.get_mut().1, value)),
-            Entry::Vacant(place) => {
-                place.insert((Key::from(key), value));
+            hashbrown::hash_table::Entry::Occupied(mut at) => {
+                let old = std::mem::replace(at.get_mut(), slot).entry();
+                // SAFETY: the table's hold on the old entry goes to the caller.
+                Some(unsafe { Taken::new(old) })
+            }
+            hashbrown::hash_table::Entry::Vacant(place) => {
+                place.insert(slot);
                 None
             }
         }
     }
 
+    /// Set `key` to `value`, and give back what it had: dropping that frees
+    /// it, which is best done once the shard is unlocked.
     #[inline]
-    pub fn remove(&mut self, key: &str) -> Option<KiviDBValue> {
+    pub fn insert(&mut self, key: impl AsRef<str>, value: KiviDBValue) -> Option<Taken> {
+        self.put(Entry::new(key.as_ref().as_bytes(), value))
+    }
+
+    /// Set `key` to the string `bytes`: [`ShardMap::insert`] of a string,
+    /// with its bytes copied once, into the entry.
+    #[inline]
+    pub fn insert_str(&mut self, key: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Option<Taken> {
+        self.put(Entry::string(key.as_ref().as_bytes(), bytes.as_ref()))
+    }
+
+    /// Put an entry made before the shard was locked ([`NewEntry`]).
+    #[inline]
+    pub fn insert_entry(&mut self, entry: NewEntry) -> Option<Taken> {
+        let at = entry.0;
+        std::mem::forget(entry);
+        self.put(at)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &str) -> Option<Taken> {
+        let key = key.as_bytes();
         let hash = self.hash_of(key);
-        match self.table.find_entry(hash, |(k, _)| k.as_str() == key) {
-            Ok(slot) => Some(slot.remove().0.1),
+        match self
+            .table
+            .find_entry(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+        {
+            // SAFETY: the table's hold goes to the caller.
+            Ok(at) => Some(unsafe { Taken::new(at.remove().0.entry()) }),
             Err(_) => None,
         }
     }
@@ -288,37 +361,33 @@ impl ShardMap {
         key: &str,
         make: impl FnOnce() -> KiviDBValue,
     ) -> ValueRef<'_> {
-        let hash = self.hash_of(key);
-        let hasher = &self.hash;
-        let slot = self
-            .table
-            .entry(
-                hash,
-                |(k, _)| k.as_str() == key,
-                |(k, _)| hasher.hash_one(k.as_str()),
-            )
-            .or_insert_with(|| (Key::from(key), make()));
-        ValueRef::from(&slot.into_mut().1)
+        if !self.contains_key(key) {
+            self.insert(key, make());
+        }
+        self.get(key).expect("a key just put in")
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, ValueRef<'_>)> {
-        self.table
-            .iter()
-            .map(|(k, v)| (k.as_str(), ValueRef::from(v)))
+        self.table.iter().map(|s| {
+            let e = s.entry();
+            (e.key_str(), e.value())
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.table.iter().map(|(k, _)| k.as_str())
+        self.table.iter().map(|s| s.entry().key_str())
     }
 
     pub fn values(&self) -> impl Iterator<Item = ValueRef<'_>> {
-        self.table.iter().map(|(_, v)| ValueRef::from(v))
+        self.table.iter().map(|s| s.entry().value())
     }
 
-    /// Every key and value, taken out: the table is left empty, with the
-    /// room it had.
-    pub fn drain(&mut self) -> impl Iterator<Item = (Key, KiviDBValue)> + '_ {
-        self.table.drain()
+    /// Every entry, each as a key, a value and the means to hold it.
+    pub fn entries(&self) -> impl Iterator<Item = EntryView<'_>> {
+        self.table.iter().map(|s| EntryView {
+            entry: s.entry(),
+            _map: std::marker::PhantomData,
+        })
     }
 
     #[inline]
@@ -337,14 +406,18 @@ impl ShardMap {
         self.table.capacity()
     }
 
+    /// Take every key out, keeping the table's room.
     pub fn clear(&mut self) {
-        self.table.clear();
+        for slot in self.table.drain() {
+            // SAFETY: the table's hold, given up.
+            unsafe { slot.entry().release() };
+        }
     }
 
     pub fn shrink_to(&mut self, keys: usize) {
         let hasher = &self.hash;
         self.table
-            .shrink_to(keys, |(k, _)| hasher.hash_one(k.as_str()));
+            .shrink_to(keys, |s| hasher.hash_one(s.entry().key()));
     }
 
     /// How many buckets the table has: the positions [`ShardMap::bucket`]
@@ -358,9 +431,10 @@ impl ShardMap {
     /// The key and value in bucket `index`, if it holds one.
     #[inline]
     pub fn bucket(&self, index: usize) -> Option<(&str, ValueRef<'_>)> {
-        self.table
-            .get_bucket(index)
-            .map(|(k, v)| (k.as_str(), ValueRef::from(v)))
+        self.table.get_bucket(index).map(|s| {
+            let e = s.entry();
+            (e.key_str(), e.value())
+        })
     }
 
     /// Up to `count` keys and values from the buckets at and after `start`
@@ -380,8 +454,9 @@ impl ShardMap {
     }
 
     /// One key picked at random, `pick()` giving the random numbers. A
-    /// random bucket is tried until one is full, as Redis's `dictGetFairRandomKey`
-    /// does; a table that is very sparse is walked from a random bucket.
+    /// random bucket is tried until one is full, as Redis's
+    /// `dictGetFairRandomKey` does; a table that is very sparse is walked
+    /// from a random bucket.
     pub fn random_entry(&self, mut pick: impl FnMut() -> usize) -> Option<(&str, ValueRef<'_>)> {
         if self.is_empty() {
             return None;
@@ -395,33 +470,83 @@ impl ShardMap {
         self.sample_from(pick(), 1).next()
     }
 
-    /// Move `key`'s string to a new block if its block is in a slab
-    /// compaction is emptying and nothing else holds it
-    /// ([`SharedBytes::relocate`]).
-    pub fn relocate_string(&mut self, key: &str, regions: &[usize]) -> Relocated {
-        let hash = self.hash_of(key);
-        match self.table.find_mut(hash, |(k, _)| k.as_str() == key) {
-            Some((_, KiviDBValue::String(bytes))) => {
-                if !crate::value_slab::is_evacuating(bytes.block(), regions) {
-                    return Relocated::Stays;
-                }
-                match bytes.relocate(regions) {
-                    Some(old) => Relocated::Moved(old),
-                    None => Relocated::Held,
-                }
+    /// Whether the entry in bucket `index`, or its string's bytes, is in a
+    /// slab compaction is emptying (`regions` is
+    /// `value_slab::regions_snapshot`).
+    pub fn evacuating_at(&self, index: usize, regions: &[usize]) -> bool {
+        let Some(slot) = self.table.get_bucket(index) else {
+            return false;
+        };
+        let entry = slot.entry();
+        (crate::value_slab::class_of(entry.size()).is_some()
+            && crate::value_slab::is_evacuating(entry.base(), regions))
+            || matches!(entry.value(), ValueRef::String(s)
+                if s.shared().is_some_and(|b| crate::value_slab::is_evacuating(b.block(), regions)))
+    }
+
+    /// Move the entry in bucket `index`, or its string's bytes, out of a
+    /// slab compaction is emptying, if the table's is its only hold.
+    pub fn relocate_at(&mut self, index: usize, regions: &[usize]) -> Relocated {
+        let Some(slot) = self.table.get_bucket_mut(index) else {
+            return Relocated::Stays;
+        };
+        let entry = slot.entry();
+        // SAFETY: the table is locked for writing (`&mut self`), and holds
+        // the entry.
+        match unsafe { entry.relocate(regions) } {
+            Relocation::Stays => Relocated::Stays,
+            Relocation::Held => Relocated::Held,
+            Relocation::Moved { to, left } => {
+                // The hash is not stored; the fragment is in the slot.
+                *slot = slot.moved_to(to);
+                Relocated::Moved(Leftover::Entry(left))
             }
-            _ => Relocated::Stays,
+            Relocation::BytesMoved(old) => Relocated::Moved(Leftover::Bytes(old)),
         }
     }
 }
 
-impl FromIterator<(Key, KiviDBValue)> for ShardMap {
-    fn from_iter<I: IntoIterator<Item = (Key, KiviDBValue)>>(items: I) -> Self {
-        let mut map = ShardMap::new();
-        for (key, value) in items {
-            map.insert(key, value);
-        }
-        map
+/// A key's entry, made before its shard is locked: what the shard then
+/// waits for is only the table. Freed if dropped unused.
+pub struct NewEntry(Entry);
+
+impl NewEntry {
+    pub fn new(key: &str, value: KiviDBValue) -> Self {
+        NewEntry(Entry::new(key.as_bytes(), value))
+    }
+
+    /// The string `bytes`, copied once, into the entry.
+    pub fn string(key: &str, bytes: &[u8]) -> Self {
+        NewEntry(Entry::string(key.as_bytes(), bytes))
+    }
+}
+
+impl Drop for NewEntry {
+    fn drop(&mut self) {
+        // SAFETY: the only hold, never put in a table.
+        unsafe { self.0.release() };
+    }
+}
+
+/// One entry of a locked shard, as [`ShardMap::entries`] gives them.
+pub struct EntryView<'a> {
+    entry: Entry,
+    _map: std::marker::PhantomData<&'a ShardMap>,
+}
+
+impl<'a> EntryView<'a> {
+    pub fn key(&self) -> &'a str {
+        self.entry.key_str()
+    }
+
+    pub fn value(&self) -> ValueRef<'a> {
+        self.entry.value()
+    }
+
+    /// A hold on the entry, to read it once the shard is let go of.
+    pub fn hold(&self) -> EntryRef {
+        // SAFETY: the shard is locked for as long as `'a`.
+        unsafe { EntryRef::new(self.entry) }
     }
 }
 
@@ -446,8 +571,10 @@ mod tests {
         assert!(map.insert("a", s("1")).is_none());
         assert_eq!(text(map.get("a")), Some(b"1".to_vec()));
         assert!(map.contains_key("a"));
-        let old = map.insert(Key::from("a"), s("2"));
-        assert!(matches!(old, Some(KiviDBValue::String(b)) if &b[..] == b"1"));
+        let old = map.insert(crate::store::Key::from("a"), s("2"));
+        assert!(
+            matches!(old.map(Taken::into_value), Some(KiviDBValue::String(b)) if &b[..] == b"1")
+        );
         assert_eq!(map.len(), 1);
         assert!(map.remove("a").is_some());
         assert!(map.remove("a").is_none());

@@ -23,7 +23,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::store::{Key, Relocated, Shard, Store, ValueRef};
+use crate::store::{Relocated, Shard, Store};
 use crate::value_slab;
 
 /// Buckets looked at under one hold of a shard's read lock (about half as
@@ -169,18 +169,16 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
         let started = Instant::now();
         let looked;
         let buckets;
-        let moving: Vec<Key> = {
+        // The buckets whose entry, or whose entry's string, is in a slab
+        // being emptied. Looked at again under the write lock: the bucket
+        // may hold another entry by then, which is checked the same way.
+        let moving: Vec<usize> = {
             let map = shard.read();
             buckets = map.buckets();
             let end = (at + BATCH).min(buckets);
             looked = end.saturating_sub(at);
             (at..end)
-                .filter_map(|index| map.bucket(index))
-                .filter(|(_, value)| {
-                    matches!(value, ValueRef::String(bytes)
-                        if value_slab::is_evacuating(bytes.block(), regions))
-                })
-                .map(|(key, _)| Key::from(key))
+                .filter(|&index| map.evacuating_at(index, regions))
                 .collect()
         };
         at += looked;
@@ -188,8 +186,8 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
             let mut old = Vec::with_capacity(moving.len());
             {
                 let mut map = shard.write();
-                for key in &moving {
-                    match map.relocate_string(key, regions) {
+                for &index in &moving {
+                    match map.relocate_at(index, regions) {
                         Relocated::Moved(was) => old.push(was),
                         Relocated::Held => {
                             MISSES.fetch_add(1, Ordering::Relaxed);

@@ -2,9 +2,7 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::*;
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
-use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
 
@@ -158,10 +156,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         new_bytes[byte_idx] &= !mask;
     }
 
-    map.insert(
-        Key::from(key_owned),
-        KiviDBValue::String(SharedBytes::from(new_bytes.as_slice())),
-    );
+    map.insert_str(key_owned, new_bytes.as_slice());
 
     resp_integer(old_bit)
 }
@@ -591,10 +586,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
     // Store result at dest key
     let dest_shard = store::get_shard(db, &dest_key);
     let mut map = write_lock!(dest_shard);
-    map.insert(
-        Key::from(dest_key),
-        KiviDBValue::String(SharedBytes::from(result.as_slice())),
-    );
+    map.insert_str(dest_key, result.as_slice());
     drop(map);
 
     resp_integer(result_len)
@@ -758,10 +750,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     }
     if modified {
         let mut map = write_lock!(shard);
-        map.insert(
-            Key::from(key),
-            KiviDBValue::String(SharedBytes::from(current_bytes.as_slice())),
-        );
+        map.insert_str(key, current_bytes.as_slice());
     } else {
         ctx.skip_write_side_effects = true;
     }
