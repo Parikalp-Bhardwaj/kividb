@@ -287,6 +287,35 @@ fn hset_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
     }
 }
 
+/// `n` hashes `{prefix}{start}` … with a TAG `c`, `red` for even numbers and
+/// `blue` for odd, and a 4-dimension vector `v`, pipelined like
+/// [`hset_many`].
+fn hset_tagged_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
+    const BATCH: usize = 250;
+    let mut i = 0;
+    while i < n {
+        let end = (i + BATCH).min(n);
+        let mut buf = Vec::new();
+        for j in start + i..start + end {
+            let key = format!("{prefix}{j}");
+            let tag: &[u8] = if j % 2 == 0 { b"red" } else { b"blue" };
+            let blob = vector(&[j as f32, 1.0, 2.0, 3.0]);
+            let args: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"c", tag, b"v", &blob];
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in start + i..start + end {
+            assert!(matches!(c.read(), V::Int(_)), "HSET");
+        }
+        i = end;
+    }
+}
+
 fn vector(floats: &[f32]) -> Vec<u8> {
     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -2737,6 +2766,117 @@ fn a_query_that_finishes_is_not_reported_as_timed_out() {
     ]);
     assert_eq!(first_row(&reply, "c"), "300", "{reply:?}");
     assert!(!warned(&reply), "{reply:?}");
+}
+
+/// A TAG filter has no candidates of its own: FT.SEARCH's KNN with one, and
+/// FT.AGGREGATE with one, read every document, and the clock is read
+/// between runs of documents rather than before each. They still stop at
+/// `TIMEOUT`, and with `TIMEOUT 0` they are whole. Grown as in
+/// `a_query_is_cut_short_when_it_runs_out_of_time`.
+#[test]
+fn a_tag_filtered_scan_is_cut_short_when_it_runs_out_of_time() {
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tk",
+            "PREFIX",
+            "1",
+            "tk:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .ok()
+    );
+    let q = [0.0f32, 1.0, 2.0, 3.0];
+    let knn = |c: &mut Conn, timeout: &str| -> V {
+        search_with_vector(
+            c,
+            "tk",
+            "(@c:{red})=>[KNN 10 @v $q]",
+            &q,
+            &["NOCONTENT", "TIMEOUT", timeout],
+        )
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 400_000 {
+        hset_tagged_many(&mut c, "tk:", n, 8_000);
+        n += 8_000;
+        if warned(&knn(&mut c, "1")) && warned(&knn(&mut c, "1")) {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+    hset_tagged_many(&mut c, "tk:", n, 4 * n);
+    n *= 5;
+
+    // `TIMEOUT 0`: the ten nearest red documents, 0, 2, … 18, in order.
+    let all = knn(&mut c, "0");
+    assert!(!warned(&all), "{all:?}");
+    let keys: Vec<String> = all
+        .get("results")
+        .arr()
+        .iter()
+        .map(|r| r.get("id").s().to_string())
+        .collect();
+    let nearest: Vec<String> = (0..10).map(|i| format!("tk:{}", 2 * i)).collect();
+    assert_eq!(keys, nearest, "{all:?}");
+
+    let cut = knn(&mut c, "1");
+    assert!(warned(&cut), "{cut:?}");
+
+    let count = |c: &mut Conn, timeout: &str| -> V {
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "tk",
+            "@c:{red}",
+            "TIMEOUT",
+            timeout,
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "n",
+        ])
+    };
+    let all = count(&mut c, "0");
+    assert!(!warned(&all), "{all:?}");
+    assert_eq!(first_row(&all, "n"), (n / 2).to_string(), "{all:?}");
+    let cut = count(&mut c, "1");
+    assert!(warned(&cut), "{cut:?}");
+    assert!(
+        first_row(&cut, "n").parse::<usize>().unwrap() < n / 2,
+        "{cut:?}"
+    );
+
+    // Under `ON_TIMEOUT fail`, an error.
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let search = knn(&mut c, "1");
+    let aggregate = count(&mut c, "1");
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for failed in [search, aggregate] {
+        assert!(
+            failed.err().contains("Timeout limit was reached"),
+            "{failed:?}"
+        );
+    }
 }
 
 /// FT.AGGREGATE's `TIMEOUT` is the option where an option can be, not a word
