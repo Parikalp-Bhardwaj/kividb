@@ -1514,6 +1514,19 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     offset,
                     reply,
                 } => match backlog.after(offset) {
+                    // What follows a replica's position begins a command. If
+                    // it does not, the position is not one in this backlog's
+                    // numbering, and a replica sent it would read nothing of
+                    // it, ever.
+                    Some(missed) if !crate::resp::parse::can_start_command(&missed) => {
+                        log_warn!(
+                            "Replication: Partial resync refused for {}: offset {offset} is not \
+                             where a command begins in this master's stream — sending the dataset",
+                            registration.addr
+                        );
+                        state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(Err(registration));
+                    }
                     Some(missed) => {
                         let progress = state.register_replica(
                             registration.replica_id,
@@ -1623,6 +1636,29 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // Everything queued before this message is in the
                     // dataset the replica was sent; the backlog records what
                     // comes after.
+                    if backlog.valid && backlog.end != base && !channel_replicas.is_empty() {
+                        // The replicas attached count the stream to
+                        // `backlog.end`, the master's offset to `base`: the
+                        // two have come apart, and from here the backlog
+                        // counts as the offset does. A replica continued
+                        // later from a position it counted the old way
+                        // would be sent the stream from somewhere else.
+                        // So they are let go, and the stream gets a new
+                        // id: none of them is continued, each is sent the
+                        // dataset.
+                        log_warn!(
+                            "Replication: The stream's offset is {base} but {} replica(s) were \
+                             sent it to {}; disconnecting them, and starting a new replication \
+                             id so that each resyncs in full",
+                            channel_replicas.len(),
+                            backlog.end
+                        );
+                        for replica in channel_replicas.drain(..) {
+                            forget_replica(&state, replica.id);
+                        }
+                        *state.repl_id.write() = generate_repl_id();
+                        *state.repl_id2.write() = None;
+                    }
                     backlog.align(base);
                     state.backlog_active.store(true, Ordering::Relaxed);
                     // Already done at the cut by `begin_full_sync`; a no-op
