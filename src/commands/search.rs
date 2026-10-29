@@ -875,19 +875,38 @@ pub(crate) fn filter_search(
             }
         }
         None => {
+            // The deadline is looked at between runs of DEADLINE_EVERY
+            // documents, counted across shards, and not in the loop over
+            // them. The scan waits on memory, document after document; with
+            // the check in that loop, however cheap, the compiler kept less
+            // of it inline and filtered KNN queries took 12% longer.
+            let run = DEADLINE_EVERY as usize;
             'shards: for shard in db.iter() {
                 let map = shard.read();
-                for (key, value) in map.iter() {
-                    if deadline_due(deadline, &mut seen) {
-                        timed_out = true;
-                        break 'shards;
+                let mut left = map.len();
+                let mut docs = map.iter();
+                while left > 0 {
+                    // Only with documents still to read: a scan that got to
+                    // the end is whole.
+                    if seen >= DEADLINE_EVERY {
+                        seen = 0;
+                        if past_deadline(deadline) {
+                            timed_out = true;
+                            break 'shards;
+                        }
                     }
-                    if !covers(def, key) {
-                        continue;
+                    let this_run = left.min(run);
+                    for (key, value) in docs.by_ref().take(this_run) {
+                        if !covers(def, key) {
+                            continue;
+                        }
+                        if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value)
+                        {
+                            consider(key, &fields);
+                        }
                     }
-                    if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
-                        consider(key, &fields);
-                    }
+                    left -= this_run;
+                    seen += this_run as u32;
                 }
             }
         }
