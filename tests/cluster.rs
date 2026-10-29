@@ -482,11 +482,14 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
         "replica to learn of its master",
         Duration::from_secs(15),
         || {
+            // The master's id is also in its other replicas' rows, as their
+            // master, so look for the row that starts with it.
             replica
                 .conn()
                 .cmd(&["CLUSTER", "NODES"])
                 .text()
-                .contains(&master_id)
+                .lines()
+                .any(|l| l.starts_with(&master_id))
         },
     );
     let r = replica.conn().cmd(&["CLUSTER", "REPLICATE", &master_id]);
@@ -1553,6 +1556,222 @@ fn the_replica_that_read_further_wins_the_election() {
     for k in &keys {
         assert_eq!(a.conn().cmd(&["GET", k]).text(), "v", "{k}");
     }
+}
+
+/// Eight masters with two replicas each: once settled, heartbeats open no new
+/// bus connections. When a master dies, one of its replicas takes over with
+/// the highest config epoch, the other follows it, and the old master rejoins
+/// as a replica.
+#[test]
+#[ignore = "starts 24 nodes"]
+fn a_24_node_cluster_fails_over_and_the_old_master_rejoins() {
+    const MASTERS: usize = 8;
+    const REPLICAS_PER_MASTER: usize = 2;
+    const VICTIM: usize = 3;
+    const NODES: usize = MASTERS * (1 + REPLICAS_PER_MASTER);
+    let (mut masters, mut ranges) = form_cluster(MASTERS);
+    let mut replicas = Vec::new();
+    for master in &masters {
+        for _ in 0..REPLICAS_PER_MASTER {
+            replicas.push(add_replica(&masters, master));
+        }
+    }
+    let nodes_of = |n: &Node| n.conn().cmd(&["CLUSTER", "NODES"]).text();
+    fn row<'a>(nodes: &'a str, id: &str) -> Option<Vec<&'a str>> {
+        nodes
+            .lines()
+            .find(|l| l.starts_with(id))
+            .map(|l| l.split(' ').collect())
+    }
+    let epoch = |n: &Node| -> u64 { n.my_row()[6].parse().unwrap() };
+    {
+        let all: Vec<&Node> = masters.iter().chain(&replicas).collect();
+        wait_cluster_ok(&all, NODES);
+        let pairs: Vec<(String, String)> = replicas
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id(), masters[i / REPLICAS_PER_MASTER].id()))
+            .collect();
+        wait_until(
+            "every node to agree on who replicates whom",
+            Duration::from_secs(30),
+            || {
+                all.iter().all(|n| {
+                    let nodes = nodes_of(n);
+                    pairs.iter().all(|(replica, master)| {
+                        row(&nodes, replica)
+                            .is_some_and(|r| r[2].contains("slave") && r[3] == master)
+                    })
+                })
+            },
+        );
+        wait_until(
+            "the masters to have distinct config epochs",
+            Duration::from_secs(15),
+            || {
+                let mut epochs: Vec<u64> = masters.iter().map(epoch).collect();
+                epochs.sort_unstable();
+                epochs.dedup();
+                epochs.len() == MASTERS
+            },
+        );
+
+        // Measured before the failover, which rightly redials the dead node.
+        let total = |f: &str| -> u64 {
+            all.iter()
+                .map(|n| n.cluster_info(f).parse::<u64>().unwrap_or(0))
+                .sum()
+        };
+        // Let every link come up.
+        std::thread::sleep(Duration::from_secs(2));
+        let (connects, sent) = (
+            total("cluster_stats_bus_connects"),
+            total("cluster_stats_messages_sent"),
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        let new_connects = total("cluster_stats_bus_connects") - connects;
+        let new_messages = total("cluster_stats_messages_sent") - sent;
+        assert!(
+            new_messages >= (NODES * (NODES - 1)) as u64,
+            "{new_messages} messages sent in 5 s"
+        );
+        assert!(
+            new_connects <= 2,
+            "{new_connects} connections opened in 5 s"
+        );
+    }
+
+    let (start, end) = ranges.remove(VICTIM);
+    let keys: Vec<String> = (0..100)
+        .map(|i| key_in(start..=end, &format!("big{i}")))
+        .collect();
+    let mut writer = masters[VICTIM].conn();
+    for k in &keys {
+        assert!(writer.cmd(&["SET", k, "v"]).is_ok());
+    }
+    let wait = REPLICAS_PER_MASTER.to_string();
+    assert_eq!(
+        writer.cmd(&["WAIT", &wait, "5000"]).int(),
+        REPLICAS_PER_MASTER as i64
+    );
+    let its_replicas = VICTIM * REPLICAS_PER_MASTER..(VICTIM + 1) * REPLICAS_PER_MASTER;
+    for replica in &replicas[its_replicas.clone()] {
+        let mut c = replica.conn();
+        assert!(c.cmd(&["READONLY"]).is_ok());
+        for k in &keys {
+            assert_eq!(c.cmd(&["GET", k]).text(), "v", "{k}");
+        }
+    }
+
+    let mut victim = masters.remove(VICTIM);
+    let pair: Vec<Node> = replicas.drain(its_replicas).collect();
+    let elsewhere: Vec<String> = ranges.iter().map(|r| key_in(r.0..=r.1, "kept")).collect();
+    for (m, k) in masters.iter().zip(&elsewhere) {
+        assert!(m.conn().cmd(&["SET", k, "v"]).is_ok());
+    }
+    let victim_id = victim.id();
+    let survivors: Vec<&Node> = masters.iter().chain(&replicas).chain(&pair).collect();
+
+    victim.kill();
+    let killed = Instant::now();
+    wait_until(
+        "every survivor to mark the master FAIL",
+        Duration::from_secs(30),
+        || {
+            survivors.iter().all(|n| {
+                row(&nodes_of(n), &victim_id).is_some_and(|r| r[2].split(',').any(|f| f == "fail"))
+            })
+        },
+    );
+    let detected = killed.elapsed();
+    wait_until("a replica to be promoted", Duration::from_secs(30), || {
+        pair.iter().any(Node::is_master)
+    });
+    let promoted = killed.elapsed();
+    let (winner, other) = if pair[0].is_master() {
+        (&pair[0], &pair[1])
+    } else {
+        (&pair[1], &pair[0])
+    };
+    let moved = format!("MOVED {} 127.0.0.1:{}", slot_of(&keys[0]), winner.port);
+    wait_until(
+        "every survivor to be up and send the slot to the new master",
+        Duration::from_secs(30),
+        || {
+            survivors.iter().all(|n| {
+                n.cluster_info("cluster_state") == "ok"
+                    && (n.port == winner.port
+                        || n.conn().cmd(&["GET", &keys[0]]).err() == Some(moved.as_str()))
+            })
+        },
+    );
+    let recovered = killed.elapsed();
+    eprintln!(
+        "24 nodes: FAIL everywhere after {detected:?}, replica promoted after {promoted:?}, \
+         cluster up after {recovered:?}"
+    );
+
+    assert!(!other.is_master(), "only one replica is promoted");
+    let won_at = epoch(winner);
+    for m in &masters {
+        let at = epoch(m);
+        assert!(
+            at < won_at,
+            "{} is at config epoch {at}, the new master at {won_at}",
+            m.port
+        );
+    }
+    assert_eq!(winner.my_row()[8..], [format!("{start}-{end}")]);
+    for k in &keys {
+        assert_eq!(winner.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+    for (m, k) in masters.iter().zip(&elsewhere) {
+        assert_eq!(m.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+    assert!(winner.conn().cmd(&["SET", &keys[0], "after"]).is_ok());
+
+    wait_until(
+        "the other replica to follow the new master",
+        Duration::from_secs(40),
+        || {
+            other.repl_info("master_link_status").as_deref() == Some("up")
+                && other.my_row()[3] == winner.id()
+        },
+    );
+    wait_until(
+        "the write after the failover to reach the other replica",
+        Duration::from_secs(10),
+        || {
+            let mut c = other.conn();
+            c.cmd(&["READONLY"]);
+            c.cmd(&["GET", &keys[0]]).text() == "after"
+        },
+    );
+
+    victim.spawn();
+    wait_until(
+        "the old master to rejoin as a replica of the new one",
+        Duration::from_secs(40),
+        || {
+            !victim.is_master()
+                && victim.repl_info("master_link_status").as_deref() == Some("up")
+                && victim.my_row()[3] == winner.id()
+        },
+    );
+    wait_until(
+        "FAIL to be cleared everywhere",
+        Duration::from_secs(20),
+        || {
+            survivors
+                .iter()
+                .all(|n| row(&nodes_of(n), &victim_id).is_some_and(|r| !r[2].contains("fail")))
+        },
+    );
+    let mut c = victim.conn();
+    assert!(c.cmd(&["READONLY"]).is_ok());
+    assert_eq!(c.cmd(&["GET", &keys[0]]).text(), "after");
+    let all: Vec<&Node> = survivors.into_iter().chain([&victim]).collect();
+    wait_cluster_ok(&all, NODES);
 }
 
 /// `CLUSTER FAILOVER` on a replica of a healthy master swaps the two, and no
