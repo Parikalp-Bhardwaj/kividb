@@ -769,6 +769,195 @@ fn writes_over_tls_with_the_aof_on_are_answered_at_once() {
     }
 }
 
+/// A plaintext PING on `port`, with a fresh connection: the reply, or what
+/// went wrong. A connection that is accepted and never answered gives
+/// "accepted, and hangs".
+#[cfg(target_os = "linux")]
+fn plain_ping(port: u16) -> Result<String, String> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("connect: {e} ({:?})", e.kind()))?;
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    conn.write_all(b"*1\r\n$4\r\nPING\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    let mut reply = [0u8; 7];
+    match conn.read(&mut reply) {
+        Ok(0) => Err("closed without a reply".into()),
+        Ok(n) => Ok(String::from_utf8_lossy(&reply[..n]).trim_end().to_string()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err("accepted, and hangs".into())
+        }
+        Err(e) => Err(format!("read: {e}")),
+    }
+}
+
+/// That `port`, closed by a `CONFIG SET` that has just answered, refuses
+/// connections: the very first one. The port is shut before the reply.
+#[cfg(target_os = "linux")]
+fn refused(port: u16, what: &str) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{what}: port {port}: {e}"
+        ),
+        Ok(conn) => {
+            drop(conn);
+            panic!(
+                "{what}: port {port} is still open: a PING on it: {:?}",
+                plain_ping(port)
+            );
+        }
+    }
+}
+
+/// `CONFIG SET port` closes the plaintext port with 0 and opens it, on a
+/// new port or the old one, again and again, with both I/O models, and
+/// `tls-port` moves and closes the TLS port in between. A closed port
+/// refuses connections at once; an open one serves them; connections made
+/// before stay up through all of it.
+///
+/// It starts the binary: the in-process servers of the tests above run the
+/// tokio model only. On io_uring, the default on Linux, 1.2.0-rc2 could not
+/// open a plaintext port with `CONFIG SET port` ("Address already in use",
+/// on any port), and after `CONFIG SET port 0` its sockets went on
+/// listening, and the connections they took were never answered.
+///
+/// Linux only: io_uring is Linux only, and the tests above cover the tokio
+/// model everywhere. On Windows a server process started here also kept
+/// the ports of those tests' in-process servers open after they were
+/// closed, for as long as it ran (`config_set_port_0_without_tls_is_refused`
+/// failed in eight of twelve runs).
+#[cfg(target_os = "linux")]
+#[test]
+fn config_set_port_closes_and_opens_it_on_both_io_models() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let bin = std::env::var("CARGO_BIN_EXE_kividb").expect("built with the kividb binary");
+    let certs = generate_certs();
+    for io_model in ["uring", "tokio"] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let _server = Killed(
+            std::process::Command::new(&bin)
+                .args([
+                    "--port",
+                    &plain.to_string(),
+                    "--bind",
+                    "127.0.0.1",
+                    "--dir",
+                    dir.path().to_str().unwrap(),
+                    // Fails to start where io_uring is not to be had,
+                    // rather than falling back to tokio.
+                    "--io-model",
+                    io_model,
+                    // Several io_uring workers, each with a socket on the
+                    // port, as on any machine with more than one core.
+                    "--threads",
+                    "4",
+                    "--tls-port",
+                    &tls.to_string(),
+                    "--tls-cert-file",
+                    certs.cert_path.to_str().unwrap(),
+                    "--tls-key-file",
+                    certs.key_path.to_str().unwrap(),
+                ])
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+        let mut over_tls = make_tls_client(tls, &certs.cert_der);
+        let info = cmd_on(&mut over_tls, &["INFO", "server"]);
+        assert_eq!(
+            info.contains("multiplexing_api:io_uring"),
+            io_model == "uring",
+            "{io_model}: {info}"
+        );
+        let mut kept = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+        kept.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(plain_ping(plain), Ok("+PONG".into()), "{io_model}");
+
+        let (n, m) = (free_port(), free_port());
+        let mut current = plain;
+        for port in [0, n, 0, m, 0, plain] {
+            let what = format!("{io_model}: CONFIG SET port {port}");
+            assert_eq!(
+                cmd_on(&mut over_tls, &["CONFIG", "SET", "port", &port.to_string()]),
+                "OK",
+                "{what}"
+            );
+            if port == 0 {
+                refused(current, &what);
+            } else {
+                assert_eq!(plain_ping(port), Ok("+PONG".into()), "{what}");
+                if current != 0 {
+                    refused(current, &what);
+                }
+            }
+            current = port;
+            assert_eq!(
+                cmd_on(&mut over_tls, &["CONFIG", "GET", "port"]),
+                format!("port {port}"),
+                "{what}"
+            );
+            assert_eq!(cmd_on(&mut over_tls, &["PING"]), "PONG", "{what}");
+            assert!(handshake_ok(tls, &certs.cert_der), "{what}: TLS");
+            assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG", "{what}");
+        }
+
+        // The TLS port, moved and closed and opened again, with the
+        // plaintext port open.
+        let moved = free_port();
+        let what = format!("{io_model}: CONFIG SET tls-port");
+        let mut on_plain = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+        on_plain
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(
+            cmd_on(
+                &mut on_plain,
+                &["CONFIG", "SET", "tls-port", &moved.to_string()]
+            ),
+            "OK",
+            "{what}"
+        );
+        assert!(handshake_ok(moved, &certs.cert_der), "{what}");
+        refused(tls, &what);
+        assert_eq!(
+            cmd_on(&mut on_plain, &["CONFIG", "SET", "tls-port", "0"]),
+            "OK",
+            "{what}"
+        );
+        refused(moved, &what);
+        assert_eq!(
+            cmd_on(
+                &mut on_plain,
+                &["CONFIG", "SET", "tls-port", &tls.to_string()]
+            ),
+            "OK",
+            "{what}"
+        );
+        assert!(handshake_ok(tls, &certs.cert_der), "{what}");
+        assert_eq!(cmd_on(&mut over_tls, &["PING"]), "PONG", "{what}");
+        assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG", "{what}");
+    }
+}
+
 /// SET and GET over TLS produce the expected value.
 #[test]
 fn test_tls_set_get() {

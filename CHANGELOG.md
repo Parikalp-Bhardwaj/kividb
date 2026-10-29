@@ -241,6 +241,21 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **On io_uring, `CONFIG SET port` opens the plaintext port, and `port 0`
+  closes it.** On the io_uring I/O model, the default on Linux, `CONFIG SET
+  port` was refused with `Unable to listen on this port: Address already in
+  use` for any port, also one nothing had used, and on a server started with
+  `--port 0`: the check that the port is free was made again before each
+  worker's socket, and the first of them made the port look taken. And
+  `CONFIG SET port 0` answered OK but left the sockets listening: each went
+  only when a connection woke its accept, and that connection was accepted
+  and never answered. Now the port is opened with a socket for each worker,
+  set as at startup, before the reply; `port 0`, or a move, shuts the old
+  sockets down before the reply, so a connection that comes after it is
+  refused, and one accepted just before is served. Connections already open
+  stay up. The tokio I/O model was not affected, nor was `tls-port`. Moving
+  the port on io_uring has failed this way since it came in 1.1.1; `port 0`
+  is new in 1.2.0. Reported by KiviDB Cloud.
 - **A replica no longer stops receiving writes after a partial resync to a
   promoted master, while both sides report it healthy.** A replica that is
   promoted (`CLUSTER FAILOVER`, `REPLICAOF NO ONE`) while clients write to
