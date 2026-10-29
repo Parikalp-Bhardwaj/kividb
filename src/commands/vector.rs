@@ -463,78 +463,66 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // In a cluster, only the keys of the slots this node serves: see
     // `cluster::search`.
     let cluster = ctx.cluster.enabled.then_some(ctx.cluster);
-    let mut timed_out = false;
-    let mut seen = 0u32;
+    // The deadline is kept between runs of documents: see `scan_docs`.
+    let timed_out_scan = crate::commands::search::scan_docs(db_ref, deadline, |key, value| {
+        // ── Prefix check ─────────────────────────────────────────────
+        let matches =
+            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
+        if !matches {
+            return;
+        }
+        if cluster.is_some_and(|c| !crate::cluster::search::serves(c, key)) {
+            return;
+        }
 
-    'shards: for shard in db_ref.iter() {
-        #[cfg(target_os = "linux")]
-        let map = shard.read();
-        #[cfg(not(target_os = "linux"))]
-        let map = shard.read();
+        let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+            return;
+        };
+        let json = matches!(def.on, crate::vector::IndexOn::Json);
 
-        for (key, value) in map.iter() {
-            if crate::commands::search::deadline_due(deadline, &mut seen) {
-                timed_out = true;
-                break 'shards;
-            }
-            // ── Prefix check ─────────────────────────────────────────────
-            let matches =
-                def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-            if !matches {
-                continue;
-            }
-            if cluster.is_some_and(|c| !crate::cluster::search::serves(c, key)) {
-                continue;
-            }
+        // ── Filter check ──────────────────────────────────────────────
+        // Evaluate the filter against the raw hash fields BEFORE converting
+        // to strings. This is the correct order: filter is cheap (byte
+        // comparisons on Arc<[u8]>), string conversion is not free.
+        // For MatchAll, eval() returns true immediately — no overhead.
+        if !crate::vector::filter::eval(&filter, &*inner) {
+            return;
+        }
 
-            let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+        // ── Build row ─────────────────────────────────────────────────
+        // Only rows that passed the filter reach here.
+        let mut row: Row = ahash::AHashMap::new();
+
+        // Always include the key itself as a special field.
+        // Prefixed with __ so it doesn't collide with user field names.
+        row.insert("__key".to_string(), key.to_string());
+        if addscores {
+            row.insert(
+                "__score".to_string(),
+                crate::commands::search::number_text(crate::commands::search::relevance(
+                    &def, &inner, &terms,
+                )),
+            );
+        }
+
+        for (field, val) in inner.iter() {
+            // Text only: a vector's bytes are not a value a row can show
+            // or a pipeline can compute with.
+            let Ok(s) = std::str::from_utf8(val) else {
                 continue;
             };
-            let json = matches!(def.on, crate::vector::IndexOn::Json);
-
-            // ── Filter check ──────────────────────────────────────────────
-            // Evaluate the filter against the raw hash fields BEFORE converting
-            // to strings. This is the correct order: filter is cheap (byte
-            // comparisons on Arc<[u8]>), string conversion is not free.
-            // For MatchAll, eval() returns true immediately — no overhead.
-            if !crate::vector::filter::eval(&filter, &*inner) {
-                continue;
-            }
-
-            // ── Build row ─────────────────────────────────────────────────
-            // Only rows that passed the filter reach here.
-            let mut row: Row = ahash::AHashMap::new();
-
-            // Always include the key itself as a special field.
-            // Prefixed with __ so it doesn't collide with user field names.
-            row.insert("__key".to_string(), key.to_string());
-            if addscores {
-                row.insert(
-                    "__score".to_string(),
-                    crate::commands::search::number_text(crate::commands::search::relevance(
-                        &def, &inner, &terms,
-                    )),
-                );
-            }
-
-            for (field, val) in inner.iter() {
-                // Text only: a vector's bytes are not a value a row can show
-                // or a pipeline can compute with.
-                let Ok(s) = std::str::from_utf8(val) else {
-                    continue;
-                };
-                // A field of a JSON document goes by the name the schema
-                // gives its path.
-                let shown = match def.fields.iter().find(|f| json && &f.name == field) {
-                    Some(f) => f.attribute().to_string(),
-                    None => field.clone(),
-                };
-                row.insert(shown, s.to_string());
-            }
-
-            rows.push(row);
+            // A field of a JSON document goes by the name the schema
+            // gives its path.
+            let shown = match def.fields.iter().find(|f| json && &f.name == field) {
+                Some(f) => f.attribute().to_string(),
+                None => field.clone(),
+            };
+            row.insert(shown, s.to_string());
         }
-    }
+
+        rows.push(row);
+    });
+    let mut timed_out = timed_out_scan;
 
     // ── A KNN clause: the nearest `k` of what the filter left ────────────────
     //

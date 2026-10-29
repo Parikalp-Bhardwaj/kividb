@@ -672,6 +672,44 @@ pub(crate) fn deadline_due(deadline: Option<Instant>, seen: &mut u32) -> bool {
     past_deadline(deadline)
 }
 
+/// Every document of `db` into `each`, shard by shard, until `deadline` has
+/// passed: then true. The clock is read between runs of [`DEADLINE_EVERY`]
+/// documents, counted across shards, and only while documents are left to
+/// read: a scan that got to the end is whole, however long it took.
+///
+/// Not in the loop over the documents of a run: the scan waits on memory,
+/// document after document, and with a check in that loop, however cheap,
+/// the compiler kept less of the per-document work inline. Filtered KNN
+/// queries took 12% longer that way.
+pub(crate) fn scan_docs(
+    db: &Db,
+    deadline: Option<Instant>,
+    mut each: impl FnMut(&str, ValueRef<'_>),
+) -> bool {
+    let run = DEADLINE_EVERY as usize;
+    let mut seen = 0usize;
+    for shard in db.iter() {
+        let map = shard.read();
+        let mut left = map.len();
+        let mut docs = map.iter();
+        while left > 0 {
+            if seen >= run {
+                seen = 0;
+                if past_deadline(deadline) {
+                    return true;
+                }
+            }
+            let this_run = left.min(run);
+            for (key, value) in docs.by_ref().take(this_run) {
+                each(key, value);
+            }
+            left -= this_run;
+            seen += this_run;
+        }
+    }
+    false
+}
+
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
 /// be left out because the deadline has passed. Fewer than
 /// [`DEADLINE_EVERY`] items cost less than reading the clock, and always
@@ -841,7 +879,6 @@ pub(crate) fn filter_search(
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
     let mut timed_out = false;
-    let mut seen = 0u32;
 
     let mut consider = |key: &str, fields: &Fields| {
         if !filter::eval(filter, fields) {
@@ -863,6 +900,7 @@ pub(crate) fn filter_search(
     };
     match known {
         Some(keys) => {
+            let mut seen = 0u32;
             for key in &keys {
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
@@ -875,40 +913,14 @@ pub(crate) fn filter_search(
             }
         }
         None => {
-            // The deadline is looked at between runs of DEADLINE_EVERY
-            // documents, counted across shards, and not in the loop over
-            // them. The scan waits on memory, document after document; with
-            // the check in that loop, however cheap, the compiler kept less
-            // of it inline and filtered KNN queries took 12% longer.
-            let run = DEADLINE_EVERY as usize;
-            'shards: for shard in db.iter() {
-                let map = shard.read();
-                let mut left = map.len();
-                let mut docs = map.iter();
-                while left > 0 {
-                    // Only with documents still to read: a scan that got to
-                    // the end is whole.
-                    if seen >= DEADLINE_EVERY {
-                        seen = 0;
-                        if past_deadline(deadline) {
-                            timed_out = true;
-                            break 'shards;
-                        }
-                    }
-                    let this_run = left.min(run);
-                    for (key, value) in docs.by_ref().take(this_run) {
-                        if !covers(def, key) {
-                            continue;
-                        }
-                        if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value)
-                        {
-                            consider(key, &fields);
-                        }
-                    }
-                    left -= this_run;
-                    seen += this_run as u32;
+            timed_out = scan_docs(db, deadline, |key, value| {
+                if !covers(def, key) {
+                    return;
                 }
-            }
+                if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
+                    consider(key, &fields);
+                }
+            });
         }
     }
     // A scan that reached the end is whole, however long it took: only one
