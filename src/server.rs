@@ -2,8 +2,6 @@ use crate::commands;
 use crate::pubsub::PubSubHub;
 use crate::resp;
 use crate::store;
-use crate::store::Key;
-use crate::types::SharedBytes;
 use crate::vector;
 use crate::watch::WatchNotifier;
 use commands::ctx::Ctx;
@@ -1411,12 +1409,7 @@ where
                                     if let Some((_, guard)) =
                                         guards.iter_mut().find(|(p, _)| *p == ptr)
                                     {
-                                        guard.insert(
-                                            Key::from(key),
-                                            crate::types::KiviDBValue::String(SharedBytes::from(
-                                                value.as_slice(),
-                                            )),
-                                        );
+                                        guard.insert_str(key, value);
                                     }
                                     // Notify while STILL HOLDING this key's shard lock. Doing this
                                     // after `drop(guards)` below would reopen the exact race this

@@ -279,7 +279,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Made before the shard is locked, for the same reason the old
             // value is dropped after: allocating and copying are not the
             // shard's to wait for. A condition that fails wastes it.
-            let value = KiviDBValue::String(SharedBytes::from(cmd[2]));
+            let value = store::NewEntry::string(key, cmd[2]);
             let mut map = write_lock!(shard);
 
             // Looked up once; what follows asks this, not the map again.
@@ -396,7 +396,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // We insert directly here (already holding the write lock) rather than
             // calling store_value so we don't re-acquire the shard lock.
             // An overwrite keeps the key it has: no new string for it.
-            let replaced = map.insert(key, value);
+            let replaced = map.insert_entry(value);
             drop(map); // ← release write lock BEFORE touching expiry_store
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
@@ -650,10 +650,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
 
-            // INCR must read then write so the lock scope is unavoidable
-            // but we can at least avoid the intermediate to_string().as_bytes() chain
-            let new_val = KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes()));
-            map.insert(Key::from(&*key), new_val);
+            // INCR must read then write so the lock scope is unavoidable.
+            map.insert_str(&*key, next.to_string());
             drop(map); // explicitly drop lock before AOF
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
@@ -750,7 +748,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            match map.remove(key) {
+            match map.remove(key).map(store::Taken::into_value) {
                 Some(KiviDBValue::String(v)) => {
                     drop(map);
                     // also clear expiry
@@ -791,7 +789,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let old = map.insert(Key::from(key), new_val);
+            let old = map.insert(key, new_val).map(store::Taken::into_value);
             drop(map);
             // clear any existing TTL — GETSET always persists the key
             let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
@@ -837,10 +835,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if map.contains_key(key) {
                 return Some(resp_integer(0));
             }
-            map.insert(
-                Key::from(key),
-                KiviDBValue::String(SharedBytes::from(cmd[2])),
-            );
+            map.insert_str(key, cmd[2]);
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             Some(resp_integer(1))
@@ -895,10 +890,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // some of the keys set and the others not yet.
                 let mut shards = WriteShards::lock(&ctx.store[db], pairs.iter().map(|p| p.0));
                 for (key, value) in &pairs {
-                    shards.map(key).insert(
-                        Key::from(*key),
-                        KiviDBValue::String(SharedBytes::from(*value)),
-                    );
+                    shards.map(key).insert_str(*key, *value);
                     forget_expiry(ctx.expiry_store, db, key);
                 }
             }
@@ -985,10 +977,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 }
                 for (key, value) in &pairs {
-                    shards.map(key).insert(
-                        Key::from(*key),
-                        KiviDBValue::String(SharedBytes::from(*value)),
-                    );
+                    shards.map(key).insert_str(*key, *value);
                     forget_expiry(ctx.expiry_store, db, key);
                 }
             }
@@ -1038,10 +1027,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert(
-                Key::from(&*key),
-                KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes())),
-            );
+            map.insert_str(&*key, next.to_string().as_bytes());
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
@@ -1082,10 +1068,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert(
-                Key::from(&*key),
-                KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes())),
-            );
+            map.insert_str(&*key, next.to_string().as_bytes());
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
@@ -1128,10 +1111,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert(
-                Key::from(&*key),
-                KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes())),
-            );
+            map.insert_str(&*key, next.to_string().as_bytes());
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
@@ -1177,10 +1157,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             // Redis trims trailing zeros. format!("{}", f) already does this in Rust for many cases.
             let s = format!("{}", next);
-            map.insert(
-                Key::from(&*key),
-                KiviDBValue::String(SharedBytes::from(s.as_bytes())),
-            );
+            map.insert_str(&*key, s.as_bytes());
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrbyfloat", &key);
             Some(resp_bulk_str(&s))
@@ -1318,10 +1295,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             buf[offset..offset + patch.len()].copy_from_slice(patch);
             let new_len = buf.len() as i64;
-            map.insert(
-                Key::from(key),
-                KiviDBValue::String(SharedBytes::from(buf.as_slice())),
-            );
+            map.insert_str(key, buf.as_slice());
             drop(map);
             Some(resp_integer(new_len))
         }
@@ -2345,10 +2319,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         return reply;
     }
 
-    map.insert(
-        Key::from(&*key),
-        KiviDBValue::String(SharedBytes::from(new_repr.as_bytes())),
-    );
+    map.insert_str(&*key, new_repr.as_bytes());
     drop(map); // release the value lock before touching expiry_store
 
     // Propagated as a SET of the result, so float formatting cannot drift on

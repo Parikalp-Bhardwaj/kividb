@@ -3,7 +3,6 @@
 use crate::commands::*;
 use crate::replication;
 use crate::resp::write::{resp_array, resp_error, resp_integer, resp_null_bulk};
-use crate::store::ValueRef;
 use ctx::Ctx;
 use std::sync::atomic::Ordering;
 
@@ -129,7 +128,10 @@ pub(crate) fn dispatch_command_handlers(ctx: &mut Ctx, name: &str) -> Option<Vec
 /// The values a command may replace whole (Redis's `setKey`), taken before
 /// it runs, to announce `overwritten` and `type_changed` for those it did.
 struct ReplaceWatch {
-    before: Vec<(usize, usize, crate::types::KiviDBValue)>,
+    /// A hold on each key's entry as it was: an entry is never changed
+    /// while held, so the key's value is the same one exactly when the key
+    /// still has this entry.
+    before: Vec<(usize, usize, crate::store::EntryRef)>,
     /// The command's own events are held back, so that these go first.
     holding: bool,
 }
@@ -142,10 +144,9 @@ fn replace_watch_begin(ctx: &Ctx, name: &str) -> Option<ReplaceWatch> {
         .filter_map(|(db, pos)| {
             let db = db.unwrap_or(*ctx.selected_db);
             let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
-            let value = crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key))
-                .get(key)?
-                .to_value();
-            Some((db, pos, value))
+            let held =
+                crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key)).get_ref(key)?;
+            Some((db, pos, held))
         })
         .collect();
     if before.is_empty() {
@@ -170,12 +171,17 @@ fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
         let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
             continue;
         };
-        let now = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key))
-            .get(key)
-            .map(ValueRef::to_value);
-        if let Some(now) = now
-            && !now.same_value(&old)
-        {
+        // Whether the key has another value now, and whether of another type.
+        let replaced = {
+            let map = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key));
+            match map.get(key) {
+                Some(now) if !map.holds(key, &old) => {
+                    Some(now.type_name() != old.value().type_name())
+                }
+                _ => None,
+            }
+        };
+        if let Some(type_changed) = replaced {
             crate::keyspace_events::notify(
                 ctx.pubsub,
                 db,
@@ -183,7 +189,7 @@ fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
                 "overwritten",
                 key,
             );
-            if now.type_name() != old.type_name() {
+            if type_changed {
                 crate::keyspace_events::notify(
                     ctx.pubsub,
                     db,

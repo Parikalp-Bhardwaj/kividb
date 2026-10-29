@@ -352,7 +352,9 @@ fn allkeys_lru_makes_room_by_deleting_what_was_used_longest_ago() {
             V::Str("allkeys-lru".into())
         ])
     );
-    let limit = c.limit_to(6 * MB);
+    // Room for about 4,800 of the 6,200 keys written below, at about 1,080
+    // bytes a key (a key and its 1,000-byte value are one block of 1,024).
+    let limit = c.limit_to(5 * MB);
     let value = value();
 
     for i in 0..3000 {

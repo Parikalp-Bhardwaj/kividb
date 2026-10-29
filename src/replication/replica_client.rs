@@ -2179,7 +2179,6 @@ mod slave_upstream_guard_tests {
 mod full_sync_guard_tests {
     use super::{full_sync_refusal, load_full_sync_payload};
     use crate::replication::FullSyncGuard;
-    use crate::types::KiviDBValue;
 
     #[test]
     fn an_empty_master_is_refused_when_the_replica_holds_data() {
@@ -2249,10 +2248,9 @@ mod full_sync_guard_tests {
         let store = crate::store::new_store(2);
         let expiry = crate::store::new_expiry_store(2);
         for (db, key) in [(0usize, "a"), (0, "b"), (1, "c")] {
-            crate::store::get_shard(&store[db], key).write().insert(
-                key,
-                KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
-            );
+            crate::store::get_shard(&store[db], key)
+                .write()
+                .insert_str(key, &b"v"[..]);
         }
         let in_an_hour = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
         crate::store::get_expiry_shard(&expiry[0], "a")
@@ -2286,10 +2284,9 @@ mod full_sync_guard_tests {
         let store = crate::store::new_store(1);
         let expiry = crate::store::new_expiry_store(1);
         for key in ["live", "dead"] {
-            crate::store::get_shard(&store[0], key).write().insert(
-                key,
-                KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
-            );
+            crate::store::get_shard(&store[0], key)
+                .write()
+                .insert_str(key, &b"v"[..]);
         }
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
         crate::store::get_expiry_shard(&expiry[0], "dead")

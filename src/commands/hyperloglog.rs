@@ -2,10 +2,7 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
-use crate::types::KiviDBValue;
-use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
 
 // ── HyperLogLog constants ─────────────────────────────────────────────────────
@@ -261,10 +258,7 @@ fn save_hll(ctx: &mut Ctx, key: &str, blob: Vec<u8>) {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
-    map.insert(
-        Key::from(key_owned),
-        KiviDBValue::String(SharedBytes::from(blob.as_slice())),
-    );
+    map.insert_str(key_owned, blob.as_slice());
 }
 
 // Like get_or_create_hll but returns an error if the key doesn't exist,
@@ -383,10 +377,14 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         // their own cache, and the dataset digest leaves it out.
         let (counted_bytes, count) = counted;
         let mut map = write_lock!(shard);
-        if matches!(map.get(key), Some(ValueRef::String(now)) if now.is(&counted_bytes)) {
+        // The same bytes as were counted (a string kept in its key's entry
+        // has no identity of its own to compare): the count is theirs.
+        if matches!(map.get(key), Some(ValueRef::String(now))
+            if now.is(&counted_bytes) || now.as_bytes() == counted_bytes.as_slice())
+        {
             let mut blob = counted_bytes.to_vec();
             blob[8..16].copy_from_slice(&count.to_le_bytes());
-            map.insert(key, KiviDBValue::String(SharedBytes::from(blob.as_slice())));
+            map.insert_str(key, blob.as_slice());
         }
         return resp_integer(count as i64);
     }

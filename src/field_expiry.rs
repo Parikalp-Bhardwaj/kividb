@@ -287,10 +287,7 @@ mod tests {
         put("replaced", hash_with(&[("a", soon)]));
         crate::store::get_shard(&store[0], "replaced")
             .write()
-            .insert(
-                "replaced",
-                KiviDBValue::String(crate::types::SharedBytes::from(&b"x"[..])),
-            );
+            .insert_str("replaced", &b"x"[..]);
         std::thread::sleep(Duration::from_millis(60));
         sweep(&store, &expiry_store, &index_store);
         assert_eq!(watched_in(&store), 1);

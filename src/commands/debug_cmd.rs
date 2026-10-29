@@ -58,7 +58,6 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// there already is left as it is. It replied `OK` and made nothing, so a
 /// tool or test that loads data this way believed it had (#173).
 fn populate(ctx: &mut Ctx) -> Vec<u8> {
-    use crate::types::{KiviDBValue, SharedBytes};
     let cmd = &ctx.cmd;
     if !(3..=5).contains(&cmd.len()) {
         return resp_error("ERR wrong number of arguments for 'debug|populate' command");
@@ -92,10 +91,7 @@ fn populate(ctx: &mut Ctx) -> Vec<u8> {
         let shard = crate::store::get_shard(db, &key);
         let mut map = crate::write_lock!(shard);
         if !map.contains_key(key.as_str()) {
-            map.insert(
-                crate::store::Key::from(key.as_str()),
-                KiviDBValue::String(SharedBytes::from(&value[..])),
-            );
+            map.insert_str(key.as_str(), &value[..]);
         }
     }
     resp_simple("OK")

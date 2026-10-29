@@ -417,7 +417,7 @@ fn expire_batch(
     let values_db = &store[db];
     let same_shards = values_db.len() == expiry_store[db].len();
     let mut gone: Vec<&Key> = Vec::with_capacity(due.len());
-    let mut freed: Vec<KiviDBValue> = Vec::with_capacity(due.len());
+    let mut freed: Vec<store::Taken> = Vec::with_capacity(due.len());
     if same_shards {
         let mut values = write_lock!(values_db[shard]);
         for key in due {
@@ -692,7 +692,7 @@ pub fn take_key(
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key);
     clear_expiry(expiry_store, db, key);
-    removed
+    removed.map(store::Taken::into_value)
 }
 
 /// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired` check (lazy TTL).
