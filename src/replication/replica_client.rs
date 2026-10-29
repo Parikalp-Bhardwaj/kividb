@@ -1987,7 +1987,6 @@ where
 mod repl_apply_env_tests {
     use super::ReplicationApplyEnv;
     use crate::replication::ReplState;
-    use crate::types::KiviDBValue;
 
     #[tokio::test]
     async fn replication_apply_env_reuses_scaffold_for_many_writes() {
@@ -2062,21 +2061,10 @@ mod repl_apply_env_tests {
         .unwrap();
 
         let shard = crate::store::get_shard(&store[0], "rk0");
-        #[cfg(not(target_os = "linux"))]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(KiviDBValue::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(KiviDBValue::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
+        let map = shard.read();
+        match map.get("rk0") {
+            Some(crate::store::ValueRef::String(b)) => assert_eq!(&b[..], b"v"),
+            _ => panic!("unexpected value variant for rk0"),
         }
     }
 }
@@ -2262,7 +2250,7 @@ mod full_sync_guard_tests {
         let expiry = crate::store::new_expiry_store(2);
         for (db, key) in [(0usize, "a"), (0, "b"), (1, "c")] {
             crate::store::get_shard(&store[db], key).write().insert(
-                key.into(),
+                key,
                 KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
             );
         }
@@ -2299,7 +2287,7 @@ mod full_sync_guard_tests {
         let expiry = crate::store::new_expiry_store(1);
         for key in ["live", "dead"] {
             crate::store::get_shard(&store[0], key).write().insert(
-                key.into(),
+                key,
                 KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
             );
         }
