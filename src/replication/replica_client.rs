@@ -985,7 +985,9 @@ async fn run_replication_session(
     // incomplete command still sitting in `repl_buf`. This is the offset
     // reported, acknowledged, and continued from.
     let mut applied = offset - repl_buf.len() as u64;
-    repl_state.repl_offset.store(applied, Ordering::Relaxed);
+    if !publish_applied(repl_state, my_generation, applied) {
+        return Ok(SessionEnd::Superseded);
+    }
 
     let ack_interval = Duration::from_secs(1);
     send_ack(&mut writer, applied, timeout).await?;
@@ -1014,8 +1016,15 @@ async fn run_replication_session(
     let mut transaction_scanned = 0usize;
 
     loop {
+        // Nothing is written to `repl_offset` on the way out, here or below:
+        // every batch has already published its position, and a session that
+        // has been superseded has no position to publish. A promoted node's
+        // offset is its own stream's by then, and a re-pointed one's is the
+        // new session's. Writing the old position over it took back the
+        // writes a promoted master had taken meanwhile; the next full sync
+        // restarted the backlog at the shorter offset, and replicas continued
+        // before it were later sent the stream from the middle of a command.
         if repl_state.generation() != my_generation {
-            repl_state.repl_offset.store(applied, Ordering::Relaxed);
             log_info!(
                 "Replication: Command stream from {addr} superseded (epoch {my_generation}) — \
                  dropping connection"
@@ -1036,7 +1045,6 @@ async fn run_replication_session(
             };
             match read_n {
                 Some(0) => {
-                    repl_state.repl_offset.store(applied, Ordering::Relaxed);
                     return Ok(SessionEnd::MasterClosed);
                 }
                 Some(n) => {
@@ -1049,7 +1057,6 @@ async fn run_replication_session(
                 None => {
                     let timeout = repl_state.repl_timeout();
                     if heartbeats_seen && last_io.elapsed() > timeout {
-                        repl_state.repl_offset.store(applied, Ordering::Relaxed);
                         return Err(SessionError::Link(format!(
                             "no data from master for {}s (repl-timeout) — master is \
                              unreachable",
@@ -1112,6 +1119,17 @@ async fn run_replication_session(
                 // resync point. A save takes it to record that point beside the
                 // dataset it writes.
                 let _applying = repl_state.apply_lock.lock();
+                // Looked at under the lock a promotion takes to read where the
+                // stream stands (`become_master`): what was read from the old
+                // master after that is not this node's to apply any more, nor
+                // to count in an offset that is now its own stream's.
+                if repl_state.generation() != my_generation {
+                    log_info!(
+                        "Replication: Command stream from {addr} superseded (epoch \
+                         {my_generation}) — dropping connection"
+                    );
+                    return Ok(SessionEnd::Superseded);
+                }
                 let parse_pos = match transaction {
                     Some(whole) => {
                         // As `EXEC` runs on the master: alone, so that no
@@ -1163,6 +1181,21 @@ async fn run_replication_session(
                 // is promoted, the master's other replicas carry on from it (#109).
                 repl_state.record_received(read, applied);
             }
+            // What is left is the start of a command still arriving — or, if
+            // the master sent the stream from a position that is not where
+            // this replica stands, the middle of one. That never parses: the
+            // replica would wait for ever, applying nothing and acknowledging
+            // the same offset, and look healthy from both sides. Resync in
+            // full instead.
+            if !crate::resp::parse::can_start_command(&repl_buf)
+                || !crate::resp::parse::can_start_command(&repl_buf[transaction_scanned..])
+            {
+                repl_state.set_resync_point(None);
+                return Err(SessionError::Link(format!(
+                    "the master's stream does not read as commands from offset {applied} \
+                     (it was sent from another position than this replica's) — resyncing in full"
+                )));
+            }
         }
 
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
@@ -1173,6 +1206,20 @@ async fn run_replication_session(
             last_ack = Instant::now();
         }
     }
+}
+
+/// Publish `applied` as this node's replication offset, unless the session
+/// that applied it has been superseded — by a promotion, whose stream the
+/// offset now counts, or by a re-point, whose session owns it. Under the lock
+/// a promotion takes to read where the stream stands, so that the two cannot
+/// cross. False when superseded.
+fn publish_applied(repl_state: &ReplState, my_generation: u64, applied: u64) -> bool {
+    let _applying = repl_state.apply_lock.lock();
+    if repl_state.generation() != my_generation {
+        return false;
+    }
+    repl_state.repl_offset.store(applied, Ordering::Relaxed);
+    true
 }
 
 /// Whether `cmd` is the bare command `name` — `MULTI`, `EXEC`, `PING`.

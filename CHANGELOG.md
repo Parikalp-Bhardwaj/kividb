@@ -241,6 +241,30 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A replica no longer stops receiving writes after a partial resync to a
+  promoted master, while both sides report it healthy.** A replica that is
+  promoted (`CLUSTER FAILOVER`, `REPLICAOF NO ONE`) while clients write to
+  it had its old replication session notice the promotion up to 200 ms
+  later, and that session then wrote its last position over the new
+  master's offset. The writes of that moment were in the backlog, and
+  reached the replicas continued from it, but the offset no longer counted
+  them. The next full sync restarted the backlog at the shorter offset
+  (`Backlog restarted at offset X (it ended at X+N)`), and a replica that
+  had been continued before it and was later restarted was sent the stream
+  from N bytes too far on, in the middle of a command. It applied nothing
+  from then on, and kept acknowledging the offset it was stuck at:
+  `master_link_status:up`, `state=online`, `lag=0`, its offset and DBSIZE
+  frozen. Now a session that has been superseded neither applies what it
+  read after the promotion nor touches the offset. As safeguards, a master
+  refuses to continue a replica from a position where no command begins,
+  and if its offset and the stream its replicas were sent ever come apart,
+  it disconnects them and takes a new replication id, so that each resyncs
+  in full; and a replica whose stream does not read as commands resyncs in
+  full instead of waiting. The same overwrite let a replica re-pointed with
+  `REPLICAOF` apply a few writes of its old master. Found by a Kubernetes
+  test of 1.2.0-rc2: 4 of 7 partial resyncs to masters promoted by a
+  `CLUSTER FAILOVER` froze, about 150,000 keys behind.
+
 - **A master drops a replica that has gone silent, after `repl-timeout`,
   as Redis does.** A replica whose host went away without closing the
   connection (a terminated VM, a lost network path, a paused container)
