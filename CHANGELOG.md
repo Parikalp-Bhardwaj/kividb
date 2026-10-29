@@ -57,6 +57,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   TEXT index like any other, which now costs less than it did without them
   (see *Full-text search: the TEXT index holds numbers, not strings*).
 
+- **Redis-compatible HyperLogLog hash space (#62).** `PFCOUNT` now uses
+  Ertl's estimator for legacy keys too, so estimates can shift slightly.
+  KiviDB always writes dense HLL values; `PFADD` on a Redis sparse HLL rewrites
+  it as dense. Existing keys are not automatically converted between hash
+  formats. `hll-write-format` selects the hash space for new values and
+  defaults to `legacy`; keep it there until every node runs this release, then
+  set it to `redis` on the master and every replica. Keep the setting
+  consistent across the replication group. Existing values remain in their
+  original hash space.
+
 - **Signed build provenance for every release file and image.** The
   release workflow signs a GitHub artifact attestation (Sigstore, with the
   workflow's own identity) for every tarball, `.deb` and `.rpm` in a
@@ -623,20 +633,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   are unchanged.
 
 - **HyperLogLog values are Redis-compatible, with a rolling-upgrade path
-  (#62).** New values can be written in Redis's format — MurmurHash64A, a
-  dense body of encoding 0, or the sparse form Redis writes — and Redis
-  dense and sparse values are read and counted correctly, including the
-  overlapping 12,304-byte case, where a valid canonical sparse body is
+  (#62).** When enabled, new values use Redis's MurmurHash64A hash space and
+  are stored dense with encoding 0. Redis dense and sparse values are read and
+  counted correctly, including the overlapping 12,304-byte case, where a
+  valid canonical sparse body is
   taken as sparse and anything else at that size stays legacy dense.
-  Writing Redis's format is opt-in: `hll-write-format` defaults to `legacy`
-  and is a per-server setting, set in the config file or with `CONFIG SET`
-  (persisted by `CONFIG REWRITE`). Existing keys keep the format they were
-  written in; `PFADD` updates one in place, and `PFMERGE` gives a new
-  destination the format of its sources (or the configured default when it
+  Writing in Redis's hash space is opt-in: `hll-write-format` defaults to
+  `legacy` and is a per-server setting, set in the config file or with `CONFIG SET`
+  (persisted by `CONFIG REWRITE`). Existing keys keep the hash space they were
+  written in; `PFADD` preserves that hash space, and `PFMERGE` gives a new
+  destination the hash space of its sources (or the configured default when it
   has none). Legacy and Redis HLLs use different hash spaces, so `PFMERGE`
   and multi-key `PFCOUNT` refuse a mixture rather than approximating, and a
   corrupt sparse value is `INVALIDOBJ Corrupted HLL object detected`, not a
   `WRONGTYPE` error. A value that is neither format is still `WRONGTYPE`.
+  `PFDEBUG GETREG` is read-only here, unlike Redis, so a diagnostic cannot
+  change a sparse value; `TODENSE` and `RESET` replicate like any other write.
   Rolling upgrades: keep every node on `legacy` until all of them run this
   release, then set `hll-write-format redis` on every node — a master and
   its replicas must agree before the switch, since `PFADD` and `PFMERGE`

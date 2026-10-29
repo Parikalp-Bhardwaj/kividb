@@ -5,7 +5,7 @@ use std::thread;
 use kividb::config::{Config, IoModel};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Helpers (same as string-json.rs) ─────────────────────────────────────────
 
@@ -117,14 +117,36 @@ struct Conn(TcpStream);
 
 impl Conn {
     fn connect(port: u16) -> Self {
-        for _ in 0..50 {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                return Self(s);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let last_error = match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(mut stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(250)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_millis(250)))
+                        .unwrap();
+                    let mut pong = [0u8; 7];
+                    if stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+                        && stream.read_exact(&mut pong).is_ok()
+                        && &pong == b"+PONG\r\n"
+                    {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream.set_write_timeout(None).unwrap();
+                        return Self(stream);
+                    }
+                    "server did not answer PING".to_string()
+                }
+                Err(error) => error.to_string(),
+            };
+            if Instant::now() >= deadline {
+                panic!("could not connect to server on port {port}: {last_error}");
             }
             thread::sleep(Duration::from_millis(100));
         }
-        panic!("could not connect to server on port {port}");
     }
 
     fn cmds(&mut self, args: &[&str]) -> RespValue {
@@ -298,19 +320,7 @@ fn test_config_rewrite_with_configfile() {
     .spawn()
     .expect("failed to start kividb");
 
-    let mut c = {
-        let mut conn = None;
-        for _ in 0..50 {
-            if let Ok(s) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                conn = Some(Conn(s));
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        conn.expect("server did not come up")
-    };
+    let mut c = Conn::connect(port);
 
     assert!(
         c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
@@ -473,19 +483,7 @@ fn test_config_rewrite_keeps_the_file_mode() {
         ])
         .spawn()
         .expect("failed to start kividb");
-        let mut c = {
-            let mut conn = None;
-            for _ in 0..50 {
-                if let Ok(s) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                        .unwrap();
-                    conn = Some(Conn(s));
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            conn.expect("server did not come up")
-        };
+        let mut c = Conn::connect(port);
         let result = c.cmds(&["CONFIG", "REWRITE"]);
         server.kill().unwrap();
         let _ = server.wait();

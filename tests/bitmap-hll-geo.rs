@@ -830,6 +830,7 @@ fn reads_redis_sparse_hll_and_converts_it_when_added_to() {
     );
 
     assert!(c.cmd(&[b"SET", b"hll", REDIS_HLL_SPARSE]).is_ok());
+    let sparse_before = get_blob(&mut c, "hll");
     assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
     assert_eq!(
         c.cmds(&["PFDEBUG", "DECODE", "hll"]).as_str(),
@@ -839,6 +840,11 @@ fn reads_redis_sparse_hll_and_converts_it_when_added_to() {
     assert_eq!(c.cmds(&["PFCOUNT", "hll", "nosuch"]).as_int(), 3);
     assert_eq!(c.cmds(&["PFADD", "hll", "a", "b", "c"]).as_int(), 0);
     assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
+    assert_eq!(
+        get_blob(&mut c, "hll"),
+        sparse_before,
+        "no-op PFADD must not rewrite sparse bytes"
+    );
 
     assert_eq!(c.cmds(&["PFADD", "hll", "d"]).as_int(), 1);
     assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "dense");
@@ -1021,7 +1027,7 @@ fn mixed_legacy_and_redis_pfcount_is_refused() {
         assert!(err.is_error(), "{err:?}");
         assert_eq!(
             err.error_str(),
-            "ERR Cannot merge HyperLogLogs with different hash formats."
+            "ERR Cannot PFCOUNT HyperLogLogs with different hash formats."
         );
     }
 }
@@ -1206,6 +1212,20 @@ fn test_pfdebug_getreg() {
     // At least some registers should be non-zero after adding 2 elements
     let nonzero = arr.iter().filter(|r| r.as_int() > 0).count();
     assert!(nonzero >= 1, "no registers set after PFADD");
+}
+
+#[test]
+fn pfdebug_getreg_leaves_redis_sparse_bytes_unchanged() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    let before = get_blob(&mut c, "sparse");
+    assert_eq!(
+        c.cmds(&["PFDEBUG", "GETREG", "sparse"]).as_array().len(),
+        16384
+    );
+    assert_eq!(get_blob(&mut c, "sparse"), before);
 }
 
 // PFDEBUG DECODE — Redis's sparse opcode listing, an error for dense

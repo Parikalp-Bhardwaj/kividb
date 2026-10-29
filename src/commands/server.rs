@@ -874,7 +874,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     ));
                 }
                 ctx.repl_state.set_hll_write_redis(v == "redis");
-                REMEMBERED_CONFIG.lock().insert(param.clone(), v);
                 Some(resp_simple("OK"))
             }
             // What a running Redis cannot be told either.

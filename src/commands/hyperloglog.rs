@@ -2,7 +2,10 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
+use crate::store::Key;
 use crate::store::ValueRef;
+use crate::types::KiviDBValue;
+use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
 
 // ── HyperLogLog constants ─────────────────────────────────────────────────────
@@ -17,10 +20,8 @@ use crate::{read_lock, write_lock};
 // long. Sparse HLLs have encoding 1 and a variable length.
 //
 // KiviDB before 1.2.0 wrote a dense HLL of the same size with encoding 1 and a
-// different hash. 1.2.0 still writes the old (legacy) format by default for
-// rolling-upgrade compatibility. Those values are still read, and an old value
-// that is updated is written back in its original format, so an old value does
-// not lose elements when it is next changed.
+// different hash. Legacy hash-space values are still read. Writes are dense;
+// an updated Redis sparse value becomes dense while retaining its hash space.
 
 const HLL_P: u32 = 14;
 const HLL_Q: u32 = 64 - HLL_P; // 50 bits left for the leading-zero rank
@@ -46,7 +47,7 @@ enum HllFormat {
     Dense,
     /// Redis sparse: encoding 1, a body that decodes as sparse.
     Sparse,
-    /// KiviDB up to 1.2.0: encoding 1, exactly 12304 bytes, FNV-1a hash.
+    /// KiviDB before 1.2.0: encoding 1, exactly 12304 bytes, FNV-1a hash.
     LegacyDense,
 }
 
@@ -201,10 +202,6 @@ fn set_register(registers: &mut [u8], i: usize, val: u8) {
 
 // ── HLL blob construction ─────────────────────────────────────────────────────
 
-fn invalidate_cache(blob: &mut [u8]) {
-    blob[15] |= 0x80;
-}
-
 /// The cached cardinality, if it is not stale.
 ///
 /// Zero is taken as not known: a HyperLogLog saved before 1.1.1 has zeros
@@ -223,17 +220,6 @@ fn make_empty_hll(write_redis: bool) -> Vec<u8> {
     } else {
         HLL_LEGACY_ENCODING
     };
-    blob
-}
-
-fn dense_blob(encoding: u8, cached: &[u8], registers: &[u8]) -> Vec<u8> {
-    let mut blob = vec![0u8; HLL_TOTAL_SIZE];
-    blob[0..4].copy_from_slice(HLL_MAGIC);
-    blob[4] = encoding;
-    if !cached.is_empty() {
-        blob[8..16].copy_from_slice(cached);
-    }
-    blob[HLL_HEADER_SIZE..].copy_from_slice(registers);
     blob
 }
 
@@ -257,6 +243,10 @@ fn wrongtype() -> Vec<u8> {
 /// into the other, so a union across them is refused rather than approximated.
 fn incompatible_hash_formats() -> Vec<u8> {
     resp_error("ERR Cannot merge HyperLogLogs with different hash formats.")
+}
+
+fn incompatible_pfcount_hash_formats() -> Vec<u8> {
+    resp_error("ERR Cannot PFCOUNT HyperLogLogs with different hash formats.")
 }
 
 // ── Sparse representation ─────────────────────────────────────────────────────
@@ -376,10 +366,28 @@ fn sparse_description(body: &[u8]) -> Result<String, ()> {
     Ok(description)
 }
 
-fn hll_registers(blob: &[u8], format: HllFormat) -> Result<Vec<u8>, Vec<u8>> {
+enum HllRegisters<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl HllRegisters<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(registers) => registers,
+            Self::Owned(registers) => registers,
+        }
+    }
+}
+
+fn hll_registers(blob: &[u8], format: HllFormat) -> Result<HllRegisters<'_>, Vec<u8>> {
     match format {
-        HllFormat::Dense | HllFormat::LegacyDense => Ok(blob[HLL_HEADER_SIZE..].to_vec()),
-        HllFormat::Sparse => sparse_to_dense(&blob[HLL_HEADER_SIZE..]).map_err(|_| corrupt_hll()),
+        HllFormat::Dense | HllFormat::LegacyDense => {
+            Ok(HllRegisters::Borrowed(&blob[HLL_HEADER_SIZE..]))
+        }
+        HllFormat::Sparse => sparse_to_dense(&blob[HLL_HEADER_SIZE..])
+            .map(HllRegisters::Owned)
+            .map_err(|_| corrupt_hll()),
     }
 }
 
@@ -407,12 +415,21 @@ fn legacy_position(hash: u64) -> (usize, u8) {
     (index, rank)
 }
 
-fn hll_add(registers: &mut [u8], element: &[u8], legacy: bool) -> bool {
-    let (index, rank) = if legacy {
+fn hll_position(element: &[u8], legacy: bool) -> (usize, u8) {
+    if legacy {
         legacy_position(legacy_hll_hash(element))
     } else {
         redis_position(redis_hll_hash(element))
-    };
+    }
+}
+
+fn hll_would_change(registers: &[u8], element: &[u8], legacy: bool) -> bool {
+    let (index, rank) = hll_position(element, legacy);
+    rank > get_register(registers, index)
+}
+
+fn hll_add(registers: &mut [u8], element: &[u8], legacy: bool) -> bool {
+    let (index, rank) = hll_position(element, legacy);
     if rank > get_register(registers, index) {
         set_register(registers, index, rank);
         true
@@ -488,48 +505,73 @@ fn delete_expired_key(ctx: &Ctx, key: &str) {
     }
 }
 
-/// The raw bytes of an HLL, or an empty blob in the configured write format.
-///
-/// The bytes are not classified here: every caller needs the format anyway,
-/// and classifying an ambiguous 12304-byte sparse value walks its body, so
-/// doing it once is the point.
-fn get_or_create_hll(ctx: &mut Ctx, key: &str, write_redis: bool) -> Result<Vec<u8>, Vec<u8>> {
-    let db = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db, key);
-    let map = read_lock!(shard);
-    match map.get(key) {
-        Some(ValueRef::String(b)) => Ok(b.to_vec()),
-        None => Ok(make_empty_hll(write_redis)),
-        _ => Err(wrongtype()),
-    }
+fn make_empty_hll_shared(write_redis: bool) -> SharedBytes {
+    let mut header = [0u8; HLL_HEADER_SIZE];
+    header[0..4].copy_from_slice(HLL_MAGIC);
+    header[4] = if write_redis {
+        HLL_DENSE_ENCODING
+    } else {
+        HLL_LEGACY_ENCODING
+    };
+    SharedBytes::concat(&[&header, &[0u8; HLL_DENSE_SIZE]])
 }
 
-fn save_hll(ctx: &mut Ctx, key: &str, blob: Vec<u8>) {
+fn dense_header(blob: &[u8], encoding: u8, invalidate: bool) -> [u8; HLL_HEADER_SIZE] {
+    let mut header = [0u8; HLL_HEADER_SIZE];
+    header.copy_from_slice(&blob[..HLL_HEADER_SIZE]);
+    header[4] = encoding;
+    if invalidate {
+        header[15] |= 0x80;
+    }
+    header
+}
+
+fn save_hll(ctx: &mut Ctx, key: &str, blob: SharedBytes) {
     let key_owned = key.to_string();
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
-    map.insert_str(key_owned, blob.as_slice());
+    map.insert(Key::from(key_owned), KiviDBValue::String(blob));
 }
 
-fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
+fn save_dense_hll(ctx: &mut Ctx, key: &str, header: [u8; HLL_HEADER_SIZE], registers: &[u8]) {
+    save_hll(ctx, key, SharedBytes::concat(&[&header, registers]));
+}
+
+fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<SharedBytes, Vec<u8>> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(ValueRef::String(b)) => Ok(b.to_vec()),
+        Some(ValueRef::String(b)) => Ok(b.to_shared()),
         None => Err(resp_error("ERR The specified key does not exist")),
         _ => Err(wrongtype()),
     }
 }
 
-fn get_optional_hll(ctx: &Ctx, key: &str) -> Result<Option<Vec<u8>>, Vec<u8>> {
+fn get_optional_hll(ctx: &Ctx, key: &str) -> Result<Option<SharedBytes>, Vec<u8>> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(ValueRef::String(b)) => Ok(Some(b.to_vec())),
+        Some(ValueRef::String(b)) => Ok(Some(b.to_shared())),
         None => Ok(None),
+        _ => Err(wrongtype()),
+    }
+}
+
+/// The raw bytes of an HLL, or an empty blob in the configured write format.
+///
+/// The bytes are not classified here: every caller needs the format anyway,
+/// and classifying an ambiguous 12304-byte sparse value walks its body, so
+/// doing it once is the point.
+fn get_or_create_hll(ctx: &mut Ctx, key: &str, write_redis: bool) -> Result<SharedBytes, Vec<u8>> {
+    let db = &ctx.store[*ctx.selected_db];
+    let shard = store::get_shard(db, key);
+    let map = read_lock!(shard);
+    match map.get(key) {
+        Some(ValueRef::String(b)) => Ok(b.to_shared()),
+        None => Ok(make_empty_hll_shared(write_redis)),
         _ => Err(wrongtype()),
     }
 }
@@ -538,9 +580,9 @@ fn classify_for_reply(blob: &[u8]) -> Result<HllFormat, Vec<u8>> {
     classify_hll(blob).map_err(hll_error)
 }
 
-fn get_classified_hll(ctx: &Ctx, key: &str) -> Result<(Vec<u8>, HllFormat), Vec<u8>> {
+fn get_classified_hll(ctx: &Ctx, key: &str) -> Result<(SharedBytes, HllFormat), Vec<u8>> {
     let blob = get_hll_blob(ctx, key)?;
-    let format = classify_for_reply(&blob)?;
+    let format = classify_for_reply(blob.as_slice())?;
     Ok((blob, format))
 }
 
@@ -568,12 +610,14 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, &key);
         let exists = read_lock!(shard).contains_key(key.as_str());
         if exists {
-            return match get_hll_blob(ctx, &key).and_then(|blob| classify_for_reply(&blob)) {
+            return match get_hll_blob(ctx, &key)
+                .and_then(|blob| classify_for_reply(blob.as_slice()))
+            {
                 Ok(_) => resp_integer(0),
                 Err(e) => e,
             };
         }
-        save_hll(ctx, &key, make_empty_hll(write_redis));
+        save_hll(ctx, &key, make_empty_hll_shared(write_redis));
         return resp_integer(1);
     }
 
@@ -581,37 +625,37 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
         Ok(b) => b,
         Err(e) => return e,
     };
-    let format = match classify_for_reply(&blob) {
+    let format = match classify_for_reply(blob.as_slice()) {
         Ok(format) => format,
         Err(e) => return e,
     };
     let legacy = format == HllFormat::LegacyDense;
-    let mut registers = match hll_registers(&blob, format) {
+    let registers = match hll_registers(blob.as_slice(), format) {
         Ok(registers) => registers,
         Err(e) => return e,
     };
 
-    let mut modified = false;
-    for element in &cmd[2..] {
-        if hll_add(&mut registers, element, legacy) {
-            modified = true;
-        }
+    if !cmd[2..]
+        .iter()
+        .any(|element| hll_would_change(registers.as_slice(), element, legacy))
+    {
+        return resp_integer(0);
     }
 
-    if modified {
-        let encoding = if legacy {
-            HLL_LEGACY_ENCODING
-        } else {
-            // Existing Redis/dense format keys keep their format
-            HLL_DENSE_ENCODING
-        };
-        let mut new_blob = dense_blob(encoding, &blob[8..16], &registers);
-        invalidate_cache(&mut new_blob);
-        save_hll(ctx, &key, new_blob);
-        resp_integer(1)
+    let encoding = if legacy {
+        HLL_LEGACY_ENCODING
     } else {
-        resp_integer(0)
-    }
+        HLL_DENSE_ENCODING
+    };
+    let header = dense_header(&blob, encoding, true);
+    let updated = SharedBytes::concat_with_mutation(&[&header, registers.as_slice()], |bytes| {
+        let registers = &mut bytes[HLL_HEADER_SIZE..];
+        for element in &cmd[2..] {
+            hll_add(registers, element, legacy);
+        }
+    });
+    save_hll(ctx, &key, updated);
+    resp_integer(1)
 }
 
 // ── PFCOUNT ───────────────────────────────────────────────────────────────────
@@ -653,7 +697,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
                             Ok(registers) => registers,
                             Err(e) => return e,
                         };
-                        (b.to_shared(), hll_count(&registers))
+                        (b.to_shared(), hll_count(registers.as_slice()))
                     }
                 }
             }
@@ -673,9 +717,16 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         if matches!(map.get(key), Some(ValueRef::String(now))
             if now.is(&counted_bytes) || now.as_bytes() == counted_bytes.as_slice())
         {
-            let mut blob = counted_bytes.to_vec();
-            blob[8..16].copy_from_slice(&count.to_le_bytes());
-            map.insert_str(key, blob.as_slice());
+            let mut header = [0u8; HLL_HEADER_SIZE];
+            header.copy_from_slice(&counted_bytes[..HLL_HEADER_SIZE]);
+            header[8..16].copy_from_slice(&count.to_le_bytes());
+            map.insert(
+                key,
+                KiviDBValue::String(SharedBytes::concat(&[
+                    &header,
+                    &counted_bytes[HLL_HEADER_SIZE..],
+                ])),
+            );
         }
         return resp_integer(count as i64);
     }
@@ -706,14 +757,14 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
                 };
                 let legacy = format == HllFormat::LegacyDense;
                 if matches!(legacy_space, Some(seen) if seen != legacy) {
-                    return incompatible_hash_formats();
+                    return incompatible_pfcount_hash_formats();
                 }
                 legacy_space = Some(legacy);
                 let registers = match hll_registers(&b, format) {
                     Ok(registers) => registers,
                     Err(e) => return e,
                 };
-                merge_registers(&mut merged, &registers);
+                merge_registers(&mut merged, registers.as_slice());
             }
             Some(_) => return wrongtype(),
             None => {}
@@ -743,7 +794,7 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
     let destination_format = match &destination {
-        Some(blob) => match classify_for_reply(blob) {
+        Some(blob) => match classify_for_reply(blob.as_slice()) {
             Ok(format) => Some(format),
             Err(e) => return e,
         },
@@ -755,11 +806,11 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
 
     if let (Some(blob), Some(format)) = (&destination, destination_format) {
         legacy_space = Some(format == HllFormat::LegacyDense);
-        let registers = match hll_registers(blob, format) {
+        let registers = match hll_registers(blob.as_slice(), format) {
             Ok(registers) => registers,
             Err(e) => return e,
         };
-        merge_registers(&mut merged, &registers);
+        merge_registers(&mut merged, registers.as_slice());
     }
 
     for key_bytes in &cmd[2..] {
@@ -775,7 +826,7 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
             Ok(None) => continue,
             Err(e) => return e,
         };
-        let format = match classify_for_reply(&source) {
+        let format = match classify_for_reply(source.as_slice()) {
             Ok(format) => format,
             Err(e) => return e,
         };
@@ -784,17 +835,16 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
             return incompatible_hash_formats();
         }
         legacy_space = Some(legacy);
-        let registers = match hll_registers(&source, format) {
+        let registers = match hll_registers(source.as_slice(), format) {
             Ok(registers) => registers,
             Err(e) => return e,
         };
-        merge_registers(&mut merged, &registers);
+        merge_registers(&mut merged, registers.as_slice());
     }
 
-    // A destination that exists keeps its format. For a new destination,
-    // inherit the format from sources when any sources are merged; the checks
-    // above ensure all sources share the same hash space. Only if there are
-    // no sources to inherit from, fall back to the configured write default.
+    // Preserve hash-space compatibility for an existing destination or its
+    // sources. Writes are always dense; modifying a Redis sparse value makes
+    // it dense. A new destination without sources uses the configured default.
     let legacy = if let Some(format) = destination_format {
         format == HllFormat::LegacyDense
     } else if let Some(space) = legacy_space {
@@ -807,10 +857,14 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
     } else {
         HLL_DENSE_ENCODING
     };
-    let cached = destination.as_ref().map(|b| &b[8..16]).unwrap_or(&[]);
-    let mut merged_blob = dense_blob(encoding, cached, &merged);
-    invalidate_cache(&mut merged_blob);
-    save_hll(ctx, &dest_key, merged_blob);
+    let mut header = [0u8; HLL_HEADER_SIZE];
+    header[0..4].copy_from_slice(HLL_MAGIC);
+    if let Some(destination) = &destination {
+        header.copy_from_slice(&destination[..HLL_HEADER_SIZE]);
+    }
+    header[4] = encoding;
+    header[15] |= 0x80;
+    save_dense_hll(ctx, &dest_key, header, &merged);
 
     resp_simple("OK")
 }
@@ -890,17 +944,13 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
                 Ok(classified) => classified,
                 Err(e) => return e,
             };
-            let registers = match hll_registers(&blob, format) {
+            let registers = match hll_registers(blob.as_slice(), format) {
                 Ok(registers) => registers,
                 Err(e) => return e,
             };
-            if format == HllFormat::Sparse {
-                // Redis's GETREG converts the value and keeps the dense form.
-                let dense = dense_blob(HLL_DENSE_ENCODING, &blob[8..16], &registers);
-                save_hll(ctx, &key, dense);
-            }
+            let registers = registers.as_slice();
             let items: Vec<Vec<u8>> = (0..HLL_REGISTERS)
-                .map(|i| resp_integer(get_register(&registers, i) as i64))
+                .map(|i| resp_integer(get_register(registers, i) as i64))
                 .collect();
             resp_array(items)
         }
@@ -938,12 +988,13 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
             if format != HllFormat::Sparse {
                 return resp_integer(0);
             }
-            let registers = match hll_registers(&blob, format) {
+            let registers = match hll_registers(blob.as_slice(), format) {
                 Ok(registers) => registers,
                 Err(e) => return e,
             };
-            let dense = dense_blob(HLL_DENSE_ENCODING, &blob[8..16], &registers);
-            save_hll(ctx, &key, dense);
+            let registers = registers.as_slice();
+            let header = dense_header(&blob, HLL_DENSE_ENCODING, false);
+            save_dense_hll(ctx, &key, header, registers);
             resp_integer(1)
         }
 
@@ -957,10 +1008,8 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
             } else {
                 HLL_DENSE_ENCODING
             };
-            let registers = vec![0u8; HLL_DENSE_SIZE];
-            let mut reset = dense_blob(encoding, &blob[8..16], &registers);
-            invalidate_cache(&mut reset);
-            save_hll(ctx, &key, reset);
+            let header = dense_header(&blob, encoding, true);
+            save_dense_hll(ctx, &key, header, &[0u8; HLL_DENSE_SIZE]);
             resp_simple("OK")
         }
 

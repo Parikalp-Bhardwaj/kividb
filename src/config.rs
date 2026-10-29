@@ -1913,6 +1913,22 @@ mod config_file_tests {
     }
 
     #[test]
+    fn hll_write_format_cli_option_is_validated() {
+        use clap::Parser;
+        let config = Config::try_parse_from(["kividb", "--hll-write-format", "redis"]).unwrap();
+        assert_eq!(config.hll_write_format, "redis");
+        assert!(config.validate(false).is_ok());
+
+        let invalid = Config::try_parse_from(["kividb", "--hll-write-format", "invalid"]).unwrap();
+        assert!(
+            invalid
+                .validate(false)
+                .unwrap_err()
+                .contains("hll-write-format")
+        );
+    }
+
+    #[test]
     fn protected_mode_is_on_until_turned_off_or_a_bind_address_is_given() {
         let c = Config::default();
         assert!(c.protected_mode && !c.bind_explicit);
