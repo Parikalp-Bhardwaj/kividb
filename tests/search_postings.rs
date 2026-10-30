@@ -941,11 +941,15 @@ fn filtered_knn_measures_exactly_what_the_filter_matches() {
                     &q,
                     " HYBRID_POLICY ADHOC_BF",
                 );
-                assert_eq!(
-                    measured.ordered_keys(),
-                    exact,
-                    "{index} round {round}: ADHOC_BF is not exact for {}",
-                    filter.query()
+                assert_same_nearest(
+                    &model,
+                    &q,
+                    &measured.ordered_keys(),
+                    &exact,
+                    &format!(
+                        "{index} round {round}: ADHOC_BF is not exact for {}",
+                        filter.query()
+                    ),
                 );
                 postings(&mut c, index, false);
                 let scanned = knn(&mut c, index, &filter.query(), &q, "");

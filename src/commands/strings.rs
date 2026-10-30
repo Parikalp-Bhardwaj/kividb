@@ -278,6 +278,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Looked up once; what follows asks this, not the map again.
             let existing = map.get(key);
             let key_exists = existing.is_some();
+            // A document written over leaves the indexes that hold it.
+            let was_document = matches!(
+                existing,
+                Some(ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
+            );
 
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
@@ -390,6 +395,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // it is the allocator's time, neither of them the shard's to wait
             // for.
             drop(replaced);
+            if was_document {
+                crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
+            }
 
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             if !keepttl && expiry.is_some() {
