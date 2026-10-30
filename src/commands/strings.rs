@@ -295,11 +295,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None
             };
             let key_exists = existing.is_some();
-            // A document written over leaves the indexes that hold it.
-            let was_document = matches!(
-                existing,
-                Some(ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
-            );
 
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
@@ -413,6 +408,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 map.set_str_expiring(key, cmd[2], expiry.map(unix_ms))
             };
             drop(map);
+            // A document written over leaves the indexes that hold it. What
+            // was there is what the write replaced: a plain SET does not look
+            // the key up first. (Written over in place, it was a string.)
+            let was_document = matches!(
+                &replaced,
+                store::Written::Replaced(old)
+                    if matches!(old.value(), ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
+            );
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
             // it is the allocator's time, neither of them the shard's to wait
