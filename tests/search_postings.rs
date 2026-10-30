@@ -617,13 +617,20 @@ fn mutate(
     model: &mut BTreeMap<String, Doc>,
     next: &mut usize,
 ) {
-    let keys: Vec<String> = model.keys().cloned().collect();
-    let some_key = |rng: &mut Rng| keys[rng.below(keys.len())].clone();
+    // From the model as it is now: a key deleted, renamed or moved away
+    // earlier in the round is not picked again.
+    let some_key = |rng: &mut Rng, model: &BTreeMap<String, Doc>| {
+        let n = rng.below(model.len());
+        model.keys().nth(n).unwrap().clone()
+    };
     for _ in 0..40 {
+        if model.is_empty() {
+            break;
+        }
         match rng.below(12) {
             0 | 1 => {
                 // Some fields written again.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let fresh = random_doc(rng, false);
                 let written: Doc = fresh.into_iter().filter(|_| rng.chance(50)).collect();
                 if written.is_empty() {
@@ -633,7 +640,7 @@ fn mutate(
                 model.get_mut(&key).unwrap().extend(written);
             }
             2 => {
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let field = rng.pick(&PREFIX_FIELDS);
                 c.cmd(&["HDEL", &key, field]);
                 let doc = model.get_mut(&key).unwrap();
@@ -643,7 +650,7 @@ fn mutate(
                 }
             }
             3 => {
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let by = (rng.below(5) as i64 - 2).to_string();
                 let reply = c.cmd(&["HINCRBY", &key, "m", &by]);
                 if let V::Int(now) = reply {
@@ -654,13 +661,13 @@ fn mutate(
                 }
             }
             4 => {
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 c.cmd(&["DEL", &key]);
                 model.remove(&key);
             }
             5 => {
                 // Renamed, inside the prefix or out of it.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let out = rng.chance(30);
                 let to = if out {
                     format!("elsewhere:{next}")
@@ -675,7 +682,7 @@ fn mutate(
                 }
             }
             6 => {
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let to = format!("{prefix}{next}");
                 *next += 1;
                 c.cmd(&["COPY", &key, &to]);
@@ -684,7 +691,7 @@ fn mutate(
             }
             7 => {
                 // Gone to another database, and back.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 assert_eq!(c.cmd(&["MOVE", &key, "3"]), V::Int(1));
                 if rng.chance(50) {
                     c.cmd(&["SELECT", "3"]);
@@ -696,7 +703,7 @@ fn mutate(
             }
             8 => {
                 // Expires, and is found expired by a read.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 c.cmd(&["PEXPIRE", &key, "1"]);
                 thread::sleep(Duration::from_millis(5));
                 assert_eq!(c.cmd(&["EXISTS", &key]), V::Int(0));
@@ -704,7 +711,7 @@ fn mutate(
             }
             9 => {
                 // A field expires, and a read drops it before the sweep can.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 let field = rng.pick(&["c", "n", "s"]);
                 let reply = c.cmd(&["HPEXPIRE", &key, "1", "FIELDS", "1", field]);
                 thread::sleep(Duration::from_millis(5));
@@ -719,7 +726,7 @@ fn mutate(
             }
             10 => {
                 // A string over a document.
-                let key = some_key(rng);
+                let key = some_key(rng, model);
                 assert!(c.cmd(&["SET", &key, "not a hash"]).ok());
                 model.remove(&key);
                 if rng.chance(50) {
@@ -840,6 +847,28 @@ fn exact_knn(model: &BTreeMap<String, Doc>, filter: &F, q: &[f32], k: usize) -> 
         .collect()
 }
 
+/// `found` is as near as `exact`, position by position, to within float
+/// rounding: the same documents but for ties, in an order that ties allow.
+fn assert_same_nearest(
+    model: &BTreeMap<String, Doc>,
+    q: &[f32],
+    found: &[String],
+    exact: &[String],
+    what: &str,
+) {
+    let dist = |key: &String| model.get(key).map(|doc| l2(&decode(&doc["v"]), q));
+    assert_eq!(found.len(), exact.len(), "{what}: {found:?} against {exact:?}");
+    for (f, e) in found.iter().zip(exact) {
+        let (Some(df), Some(de)) = (dist(f), dist(e)) else {
+            panic!("{what}: {found:?} against {exact:?}");
+        };
+        assert!(
+            (df - de).abs() <= 1e-5 * de.abs().max(1.0),
+            "{what}: {found:?} against {exact:?} ({f} at {df}, {e} at {de})"
+        );
+    }
+}
+
 fn knn(c: &mut Conn, index: &str, filter: &str, q: &[f32], extra: &str) -> V {
     let query = format!("({filter})=>[KNN 10 @v $q{extra}]");
     let b = blob(q);
@@ -917,10 +946,15 @@ fn filtered_knn_measures_exactly_what_the_filter_matches() {
                 postings(&mut c, index, false);
                 let scanned = knn(&mut c, index, &filter.query(), &q, "");
                 postings(&mut c, index, true);
-                assert_eq!(
-                    scanned.ordered_keys(),
-                    exact,
-                    "{index}: the scan is not exact"
+                // The scan's distance kernel rounds otherwise than the
+                // model's, so two documents at (nearly) the same distance
+                // may come in either order: compared by distance.
+                assert_same_nearest(
+                    &model,
+                    &q,
+                    &scanned.ordered_keys(),
+                    &exact,
+                    &format!("{index}: the scan is not exact"),
                 );
             }
             mutate(&mut c, &mut rng, prefix, &mut model, &mut next);
