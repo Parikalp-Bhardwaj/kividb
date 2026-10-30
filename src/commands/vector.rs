@@ -1425,9 +1425,14 @@ impl Best {
 /// the graph for, by default. Measuring costs a distance per document; a
 /// search that keeps a fraction `s` of the nodes it meets walks some `ef / s`
 /// of them, and more for the graph's detours. The two cost the same at
-/// `n = sqrt(c * ef * N)`; `c` is measured (see the CHANGELOG for 1.2.0).
+/// `n = sqrt(c * ef * N)`; `c` is measured. On dbpedia-openai-100K-1536
+/// (an Azure D16s_v5, AVX-512) the two cost the same at about 10,000
+/// documents for ef 64, 13,500 for 128 and 16,000 for 256: `c` 16, 14 and
+/// 10. Measuring a document of 1536 dimensions costs some 0.4 µs there; the
+/// graph search kept the recall of an unfiltered one from 10% of documents
+/// up.
 pub(crate) fn measure_up_to(ef: usize, graph_size: usize) -> usize {
-    const C: f64 = 2.0;
+    const C: f64 = 12.0;
     let crossing = (C * ef as f64 * graph_size as f64).sqrt() as usize;
     crossing.max(2000)
 }
