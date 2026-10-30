@@ -353,7 +353,13 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
 /// here the shards are worked on at once (#159). `MSET` and `MSETNX` lock
 /// all their shards together, and need no more.
 fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
-    if matches!(name, "MSET" | "MSETNX") || !replication::is_write_command_bytes(cmd0) {
+    // One argument is at most one key (`DEL k`, `INCR k`): asked first, as
+    // `key_positions` is a long match on the name, and every write comes
+    // through here.
+    if ctx.cmd.len() < 3
+        || matches!(name, "MSET" | "MSETNX")
+        || !replication::is_write_command_bytes(cmd0)
+    {
         return false;
     }
     let keys = crate::keyspec::key_positions(name, &ctx.cmd);
