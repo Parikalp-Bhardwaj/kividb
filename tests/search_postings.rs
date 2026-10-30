@@ -857,7 +857,11 @@ fn assert_same_nearest(
     what: &str,
 ) {
     let dist = |key: &String| model.get(key).map(|doc| l2(&decode(&doc["v"]), q));
-    assert_eq!(found.len(), exact.len(), "{what}: {found:?} against {exact:?}");
+    assert_eq!(
+        found.len(),
+        exact.len(),
+        "{what}: {found:?} against {exact:?}"
+    );
     for (f, e) in found.iter().zip(exact) {
         let (Some(df), Some(de)) = (dist(f), dist(e)) else {
             panic!("{what}: {found:?} against {exact:?}");

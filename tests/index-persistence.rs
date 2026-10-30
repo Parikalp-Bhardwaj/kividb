@@ -2065,7 +2065,15 @@ fn postings_answers(c: &mut Conn) -> Vec<Vec<String>> {
         // A server still building its indexes says LOADING: asked again.
         let deadline = Instant::now() + Duration::from_secs(30);
         let reply = loop {
-            let reply = c.cmds(&["FT.SEARCH", "idx:post", query, "NOCONTENT", "LIMIT", "0", "10000"]);
+            let reply = c.cmds(&[
+                "FT.SEARCH",
+                "idx:post",
+                query,
+                "NOCONTENT",
+                "LIMIT",
+                "0",
+                "10000",
+            ]);
             match &reply {
                 RespValue::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(50));
@@ -2106,9 +2114,28 @@ fn postings_answers(c: &mut Conn) -> Vec<Vec<String>> {
 fn postings_dataset(c: &mut Conn) {
     assert!(
         c.cmds(&[
-            "FT.CREATE", "idx:post", "ON", "HASH", "PREFIX", "1", "p:", "SCHEMA", "c", "TAG", "n",
-            "NUMERIC", "v", "VECTOR", "HNSW", "6", "TYPE", "FLOAT32", "DIM", "4",
-            "DISTANCE_METRIC", "L2",
+            "FT.CREATE",
+            "idx:post",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "p:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "HNSW",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
         ])
         .is_ok()
     );
@@ -2149,7 +2176,10 @@ fn postings_are_the_same_after_a_snapshot_restart() {
     let dir = temp_dir("postings_snap");
     let port1 = free_port();
     let mut srv1 = start_server_in_dir(port1, &dir);
-    assert!(wait_for_server(port1, Duration::from_secs(10)), "srv1 start");
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
     let before = {
         let mut c = Conn::connect(port1);
         postings_dataset(&mut c);
@@ -2159,11 +2189,17 @@ fn postings_are_the_same_after_a_snapshot_restart() {
     };
     assert!(before[0].len() > 50, "{before:?}");
     send_shutdown_nosave(port1);
-    assert!(wait_for_exit(&mut srv1, Duration::from_secs(8)), "srv1 stop");
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
 
     let port2 = free_port();
     let mut srv2 = start_server_in_dir(port2, &dir);
-    assert!(wait_for_server(port2, Duration::from_secs(10)), "srv2 start");
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
     {
         let mut c = Conn::connect(port2);
         assert_eq!(postings_answers(&mut c), before);
@@ -2188,7 +2224,10 @@ fn postings_are_the_same_after_an_aof_replay() {
     let dir = temp_dir("postings_aof");
     let port1 = free_port();
     let mut srv1 = start_aof_server(port1, &dir, &[]);
-    assert!(wait_for_server(port1, Duration::from_secs(10)), "srv1 start");
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
     let before = {
         let mut c = Conn::connect(port1);
         postings_dataset(&mut c);
@@ -2197,11 +2236,17 @@ fn postings_are_the_same_after_an_aof_replay() {
         postings_answers(&mut c)
     };
     send_shutdown_nosave(port1);
-    assert!(wait_for_exit(&mut srv1, Duration::from_secs(8)), "srv1 stop");
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
 
     let port2 = free_port();
     let mut srv2 = start_aof_server(port2, &dir, &[]);
-    assert!(wait_for_server(port2, Duration::from_secs(10)), "srv2 start");
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
     {
         let mut c = Conn::connect(port2);
         assert_eq!(postings_answers(&mut c), before);
