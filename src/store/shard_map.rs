@@ -983,6 +983,45 @@ impl ShardMap {
                 if s.shared().is_some_and(|b| crate::value_slab::is_evacuating(b.block(), regions)))
     }
 
+    /// The buckets from `from` to `to` (not included) whose entry, or its
+    /// string's bytes, is in a slab compaction is emptying: [`evacuating_at`]
+    /// of each, with the entries' first lines asked for a few buckets ahead.
+    /// Each entry is somewhere else in memory, and the shard is locked for
+    /// reading while this runs: one after the other, their misses held the
+    /// lock about 50 us for 512 buckets.
+    ///
+    /// [`evacuating_at`]: ShardMap::evacuating_at
+    pub fn evacuating_in(&self, from: usize, to: usize, regions: &[usize]) -> Vec<usize> {
+        const AHEAD: usize = 8;
+        let to = to.min(self.buckets());
+        for index in from..(from + AHEAD).min(to) {
+            if let Some(slot) = self.table.get_bucket(index) {
+                slot.prefetch_header();
+            }
+        }
+        let mut found = Vec::new();
+        for index in from..to {
+            if index + AHEAD < to
+                && let Some(slot) = self.table.get_bucket(index + AHEAD)
+            {
+                slot.prefetch_header();
+            }
+            if self.evacuating_at(index, regions) {
+                found.push(index);
+            }
+        }
+        found
+    }
+
+    /// Ask for the first lines of the entry in bucket `index`, if there is
+    /// one: compaction's next copy.
+    #[inline]
+    pub fn prefetch_bucket(&self, index: usize) {
+        if let Some(slot) = self.table.get_bucket(index) {
+            slot.prefetch();
+        }
+    }
+
     /// Move the entry in bucket `index`, or its string's bytes, out of a
     /// slab compaction is emptying, if the table's is its only hold.
     pub fn relocate_at(&mut self, index: usize, regions: &[usize]) -> Relocated {

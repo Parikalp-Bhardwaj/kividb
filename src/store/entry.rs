@@ -866,6 +866,22 @@ impl Slot {
     }
 }
 
+impl Slot {
+    /// Ask for the entry's first lines, as many as the hint says (up to
+    /// [`PREFETCH_LINES`]): for a walk over buckets that will read them.
+    #[inline(always)]
+    pub(super) fn prefetch(self) {
+        let lines = HINT_LINES[((self.0 >> ADDRESS_BITS) & 0xf) as usize] as usize;
+        prefetch((self.0 & ADDRESS) as *const u8, lines.min(PREFETCH_LINES));
+    }
+
+    /// Ask for the entry's first line only.
+    #[inline(always)]
+    pub(super) fn prefetch_header(self) {
+        prefetch((self.0 & ADDRESS) as *const u8, 1);
+    }
+}
+
 /// Ask for `lines` cache lines from `at`. A hint: nothing is read.
 #[inline(always)]
 fn prefetch(at: *const u8, lines: usize) {
