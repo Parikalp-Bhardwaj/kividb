@@ -118,7 +118,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let delete_documents = match &cmd[2..] {
         [] => false,
         [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
-        _ => return Some(resp_error("ERR syntax error")),
+        _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
     };
 
     // The documents it covered, if they go too: found before the index goes,
