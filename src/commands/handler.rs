@@ -652,7 +652,7 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // Counted and timed for `INFO commandstats` — unless it parked, in which
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
-    let reply = run_command(ctx, name);
+    let reply = run_command(ctx, name, started);
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
@@ -668,8 +668,68 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     reply
 }
 
-/// [`execute_command`], once the command's name is known.
-fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
+/// Commands that only ask about keys: no use of a key, as in Redis, and
+/// nothing they look up has its use written. `RESTORE` writes its own, with
+/// what `IDLETIME` or `FREQ` said. Those that pick keys by what is in them
+/// rather than by name (the query engine's, the time series' filters) name
+/// no key, and their reads are no use of one either.
+#[inline]
+fn asks_only(name: &str) -> bool {
+    matches!(
+        name,
+        "OBJECT"
+            | "TYPE"
+            | "TTL"
+            | "PTTL"
+            | "EXPIRETIME"
+            | "PEXPIRETIME"
+            | "EXISTS"
+            | "DEBUG"
+            | "RESTORE"
+            | "TS.MGET"
+            | "TS.MRANGE"
+            | "TS.MREVRANGE"
+            | "TS.QUERYINDEX"
+    ) || name.starts_with("FT.")
+}
+
+/// A script: its declared keys have their use written after it, and
+/// nothing its calls look up does (see `eviction`).
+#[inline]
+fn is_script(name: &str) -> bool {
+    matches!(
+        name,
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
+    )
+}
+
+/// What the lookups of the command `name`, started at `now`, write to the
+/// keys they find: see `store::AccessScope`.
+#[cold]
+#[inline(never)]
+fn access_scope(name: &str, now: std::time::Instant) -> crate::store::AccessScope {
+    if asks_only(name) || is_script(name) {
+        crate::store::AccessScope::none()
+    } else {
+        crate::store::AccessScope::open(crate::eviction::stamp(now))
+    }
+}
+
+/// The keys the command `name` names, used under the access scope it runs
+/// in (see `run_command`): for a command that answered with an error.
+#[cold]
+#[inline(never)]
+fn used_on_error(ctx: &Ctx, name: &str) {
+    let db = *ctx.selected_db;
+    for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+        let key = ctx.cmd[pos];
+        crate::read_lock!(crate::store::get_shard_of_bytes(&ctx.store[db], key)).use_key(key);
+    }
+}
+
+/// [`execute_command`], once the command's name is known; it started at
+/// `started`.
+fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`.
     if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
@@ -1061,9 +1121,20 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         None
     };
 
+    // Under an eviction policy that goes by use, the command's own lookups
+    // write it (see `eviction`): one atomic load when there is none.
+    let access = crate::eviction::recording().then(|| access_scope(name, started));
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
+    // A command refused for what it was given (a syntax error, say) can be
+    // refused before it looks its keys up; those keys are used all the
+    // same, as they were when the use was written after every command. Only
+    // on an error: a key it did look up is not counted again.
+    if access.is_some() && result.starts_with(b"-") {
+        used_on_error(ctx, name);
+    }
+    drop(access);
 
     if let Some(watch) = replacing {
         replace_watch_end(ctx, watch);
@@ -1123,16 +1194,13 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         hotkeys::record(ctx, name, result.len(), started.elapsed());
     }
 
-    // An eviction policy that goes by how keys are used is told which were.
-    // (Not by the commands that only ask about a key: Redis does not count
-    // those as a use of it either.)
+    // The uses its lookups did not write: a modification under the LRM
+    // policies, and the keys a script declares (see `eviction`). Not by the
+    // commands that only ask about a key: Redis does not count those as a
+    // use of it either.
     if crate::eviction::recording()
-        && !matches!(
-            name,
-            "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG"
-            // Records its own use, with what IDLETIME or FREQ said.
-            | "RESTORE"
-        )
+        && crate::eviction::used_after(is_script(name))
+        && !asks_only(name)
     {
         let wrote = writes_operation && !result.starts_with(b"-");
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
