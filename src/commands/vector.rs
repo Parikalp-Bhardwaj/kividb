@@ -1997,6 +1997,7 @@ fn ft_debug(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match sub.as_str() {
         "COMPACT" => ft_debug_compact(ctx),
         "POSTINGS" => ft_debug_postings(ctx),
+        "PAGE" => ft_debug_page(ctx),
         _ => Some(resp_error(&format!(
             "ERR unknown FT.DEBUG subcommand '{sub}'"
         ))),
@@ -2017,6 +2018,24 @@ fn ft_debug_postings(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&crate::commands::search::no_such_index(&name)));
     };
     def.postings.write().unused = !on;
+    Some(resp_simple("OK"))
+}
+
+/// `FT.DEBUG PAGE index ON|OFF`: whether a query whose page the postings
+/// know reads only the documents of that page (`search::page_from_postings`)
+/// or every document it matches, for comparing the two.
+fn ft_debug_page(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let cmd = &ctx.cmd;
+    let on = match cmd.get(3) {
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"ON") => true,
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"OFF") => false,
+        _ => return Some(resp_error("ERR syntax: FT.DEBUG PAGE <index> ON|OFF")),
+    };
+    let name = String::from_utf8_lossy(cmd[2]).into_owned();
+    let Some(def) = ctx.index_store.read().get(&name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(&name)));
+    };
+    def.postings.write().read_all = !on;
     Some(resp_simple("OK"))
 }
 

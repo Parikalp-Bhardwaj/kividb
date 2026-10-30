@@ -394,11 +394,23 @@ fn order_key(v: f64) -> u64 {
     }
 }
 
+/// The (value, document) of every document whose value is a number other
+/// than NaN, in the value's order, are in two places: most in a sorted list
+/// (`settled`), which a range is a slice of, read in order; those written
+/// since it was made, in a small B-tree (`recent`). Once that holds an
+/// eighth as many, the two are merged into a new list. A document written
+/// again or gone leaves its old entry in the list, passed over from then on
+/// (`in_settled`), until the next merge drops it. A range read off the list
+/// costs a fraction of one read off a B-tree of every value: an entry after
+/// the other in memory, not a node after the other.
 #[derive(Debug, Clone, Default)]
 struct NumericPostings {
-    /// (value, document) for every document whose value is a number other
-    /// than NaN, in the value's order.
-    sorted: BTreeSet<(u64, u32)>,
+    settled: Vec<(u64, u32)>,
+    /// The documents whose entry is the one in `settled`.
+    in_settled: Bits,
+    recent: BTreeSet<(u64, u32)>,
+    /// How many documents have a value other than NaN: entries of both.
+    ordered: usize,
     /// By document id: its value, if `has` it.
     values: Vec<f64>,
     /// The documents whose field reads as a number, NaN included.
@@ -423,7 +435,11 @@ impl NumericPostings {
         self.values[at] = v;
         self.has.set(doc);
         if !v.is_nan() {
-            self.sorted.insert((order_key(v), doc));
+            self.recent.insert((order_key(v), doc));
+            self.ordered += 1;
+            if self.recent.len() > (self.settled.len() / 8).max(1024) {
+                self.settle();
+            }
         }
     }
 
@@ -433,9 +449,60 @@ impl NumericPostings {
         }
         let v = self.values[doc as usize];
         if !v.is_nan() {
-            self.sorted.remove(&(order_key(v), doc));
+            if self.in_settled.get(doc) {
+                self.in_settled.unset(doc);
+            } else {
+                self.recent.remove(&(order_key(v), doc));
+            }
+            self.ordered -= 1;
         }
         self.has.unset(doc);
+    }
+
+    /// Merge `recent` into a new `settled`, without the entries passed over.
+    fn settle(&mut self) {
+        let mut recent = std::mem::take(&mut self.recent).into_iter().peekable();
+        let mut merged: Vec<(u64, u32)> = Vec::with_capacity(self.ordered);
+        for &entry in &self.settled {
+            if !self.in_settled.get(entry.1) {
+                continue;
+            }
+            while let Some(&next) = recent.peek() {
+                if next < entry {
+                    merged.push(next);
+                    recent.next();
+                } else {
+                    break;
+                }
+            }
+            merged.push(entry);
+        }
+        merged.extend(recent);
+        for &(_, doc) in &merged {
+            self.in_settled.set(doc);
+        }
+        self.settled = merged;
+    }
+
+    /// Every entry in order, ascending or not, into `each` until it returns
+    /// false.
+    fn walk(&self, ascending: bool, each: &mut dyn FnMut(u64, u32) -> bool) {
+        let live = |entry: &&(u64, u32)| self.in_settled.get(entry.1);
+        if ascending {
+            merge_walk(
+                self.settled.iter().filter(live),
+                self.recent.iter(),
+                |a, b| a < b,
+                each,
+            );
+        } else {
+            merge_walk(
+                self.settled.iter().rev().filter(live),
+                self.recent.iter().rev(),
+                |a, b| a > b,
+                each,
+            );
+        }
     }
 
     /// The documents whose value is in the range, ends included or not.
@@ -456,7 +523,14 @@ impl NumericPostings {
         if start > end {
             return;
         }
-        for &(_, doc) in self.sorted.range(start..=end) {
+        let from = self.settled.partition_point(|entry| *entry < start);
+        let to = self.settled.partition_point(|entry| *entry <= end);
+        for &(_, doc) in &self.settled[from..to] {
+            if self.in_settled.get(doc) {
+                out.set(doc);
+            }
+        }
+        for &(_, doc) in self.recent.range(start..=end) {
             out.set(doc);
         }
     }
@@ -464,7 +538,179 @@ impl NumericPostings {
     fn bytes(&self) -> usize {
         // A B-tree node holds up to 11 entries of 16 bytes and two words; at
         // two thirds full, some 26 bytes an entry.
-        self.sorted.len() * 26 + self.values.capacity() * 8 + self.has.bytes()
+        self.settled.capacity() * 16
+            + self.in_settled.bytes()
+            + self.recent.len() * 26
+            + self.values.capacity() * 8
+            + self.has.bytes()
+    }
+}
+
+/// Two runs of entries, each in order, into `each` in one order, until it
+/// returns false: `first(a, b)` says whether `a` comes before `b`.
+fn merge_walk<'a>(
+    a: impl Iterator<Item = &'a (u64, u32)>,
+    b: impl Iterator<Item = &'a (u64, u32)>,
+    first: impl Fn(&(u64, u32), &(u64, u32)) -> bool,
+    each: &mut dyn FnMut(u64, u32) -> bool,
+) {
+    let (mut a, mut b) = (a.peekable(), b.peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if first(*x, *y) => a.next(),
+            (Some(_), Some(_)) => b.next(),
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (None, None) => return,
+        };
+        if let Some(&(order, doc)) = next {
+            if !each(order, doc) {
+                return;
+            }
+        }
+    }
+}
+
+// ── The order of the keys ────────────────────────────────────────────────────
+//
+// A page ordered by key (FT.SEARCH without SORTBY or words to score) is read
+// off the ids in their keys' order, kept here: the first ten of 500,000
+// matches are the first ten matches met walking down this list, not the
+// least of 500,000 keys compared, each a cache miss away. It is brought up
+// to date by the queries that use it, not by writes: an id given out since
+// is kept aside (`added`) and compared by its key, and once those are many
+// they are merged in. An id that left, or went to another key, keeps its
+// old place in `sorted`, which no longer points back at it (`place`), and
+// is passed over.
+
+const NO_PLACE: u32 = u32::MAX;
+
+#[derive(Debug, Default)]
+struct KeyOrder {
+    /// Ids in the order of their keys, as of the last merge.
+    sorted: Vec<u32>,
+    /// By id: its place in `sorted`, or `NO_PLACE`.
+    place: Vec<u32>,
+    /// Ids given out since the last merge, in no order. Some have left
+    /// since, and some are here twice.
+    added: Vec<u32>,
+}
+
+/// The key of document `id`, from the postings' table of keys.
+#[inline]
+fn key_text(keys: &[Option<Arc<str>>], id: u32) -> &str {
+    keys.get(id as usize)
+        .and_then(|key| key.as_deref())
+        .unwrap_or("")
+}
+
+/// The first sixteen bytes of `key`, as a number that sorts as they do,
+/// shorter keys padded with zeros: two keys whose numbers differ are in that
+/// order, and two whose numbers are equal are left to their whole keys.
+#[inline]
+fn key_prefix(key: &str) -> u128 {
+    let mut bytes = [0u8; 16];
+    let n = key.len().min(16);
+    bytes[..n].copy_from_slice(&key.as_bytes()[..n]);
+    u128::from_be_bytes(bytes)
+}
+
+impl KeyOrder {
+    fn added(&mut self, id: u32) {
+        let at = id as usize;
+        if at >= self.place.len() {
+            self.place.resize(at + 1, NO_PLACE);
+        }
+        self.place[at] = NO_PLACE;
+        self.added.push(id);
+    }
+
+    fn removed(&mut self, id: u32) {
+        if let Some(place) = self.place.get_mut(id as usize) {
+            *place = NO_PLACE;
+        }
+    }
+
+    #[inline]
+    fn placed(&self, id: u32) -> Option<u32> {
+        match self.place.get(id as usize) {
+            Some(&place) if place != NO_PLACE => Some(place),
+            _ => None,
+        }
+    }
+
+    /// The ids of `added` still waiting for a place, once each.
+    fn waiting(&self, keys: &[Option<Arc<str>>]) -> Vec<u32> {
+        let mut waiting: Vec<u32> = self
+            .added
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.placed(id).is_none() && keys.get(id as usize).is_some_and(Option::is_some)
+            })
+            .collect();
+        waiting.sort_unstable();
+        waiting.dedup();
+        waiting
+    }
+
+    /// Give every id waiting its place: sorted by key, merged with those in
+    /// place, every place written again.
+    fn merge(&mut self, keys: &[Option<Arc<str>>]) {
+        let mut fresh = self.waiting(keys);
+        self.added = Vec::new();
+        // By the first bytes of the keys, in a list of their own, then by
+        // the whole keys where those are equal: sorting by the keys
+        // themselves would go to each, at random, at each comparison.
+        let mut tagged: Vec<(u128, u32)> = fresh
+            .iter()
+            .map(|&id| (key_prefix(key_text(keys, id)), id))
+            .collect();
+        tagged.sort_unstable();
+        let mut start = 0;
+        while start < tagged.len() {
+            let mut end = start + 1;
+            while end < tagged.len() && tagged[end].0 == tagged[start].0 {
+                end += 1;
+            }
+            if end - start > 1 {
+                tagged[start..end]
+                    .sort_unstable_by(|a, b| key_text(keys, a.1).cmp(key_text(keys, b.1)));
+            }
+            start = end;
+        }
+        fresh.clear();
+        fresh.extend(tagged.iter().map(|&(_, id)| id));
+
+        let mut merged: Vec<u32> = Vec::with_capacity(self.sorted.len() + fresh.len());
+        let mut fresh = fresh.into_iter().peekable();
+        for (at, &id) in self.sorted.iter().enumerate() {
+            if self.place.get(id as usize) != Some(&(at as u32)) {
+                continue;
+            }
+            let key = key_text(keys, id);
+            while let Some(&next) = fresh.peek() {
+                if key_text(keys, next) < key {
+                    merged.push(next);
+                    fresh.next();
+                } else {
+                    break;
+                }
+            }
+            merged.push(id);
+        }
+        merged.extend(fresh);
+        if self.place.len() < keys.len() {
+            self.place.resize(keys.len(), NO_PLACE);
+        }
+        for (at, &id) in merged.iter().enumerate() {
+            self.place[id as usize] = at as u32;
+        }
+        self.sorted = merged;
+    }
+
+    fn bytes(&self) -> usize {
+        (self.sorted.capacity() + self.place.capacity() + self.added.capacity()) * 4
     }
 }
 
@@ -499,6 +745,18 @@ pub struct Postings {
     /// document is tried, as before there were any. For comparing the two.
     /// They are still kept.
     pub unused: bool,
+    /// Queries read every document they match, not only those of the page
+    /// they return (`FT.DEBUG PAGE index OFF`): see `search::page_from_postings`.
+    /// For comparing the two.
+    pub read_all: bool,
+    /// The ids in the order of their keys: see `KeyOrder`. Behind a lock of
+    /// its own, as queries bring it up to date under a read lock of these:
+    /// they read it together, and one at a time merges into it.
+    order: parking_lot::RwLock<KeyOrder>,
+    /// By id: its key's cluster hash slot, for a query in a cluster to keep
+    /// only the documents of the slots its node serves without hashing
+    /// every key it matches.
+    slots: Vec<u16>,
 }
 
 /// The postings of an index, shared by its clones.
@@ -551,6 +809,12 @@ impl Postings {
         self.keys.get(id as usize).and_then(Option::as_ref)
     }
 
+    /// The cluster hash slot of document `id`'s key.
+    #[inline]
+    pub fn slot(&self, id: u32) -> u16 {
+        self.slots.get(id as usize).copied().unwrap_or(0)
+    }
+
     /// Every document of the index.
     pub fn live(&self) -> &Bits {
         &self.live
@@ -580,8 +844,19 @@ impl Postings {
                 (self.keys.len() - 1) as u32
             }
         };
+        let at = id as usize;
+        if at >= self.slots.len() {
+            self.slots.resize(at + 1, 0);
+        }
+        self.slots[at] = crate::cluster::key_hash_slot(key.as_bytes());
         self.ids.insert(key, id);
         self.live.set(id);
+        let order = self.order.get_mut();
+        order.added(id);
+        // Never queried by key, the list of ids waiting would only grow.
+        if order.added.len() > 2 * self.ids.len() + 4096 {
+            order.added = order.waiting(&self.keys);
+        }
         id
     }
 
@@ -638,12 +913,14 @@ impl Postings {
         self.keys[id as usize] = None;
         self.live.unset(id);
         self.free.push(id);
+        self.order.get_mut().removed(id);
     }
 
     /// Forget every document (the index is being filled again).
     pub fn clear(&mut self) {
         let mut fresh = Postings {
             unused: self.unused,
+            read_all: self.read_all,
             ..Postings::default()
         };
         for field in &self.fields {
@@ -690,6 +967,106 @@ impl Postings {
         })
     }
 
+    /// The first `need` of `ids` (`of` of them) in the order of their keys.
+    /// `ran_out` is asked at each step of the walk that finds them, and once
+    /// it says so they are the first of those found.
+    pub fn first_by_key(
+        &self,
+        ids: &Bits,
+        need: usize,
+        of: usize,
+        ran_out: &mut dyn FnMut() -> bool,
+    ) -> Vec<u32> {
+        if need == 0 {
+            return Vec::new();
+        }
+        // A sixteenth more, and at least a few hundred: a merge goes through
+        // every place, and the waiting are sorted again at each query.
+        let behind = |order: &KeyOrder| order.added.len() > (order.sorted.len() / 16).max(256);
+        let mut order = self.order.read();
+        if behind(&order) {
+            drop(order);
+            let mut merging = self.order.write();
+            // Unless another query has merged meanwhile.
+            if behind(&merging) {
+                merging.merge(&self.keys);
+            }
+            order = parking_lot::RwLockWriteGuard::downgrade(merging);
+        }
+        let order = &*order;
+        // Those with a place. Walking the places meets the `need` first
+        // after about need * places / of of them; looking up the place of
+        // each, after `of`. Whichever is fewer.
+        let mut first: Vec<u32> = Vec::with_capacity(need.min(of));
+        let places = order.sorted.len();
+        if (need as u128) * (places as u128) < (of as u128) * (of as u128) {
+            for (at, &id) in order.sorted.iter().enumerate() {
+                if ran_out() {
+                    break;
+                }
+                if order.place[id as usize] == at as u32 && ids.get(id) {
+                    first.push(id);
+                    if first.len() == need {
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut placed: Vec<(u32, u32)> = Vec::with_capacity(of);
+            for id in ids.iter() {
+                if ran_out() {
+                    break;
+                }
+                if let Some(place) = order.placed(id) {
+                    placed.push((place, id));
+                }
+            }
+            if need < placed.len() {
+                placed.select_nth_unstable(need);
+                placed.truncate(need);
+            }
+            placed.sort_unstable();
+            first.extend(placed.iter().map(|&(_, id)| id));
+        }
+        // Those still waiting for a place: by their keys, then the two lists
+        // merged.
+        let mut late: Vec<u32> = order
+            .added
+            .iter()
+            .copied()
+            .filter(|&id| ids.get(id) && order.placed(id).is_none())
+            .collect();
+        if late.is_empty() {
+            return first;
+        }
+        late.sort_unstable();
+        late.dedup();
+        let key = |id: u32| key_text(&self.keys, id);
+        if need < late.len() {
+            late.select_nth_unstable_by(need, |&a, &b| key(a).cmp(key(b)));
+            late.truncate(need);
+        }
+        late.sort_unstable_by(|&a, &b| key(a).cmp(key(b)));
+        let mut out = Vec::with_capacity(need);
+        let (mut a, mut b) = (first.into_iter().peekable(), late.into_iter().peekable());
+        while out.len() < need {
+            let next = match (a.peek(), b.peek()) {
+                (Some(&x), Some(&y)) if key(x) < key(y) => a.next(),
+                (Some(_), Some(_)) => b.next(),
+                (Some(_), None) => a.next(),
+                (None, Some(_)) => b.next(),
+                (None, None) => break,
+            };
+            out.extend(next);
+        }
+        out
+    }
+
+    /// The postings of the NUMERIC field read from `field`, to order by.
+    pub fn numbers(&self, field: &str) -> Option<Numbers<'_>> {
+        self.numeric_field(field).map(Numbers)
+    }
+
     /// The documents a `@field:[lo hi]` clause matches.
     pub fn range(
         &self,
@@ -727,7 +1104,9 @@ impl Postings {
                 .map(|k| 16 + k.len())
                 .sum::<usize>()
             + self.free.capacity() * 4
-            + self.live.bytes();
+            + self.slots.capacity() * 2
+            + self.live.bytes()
+            + self.order.read().bytes();
         let mut tags = 0;
         let mut numbers = 0;
         let mut tag_values = 0;
@@ -746,6 +1125,46 @@ impl Postings {
             numbers,
             tag_values,
         }
+    }
+}
+
+/// The postings of one NUMERIC field, as `SORTBY` reads them.
+pub struct Numbers<'a>(&'a NumericPostings);
+
+impl<'a> Numbers<'a> {
+    /// The documents whose field reads as a number, NaN included.
+    pub fn has(&self) -> &'a Bits {
+        &self.0.has
+    }
+
+    /// Whether some document's value is NaN: those are in no order here.
+    pub fn any_nan(&self) -> bool {
+        self.0.has.count() != self.0.ordered
+    }
+
+    /// How many documents have a value other than NaN: what [`Numbers::walk`]
+    /// goes through.
+    pub fn ordered(&self) -> usize {
+        self.0.ordered
+    }
+
+    /// The number document `id` holds, if it holds one.
+    #[inline]
+    pub fn value(&self, id: u32) -> Option<f64> {
+        if self.0.has.get(id) {
+            Some(self.0.values[id as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Every document with a value other than NaN, in the order of its
+    /// value, ascending or descending, into `each` until it returns false:
+    /// each with the value's place in that order, which is the same for
+    /// equal values (minus zero and zero too). Equal values come in the
+    /// order of their ids, or the reverse.
+    pub fn walk(&self, ascending: bool, mut each: impl FnMut(u64, u32) -> bool) {
+        self.0.walk(ascending, &mut each);
     }
 }
 
@@ -865,6 +1284,7 @@ mod tests {
                 .is_empty()
         );
         assert!(p.live().is_empty());
+        assert_eq!(p.slot(0), crate::cluster::key_hash_slot(b"a"));
         // Its id is given out again.
         assert_eq!(put(&mut p, "b", "red", "1"), 0);
     }
@@ -899,6 +1319,186 @@ mod tests {
             keys(&p, &p.not_equal("n", 0.0).unwrap()),
             ["a", "d", "e", "g"]
         );
+    }
+
+    #[test]
+    fn keys_come_in_their_order_through_writes_and_merges() {
+        let mut p = Postings::new(&schema());
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut ran_out = || false;
+        for round in 0..30 {
+            // Keys added, removed and added again: ids go to other keys, and
+            // the waiting list grows past what makes a query merge it.
+            for _ in 0..700 {
+                let key = format!("k{}", next() % 6000);
+                if next() % 3 == 0 {
+                    p.remove(&key);
+                } else {
+                    put(&mut p, &key, "", "1");
+                }
+            }
+            let keep = [100, 60, 20, 3][round % 4];
+            let mut ids = Bits::new();
+            for id in p.live().iter() {
+                if next() % 100 < keep {
+                    ids.set(id);
+                }
+            }
+            let of = ids.count();
+            let mut whole: Vec<u32> = ids.iter().collect();
+            whole.sort_by(|&a, &b| p.key(a).unwrap().cmp(p.key(b).unwrap()));
+            for need in [1, 2, 10, of / 3, of] {
+                let need = need.min(of);
+                let first = p.first_by_key(&ids, need, of, &mut ran_out);
+                assert_eq!(
+                    first.as_slice(),
+                    &whole[..need],
+                    "round {round}, {need} of {of}"
+                );
+            }
+        }
+        // Keys alike in their first sixteen bytes, and one a prefix of
+        // another.
+        let mut p = Postings::new(&schema());
+        for key in [
+            "same-sixteen-byteZ",
+            "same-sixteen-byte",
+            "same-sixteen-byteA",
+            "s",
+            "",
+        ] {
+            put(&mut p, key, "", "1");
+        }
+        p.order.write().merge(&p.keys);
+        let all = p.live().clone();
+        let first: Vec<String> = p
+            .first_by_key(&all, 5, 5, &mut ran_out)
+            .into_iter()
+            .map(|id| p.key(id).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            first,
+            [
+                "",
+                "s",
+                "same-sixteen-byte",
+                "same-sixteen-byteA",
+                "same-sixteen-byteZ"
+            ]
+        );
+    }
+
+    #[test]
+    fn numbers_settled_and_recent_answer_as_one() {
+        // Enough writes for several merges, values written again and gone
+        // between them, every range and both walks checked against the
+        // values themselves.
+        let mut p = Postings::new(&schema());
+        let mut seed = 0x1319_8a2e_0370_7344u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut model: std::collections::BTreeMap<String, f64> = Default::default();
+        for round in 0..12 {
+            for _ in 0..1500 {
+                let key = format!("k{}", next() % 3000);
+                match next() % 5 {
+                    0 => {
+                        p.remove(&key);
+                        model.remove(&key);
+                    }
+                    1 => {
+                        // No number: out of the field.
+                        put(&mut p, &key, "", "x");
+                        model.remove(&key);
+                    }
+                    _ => {
+                        let v = (next() % 200) as f64 - 100.0;
+                        put(&mut p, &key, "", &v.to_string());
+                        model.insert(key, v);
+                    }
+                }
+            }
+            let numbers = p.numbers("n").unwrap();
+            assert_eq!(numbers.ordered(), model.len(), "round {round}");
+            assert!(!numbers.any_nan());
+            for _ in 0..20 {
+                let a = (next() % 220) as f64 - 110.0;
+                let b = (next() % 220) as f64 - 110.0;
+                let (lo, hi) = (a.min(b), a.max(b));
+                let (lx, hx) = (next() % 2 == 0, next() % 2 == 0);
+                let mut want: Vec<String> = model
+                    .iter()
+                    .filter(|&(_, &v)| {
+                        (if lx { v > lo } else { v >= lo }) && (if hx { v < hi } else { v <= hi })
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                want.sort();
+                let got = keys(&p, &p.range("n", lo, lx, hi, hx).unwrap());
+                assert_eq!(got, want, "round {round}: {lo} {lx} {hi} {hx}");
+            }
+            for ascending in [true, false] {
+                let mut walked: Vec<(f64, u32)> = Vec::new();
+                numbers.walk(ascending, |_, id| {
+                    walked.push((numbers.value(id).unwrap(), id));
+                    true
+                });
+                assert_eq!(walked.len(), model.len());
+                let mut ids: Vec<u32> = walked.iter().map(|w| w.1).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                assert_eq!(ids.len(), walked.len(), "an id twice");
+                assert!(walked.windows(2).all(|w| if ascending {
+                    (w[0].0, w[0].1) < (w[1].0, w[1].1)
+                } else {
+                    (w[0].0, w[0].1) > (w[1].0, w[1].1)
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn numbers_are_walked_in_their_order_either_way() {
+        let mut p = Postings::new(&schema());
+        for (key, n) in [("a", "3"), ("b", "-1"), ("c", "3"), ("d", "x"), ("e", "-0")] {
+            put(&mut p, key, "", n);
+        }
+        let numbers = p.numbers("n").unwrap();
+        assert!(!numbers.any_nan());
+        assert_eq!(numbers.ordered(), 4);
+        assert_eq!(numbers.has().count(), 4);
+        assert_eq!(numbers.value(p.id("d").unwrap()), None);
+        assert_eq!(numbers.value(p.id("b").unwrap()), Some(-1.0));
+        let walked = |ascending: bool| {
+            let mut out = Vec::new();
+            numbers.walk(ascending, |_, id| {
+                out.push(p.key(id).unwrap().to_string());
+                true
+            });
+            out
+        };
+        assert_eq!(walked(true), ["b", "e", "a", "c"]);
+        assert_eq!(walked(false), ["c", "a", "e", "b"]);
+        // Stopped by its callback.
+        let mut seen = 0;
+        numbers.walk(true, |_, _| {
+            seen += 1;
+            seen < 2
+        });
+        assert_eq!(seen, 2);
+        put(&mut p, "f", "", "nan");
+        assert!(p.numbers("n").unwrap().any_nan());
+        assert!(p.numbers("t").is_none());
     }
 
     #[test]

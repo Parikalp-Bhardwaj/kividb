@@ -1072,10 +1072,409 @@ fn hybrid_policy_is_checked() {
     assert_eq!(reply.arr()[0], V::Int(5), "{reply:?}");
 }
 
+// ── The page from postings ────────────────────────────────────────────────────
+//
+// A query whose matches the postings know exactly reads only the documents
+// of the page it returns (`search::page_from_postings`). Its reply must be
+// the reply of the query that reads every match (`FT.DEBUG PAGE … OFF`),
+// whatever the query asks for, and its count the model's: no document whose
+// key has expired, even before anything has deleted it, and none deleted.
+
+/// Held by every test of this file that times a query out (as in
+/// tests/search.rs: `FT.CONFIG` is the process's).
+fn timeout_test() -> std::sync::MutexGuard<'static, ()> {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn page(c: &mut Conn, index: &str, on: bool) {
+    let reply = c.cmd(&["FT.DEBUG", "PAGE", index, if on { "ON" } else { "OFF" }]);
+    assert!(reply.ok(), "{reply:?}");
+}
+
+/// FT.SEARCH `index` `args`: the page from postings, every match read, and
+/// every document tried (postings off). Asked again if a key was deleted
+/// meanwhile (the active expiry cycle): relevance counts the documents.
+fn three_ways(c: &mut Conn, index: &str, args: &[String]) -> (V, V, V) {
+    let mut cmd: Vec<&str> = vec!["FT.SEARCH", index];
+    cmd.extend(args.iter().map(String::as_str));
+    loop {
+        let before = c.cmd(&["DBSIZE"]);
+        let paged = c.cmd(&cmd);
+        page(c, index, false);
+        let whole = c.cmd(&cmd);
+        postings(c, index, false);
+        let scanned = c.cmd(&cmd);
+        postings(c, index, true);
+        page(c, index, true);
+        if c.cmd(&["DBSIZE"]) == before {
+            return (paged, whole, scanned);
+        }
+    }
+}
+
+/// The count of an FT.SEARCH reply, in either protocol.
+fn total_of(reply: &V) -> i64 {
+    match reply {
+        V::Map(_) => reply.get("total_results").i(),
+        V::Arr(items) => items[0].i(),
+        other => panic!("not a search reply: {other:?}"),
+    }
+}
+
+/// Values of the NUMERIC field `o`: ties, minus zero beside zero, the
+/// infinities, and one that is no number. No NaN: with one, SORTBY o would
+/// read every match.
+const O_VALUES: [&str; 9] = ["3", "-0", "0", "x", "-1.5", "3", "inf", "-inf", "12"];
+
+/// The options of a random FT.SEARCH of `query`, and whether its count is
+/// the number of documents the filter matches (no INKEYS, no FILTER).
+fn random_shape(rng: &mut Rng, query: String, keys: &[String]) -> (Vec<String>, bool) {
+    let mut args = vec![query];
+    let mut plain = true;
+    let push = |args: &mut Vec<String>, words: &[&str]| {
+        args.extend(words.iter().map(|w| w.to_string()));
+    };
+    if rng.chance(35) {
+        push(&mut args, &["NOCONTENT"]);
+    }
+    if rng.chance(30) {
+        push(&mut args, &["WITHSCORES"]);
+    }
+    if rng.chance(20) {
+        push(&mut args, &["WITHSORTKEYS"]);
+    }
+    match rng.below(10) {
+        0 | 1 => push(&mut args, &["RETURN", "2", "c", "o"]),
+        2 => push(&mut args, &["RETURN", "3", "m", "AS", "mm"]),
+        3 => push(&mut args, &["RETURN", "0"]),
+        _ => {}
+    }
+    let sortby = match rng.below(12) {
+        0..=2 => Some("o"),
+        3 | 4 => Some("m"),
+        // NaN in it: every match read.
+        5 => Some("n"),
+        // A TAG field: every match read.
+        6 => Some("c"),
+        _ => None,
+    };
+    if let Some(field) = sortby {
+        push(&mut args, &["SORTBY", field]);
+        match rng.below(3) {
+            0 => push(&mut args, &["ASC"]),
+            1 => push(&mut args, &["DESC"]),
+            _ => {}
+        }
+    }
+    if rng.chance(10) {
+        push(&mut args, &["HIGHLIGHT", "FIELDS", "1", "t"]);
+    }
+    if rng.chance(10) && !keys.is_empty() {
+        let n = 1 + rng.below(30);
+        push(&mut args, &["INKEYS", (n + 1).to_string().as_str()]);
+        for _ in 0..n {
+            let key = keys[rng.below(keys.len())].clone();
+            args.push(key);
+        }
+        args.push("no:such:key".into());
+        plain = false;
+    }
+    if rng.chance(10) {
+        let lo = rng.below(8).to_string();
+        let hi = (4 + rng.below(12)).to_string();
+        push(&mut args, &["FILTER", "m", lo.as_str(), hi.as_str()]);
+        plain = false;
+    }
+    match rng.below(7) {
+        0 => {}
+        1 => push(&mut args, &["LIMIT", "0", "0"]),
+        2 => push(&mut args, &["LIMIT", "100000", "10"]),
+        3 => {
+            let offset = (200 + rng.below(250)).to_string();
+            push(&mut args, &["LIMIT", offset.as_str(), "10"]);
+        }
+        _ => {
+            let offset = rng.below(60).to_string();
+            let count = (1 + rng.below(15)).to_string();
+            push(&mut args, &["LIMIT", offset.as_str(), count.as_str()]);
+        }
+    }
+    (args, plain)
+}
+
+fn create_paged(c: &mut Conn, index: &str, prefix: &str, json: bool) {
+    let schema: &[&str] = if json {
+        &[
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            prefix,
+            "SCHEMA",
+            "$.t",
+            "AS",
+            "t",
+            "TEXT",
+            "$.c",
+            "AS",
+            "c",
+            "TAG",
+            "$.s",
+            "AS",
+            "s",
+            "TAG",
+            "SEPARATOR",
+            ";",
+            "CASESENSITIVE",
+            "$.n",
+            "AS",
+            "n",
+            "NUMERIC",
+            "$.m",
+            "AS",
+            "m",
+            "NUMERIC",
+            "SORTABLE",
+            "$.o",
+            "AS",
+            "o",
+            "NUMERIC",
+        ]
+    } else {
+        &[
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix,
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "c",
+            "TAG",
+            "s",
+            "TAG",
+            "SEPARATOR",
+            ";",
+            "CASESENSITIVE",
+            "n",
+            "NUMERIC",
+            "m",
+            "NUMERIC",
+            "SORTABLE",
+            "o",
+            "NUMERIC",
+        ]
+    };
+    let mut args = vec!["FT.CREATE", index];
+    args.extend_from_slice(schema);
+    let reply = c.cmd(&args);
+    assert!(reply.ok(), "{reply:?}");
+}
+
+/// A document as JSON: numbers as numbers where they are finite ones.
+fn json_doc(doc: &Doc) -> String {
+    let fields: Vec<String> = doc
+        .iter()
+        .map(|(field, value)| {
+            let number = value.trim().parse::<f64>().ok().filter(|n| n.is_finite());
+            match number {
+                Some(_) if matches!(field.as_str(), "n" | "m" | "o") => {
+                    format!("\"{field}\":{}", value.trim())
+                }
+                _ => format!("\"{field}\":\"{}\"", value.replace('"', "")),
+            }
+        })
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}
+
+/// Some keys given a time to live that ends in a few milliseconds and some
+/// one that does not, then a wait past the first: queries made at once find
+/// those keys expired before the active cycle (every 100 ms) deletes most of
+/// them.
+fn expire_some(c: &mut Conn, rng: &mut Rng, model: &mut BTreeMap<String, Doc>) {
+    for i in 0..7 {
+        if model.is_empty() {
+            return;
+        }
+        let key = model.keys().nth(rng.below(model.len())).unwrap().clone();
+        if i < 4 {
+            assert_eq!(c.cmd(&["PEXPIRE", &key, "15"]), V::Int(1));
+            model.remove(&key);
+        } else {
+            assert_eq!(c.cmd(&["PEXPIRE", &key, "600000"]), V::Int(1));
+        }
+    }
+    thread::sleep(Duration::from_millis(20));
+}
+
+/// Random queries of every shape, each three ways, on hashes and on JSON,
+/// with documents written, deleted and expired between rounds.
+#[test]
+fn a_page_from_postings_is_the_page_of_every_match() {
+    let mut c = conn();
+    let mut rng = Rng(0x6a09_e667_f3bc_c909);
+    for json in [false, true] {
+        let (index, prefix) = if json { ("pj", "pj:") } else { ("ph", "ph:") };
+        create_paged(&mut c, index, prefix, json);
+        let mut model: BTreeMap<String, Doc> = BTreeMap::new();
+        let write = |c: &mut Conn, rng: &mut Rng, key: &str| -> Doc {
+            let mut doc = random_doc(rng, false);
+            if rng.chance(85) {
+                doc.insert("o".into(), rng.pick(&O_VALUES).to_string());
+            }
+            if doc.is_empty() {
+                doc.insert("other".into(), "1".into());
+            }
+            if json {
+                let reply = c.cmd(&["JSON.SET", key, "$", &json_doc(&doc)]);
+                assert!(reply.ok(), "{reply:?}");
+            } else {
+                hset(c, key, &doc);
+            }
+            doc
+        };
+        for i in 0..400 {
+            let key = format!("{prefix}{i}");
+            let doc = write(&mut c, &mut rng, &key);
+            model.insert(key, doc);
+        }
+        let mut next = 400;
+        for round in 0..5 {
+            for batch in 0..4 {
+                expire_some(&mut c, &mut rng, &mut model);
+                let keys: Vec<String> = model.keys().cloned().collect();
+                let resp3 = batch == 3;
+                if resp3 {
+                    c.cmd(&["HELLO", "3"]);
+                }
+                for _ in 0..15 {
+                    let filter = random_filter(&mut rng, 3);
+                    let (args, plain) = random_shape(&mut rng, filter.query(), &keys);
+                    let (paged, whole, scanned) = three_ways(&mut c, index, &args);
+                    assert_eq!(paged, whole, "json {json}, round {round}: {args:?}");
+                    assert_eq!(scanned, whole, "json {json}, round {round}: {args:?}");
+                    if plain && !json {
+                        let expected = model.values().filter(|doc| filter.eval(doc)).count();
+                        assert_eq!(
+                            total_of(&paged),
+                            expected as i64,
+                            "round {round}: {args:?}: {paged:?}"
+                        );
+                    }
+                }
+                if resp3 {
+                    c.cmd(&["HELLO", "2"]);
+                }
+            }
+            if json {
+                // Some documents deleted, some written again or added.
+                for _ in 0..30 {
+                    let key = format!("{prefix}{}", rng.below(next + 20));
+                    if rng.chance(40) {
+                        c.cmd(&["DEL", &key]);
+                        model.remove(&key);
+                    } else {
+                        let doc = write(&mut c, &mut rng, &key);
+                        model.insert(key, doc);
+                    }
+                }
+                next += 20;
+            } else {
+                mutate(&mut c, &mut rng, prefix, &mut model, &mut next);
+            }
+        }
+    }
+}
+
+/// The count read off postings is exact: documents deleted are not in it,
+/// nor those whose key has expired, deleted yet or not. With more keys to
+/// live a while than matches,
+/// the documents are read instead, and the count is the same.
+#[test]
+fn a_count_from_postings_leaves_out_what_is_gone() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "pc",
+            "PREFIX",
+            "1",
+            "pc:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "o",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    for start in (0..2000).step_by(250) {
+        for i in start..start + 250 {
+            let key = format!("pc:{i}");
+            let o = (i % 100).to_string();
+            c.send(&[b"HSET", key.as_bytes(), b"c", b"red", b"o", o.as_bytes()]);
+        }
+        for _ in 0..250 {
+            c.read();
+        }
+    }
+    let count = |c: &mut Conn, query: &str| -> i64 {
+        total_of(&c.cmd(&["FT.SEARCH", "pc", query, "NOCONTENT", "LIMIT", "0", "0"]))
+    };
+    assert_eq!(count(&mut c, "@c:{red}"), 2000);
+    for i in 0..10 {
+        assert_eq!(c.cmd(&["DEL", &format!("pc:{i}")]), V::Int(1));
+    }
+    // To live on: 200 keys with a time to live, all matches.
+    for i in 10..210 {
+        assert_eq!(c.cmd(&["EXPIRE", &format!("pc:{i}"), "600"]), V::Int(1));
+    }
+    let mut checked = 0;
+    for attempt in 0..20 {
+        // Expired a moment ago; most are still there when the queries run.
+        let gone: Vec<String> = (0..15)
+            .map(|i| format!("pc:{}", 300 + attempt * 15 + i))
+            .collect();
+        for key in &gone {
+            assert_eq!(c.cmd(&["PEXPIRE", key, "10"]), V::Int(1));
+        }
+        thread::sleep(Duration::from_millis(15));
+        let left = 2000 - 10 - 15 * (attempt as i64 + 1);
+        assert_eq!(count(&mut c, "@c:{red}"), left, "attempt {attempt}");
+        assert_eq!(count(&mut c, "*"), left, "attempt {attempt}");
+        // `o` is 0..99 across the keys: those of 0 to 4, about 100 of them,
+        // fewer than the 200 keys with a time to live: read.
+        let few = (0..2000)
+            .filter(|i| *i >= 10 && (*i < 300 || *i >= 300 + 15 * (attempt + 1)))
+            .filter(|i| i % 100 < 5)
+            .count() as i64;
+        assert_eq!(count(&mut c, "@o:[0 4]"), few, "attempt {attempt}");
+        for args in [
+            vec!["@c:{red}", "NOCONTENT"],
+            vec!["@c:{red}", "SORTBY", "o", "DESC", "LIMIT", "0", "20"],
+            vec!["*", "SORTBY", "o", "LIMIT", "90", "30", "WITHSORTKEYS"],
+            vec!["-@o:[10 90]", "LIMIT", "5", "5"],
+        ] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (paged, whole, scanned) = three_ways(&mut c, "pc", &args);
+            assert_eq!(paged, whole, "{args:?}");
+            assert_eq!(scanned, whole, "{args:?}");
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 20);
+}
+
 /// `TIMEOUT` cuts a query answered from postings short, as it does a scan:
-/// documents are added until a 1 ms query reports it.
+/// documents are added until a 1 ms query reports it. Its matches are read
+/// (`FT.DEBUG PAGE … OFF`): a count read off postings takes no time to
+/// speak of, and is whole, as the end shows.
 #[test]
 fn a_query_from_postings_keeps_its_timeout() {
+    let _one = timeout_test();
     let mut c = conn();
     assert!(c.cmd(&["HELLO", "3"]).get("proto").i() == 3);
     assert!(
@@ -1093,6 +1492,7 @@ fn a_query_from_postings_keeps_its_timeout() {
         ])
         .ok()
     );
+    page(&mut c, "pt", false);
     let warned = |reply: &V| {
         match reply {
         V::Map(pairs) => pairs.iter().any(|(k, v)| {
@@ -1184,5 +1584,20 @@ fn a_query_from_postings_keeps_its_timeout() {
         "c",
     ]);
     assert!(warned(&agg), "{agg:?}");
+    // Counted off the postings: whole, in any time.
+    page(&mut c, "pt", true);
+    let counted = c.cmd(&[
+        "FT.SEARCH",
+        "pt",
+        "@c:{red}",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(!warned(&counted), "{counted:?}");
+    assert_eq!(counted.get("total_results").i(), n as i64, "{counted:?}");
     c.cmd(&["HELLO", "2"]);
 }
