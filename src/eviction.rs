@@ -345,17 +345,15 @@ pub fn recording() -> bool {
 
 /// `key` was read, or written: its word is brought up to date, in place,
 /// with its shard locked for reading (see `ShardMap::touch`). A key that is
-/// not there is left alone.
+/// not there is left alone. The key is found by its bytes, without asking
+/// whether they are UTF-8 (that check was a quarter of this).
 pub fn used(store: &Store, db: usize, key: &[u8], wrote: bool) {
     let track = track();
     if track == Track::Off || (track == Track::Modified && !wrote) {
         return;
     }
-    let Ok(key) = std::str::from_utf8(key) else {
-        return;
-    };
     let seconds = clock();
-    crate::store::get_shard(&store[db], key)
+    crate::store::get_shard_of_bytes(&store[db], key)
         .read()
         .touch(key, |word| {
             Access::after_use(word, track, seconds, rand::random::<f64>)
@@ -386,11 +384,8 @@ pub fn restored(store: &Store, db: usize, key: &[u8], idle: Option<u64>, freq: O
     if track == Track::Off {
         return;
     }
-    let Ok(key) = std::str::from_utf8(key) else {
-        return;
-    };
     let seconds = clock();
-    crate::store::get_shard(&store[db], key)
+    crate::store::get_shard_of_bytes(&store[db], key)
         .read()
         .touch(key, |word| match (track, idle, freq) {
             (Track::Frequency, _, Some(freq)) => Access::lfu_word(seconds / 60, freq),

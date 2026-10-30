@@ -293,7 +293,7 @@ fn compaction_moves_entries_and_their_strings_out_of_sparse_slabs() {
         let held = map.get_ref(&key(15, 5)).unwrap();
         // Each key's access word, to see that it moves with its entry.
         for i in (0..n).filter(|i| i.is_multiple_of(5)) {
-            map.touch(&key(klen(i), i), |_| i as u32 + 1);
+            map.touch(key(klen(i), i).as_bytes(), |_| i as u32 + 1);
         }
         let chosen = value_slab::plan_evacuation(usize::MAX);
         assert!(chosen > 0);
@@ -333,10 +333,10 @@ fn the_access_word_follows_the_key() {
     on_a_thread(|| {
         let mut map = ShardMap::new();
         assert_eq!(map.access("k"), None);
-        map.touch("k", |_| panic!("no such key"));
+        map.touch(b"k", |_| panic!("no such key"));
         map.insert_str("k", b"v");
         assert_eq!(map.access("k"), Some(0), "a new entry's word");
-        map.touch("k", |w| w + 7);
+        map.touch(b"k", |w| w + 7);
         assert_eq!(map.access("k"), Some(7));
         // Written over: by a string inline, a long one, a collection, an
         // entry made unlocked.
@@ -362,7 +362,7 @@ fn the_access_word_follows_the_key() {
         assert_eq!(map.access("k"), Some(7));
         drop(held);
         // `touch` sees what is there, and the same word is no write.
-        map.touch("k", |w| {
+        map.touch(b"k", |w| {
             assert_eq!(w, 7);
             w
         });
@@ -391,7 +391,7 @@ fn touching_a_held_entry_changes_nothing_a_holder_reads() {
             let map = Arc::clone(&map);
             thread::spawn(move || {
                 for i in 0..rounds {
-                    map.read().unwrap().touch("k", |_| i as u32);
+                    map.read().unwrap().touch(b"k", |_| i as u32);
                 }
             })
         };

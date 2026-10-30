@@ -19,8 +19,15 @@ pub use shard_map::{
 /// constants); the shard is taken from its low bits.
 #[inline]
 pub fn shard_index(shards: usize, key: &str) -> usize {
+    shard_index_of_bytes(shards, key.as_bytes())
+}
+
+/// [`shard_index`] of a key as the command gave it, not yet checked to be
+/// UTF-8 (the same shard: the hash is of the bytes).
+#[inline]
+pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in key.bytes() {
+    for &byte in key {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -30,6 +37,12 @@ pub fn shard_index(shards: usize, key: &str) -> usize {
 #[inline(always)]
 pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
     &db[shard_index(db.len(), key)]
+}
+
+/// [`get_shard`] of a key as the command gave it, in bytes.
+#[inline(always)]
+pub fn get_shard_of_bytes<'a>(db: &'a Db, key: &[u8]) -> &'a Shard {
+    &db[shard_index_of_bytes(db.len(), key)]
 }
 
 pub fn num_shards() -> usize {

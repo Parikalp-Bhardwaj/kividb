@@ -372,10 +372,11 @@ impl ShardMap {
     /// Make `key`'s access word over with `next`, written only if that
     /// changes it. A read lock is enough: the word is atomic, and no part
     /// of the key or its value (see `entry`'s note on it). Nothing happens
-    /// if there is no such key.
+    /// if there is no such key. The key is taken as the command gave it, in
+    /// bytes: a key is found by its bytes, and one that is not UTF-8 is not
+    /// there to find.
     #[inline]
-    pub fn touch(&self, key: &str, next: impl FnOnce(u32) -> u32) {
-        let key = key.as_bytes();
+    pub fn touch(&self, key: &[u8], next: impl FnOnce(u32) -> u32) {
         if let Some(s) = self.find(self.hash_of(key), key) {
             s.entry().touch(next);
         }
