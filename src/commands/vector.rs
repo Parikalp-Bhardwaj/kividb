@@ -154,7 +154,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // The index goes, and its aliases with it.
     if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(name)));
     }
     // Then its documents. Not each as a DEL to replicas and the AOF: they
     // run this command, and delete theirs.
@@ -266,7 +266,11 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // Check for duplicate field names — Redis rejects them
@@ -946,7 +950,11 @@ fn ft_synupdate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // entry().or_insert_with() is the idiomatic Rust "get or create" pattern.
@@ -998,7 +1006,11 @@ fn ft_syndump(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let store = ctx.index_store.read();
     let def = match store.get(index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                index_name,
+            )));
+        }
     };
 
     if def.synonyms.is_empty() {
@@ -1136,7 +1148,11 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         Arc::clone(&def.vocab)
     };
@@ -1796,7 +1812,7 @@ fn ft_alias_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     // The target may itself be given by alias.
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1841,7 +1857,7 @@ fn ft_alias_update(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR Alias already exists as an index name"));
     }
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1868,7 +1884,7 @@ fn ft_alias_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .get(index)
         .is_none_or(|def| crate::vector::is_alias(index, def))
     {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
     }
     let aliases: Vec<Vec<u8>> = crate::vector::index_aliases(&store, index)
         .iter()
@@ -2038,7 +2054,11 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         match def.indexes.get(&field_name) {
             Some(crate::vector::LiveIndex::Hnsw(_)) => {}

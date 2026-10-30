@@ -489,7 +489,11 @@ fn report_8_schema_errors_name_the_problem() {
     assert_eq!(err.err(), "No schema found");
     // None of them left an index behind.
     for index in ["r8:a", "r8:b", "r8:c", "r8:d", "r8:e", "r8:f"] {
-        assert!(c.cmd(&["FT.INFO", index]).err().contains("no such index"));
+        assert!(
+            c.cmd(&["FT.INFO", index])
+                .err()
+                .contains("Index not found: ")
+        );
     }
     // An index that is there cannot be created again.
     assert!(c.cmd(&["FT.CREATE", "r8:ok", "SCHEMA", "f", "TEXT"]).ok());
@@ -1253,7 +1257,7 @@ fn sorting_paging_and_what_is_returned() {
     assert!(
         c.cmd(&["FT.SEARCH", "nosuch", "*"])
             .err()
-            .contains("no such index")
+            .contains("Index not found: ")
     );
 }
 

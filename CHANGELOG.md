@@ -315,6 +315,20 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Search: a missing index is reported in Redis 8's words.** Every
+  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
+  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
+  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
+  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
+  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
+  the rest `ERR no such index`. Clients that create the index when the
+  error says "not found" failed on a new database: mem0's Valkey store
+  could not start. This is a compatibility fix, but the text changes: a
+  client that looked for `no such index` must look for `Index not found`.
+  In a cluster, a node still giving the old words is understood.
+
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
   matches many documents, a filtered KNN query on an HNSW index searched the
