@@ -328,6 +328,8 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   could not start. This is a compatibility fix, but the text changes: a
   client that looked for `no such index` must look for `Index not found`.
   In a cluster, a node still giving the old words is understood.
+  `FT.DROPINDEX` with anything but `DD` after the name now replies
+  `SEARCH_ARG_UNRECOGNIZED Unknown argument`, as in Redis.
 
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
