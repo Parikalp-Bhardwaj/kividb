@@ -1364,7 +1364,12 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     // key are brought up to date with what is there now (see
     // `vector::reindex_key`). A value put under a key whole (`RESTORE`, and
     // so `MIGRATE` and slot migration; `RENAME`) is indexed whole.
-    match name {
+    //
+    // Every write comes through here: the names below all begin with one of
+    // a few letters, and `SET` and the like are let through on one compare.
+    let first = name.as_bytes().first().copied().unwrap_or(0);
+    let named_below = matches!(first, b'H' | b'R' | b'C' | b'M' | b'J') || name == "SWAPDB";
+    match if named_below { name } else { "" } {
         "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" | "HSETEX" | "HGETEX" | "HIMPORT"
         | "RENAME" | "RENAMENX" | "RESTORE" => {
             let how = match name {
