@@ -296,10 +296,17 @@ impl Access {
 
     /// The word after a use, at `seconds` on [`clock`]; `roll` is a random
     /// number in [0, 1) for the LFU count's chance to rise.
+    ///
+    /// A word of 0 is a new entry, and the write that made the key is not a
+    /// use of it: the key starts at [`LFU_INITIAL`], as Redis's new objects
+    /// do. Counting it would put every new key one above that, level with a
+    /// key read once, and a stream of new keys would push out the keys that
+    /// are read (hot keys kept 34% against Redis's 96% in a test of that).
     fn after_use(word: u32, track: Track, seconds: u32, roll: impl FnOnce() -> f64) -> u32 {
         match track {
             Track::Off => word,
             Track::Used | Track::Modified => Self::clock_word(seconds),
+            Track::Frequency if word == 0 => Self::lfu_word(seconds / 60, LFU_INITIAL),
             Track::Frequency => {
                 let minutes = seconds / 60;
                 let mut count = Self::frequency(word, minutes, lfu_decay_time());
@@ -724,9 +731,16 @@ mod tests {
             // what lets a read leave the line alone.
             assert_eq!(Access::after_use(word, track, now, never), word);
         }
-        // A first use counts from the initial count, as Redis's new keys do,
-        // and always counts (the chance is 1 at the initial count).
-        let first = Access::after_use(0, Track::Frequency, now, || 0.99);
+        // The write that makes a key is no use of it: a new entry (a word
+        // of 0) starts at the initial count, as Redis's new keys do.
+        let new = Access::after_use(0, Track::Frequency, now, never);
+        assert_eq!(Access::frequency(new, now / 60, 1), LFU_INITIAL);
+        // Its first use always counts (the chance is 1 at the initial
+        // count); so does a key's first use after a switch from LRU.
+        let first = Access::after_use(new, Track::Frequency, now, || 0.99);
+        assert_eq!(Access::frequency(first, now / 60, 1), LFU_INITIAL + 1);
+        let clock = Access::clock_word(now);
+        let first = Access::after_use(clock, Track::Frequency, now, || 0.99);
         assert_eq!(Access::frequency(first, now / 60, 1), LFU_INITIAL + 1);
         // Higher up, a use counts only on a lucky roll.
         let high = Access::lfu_word(now / 60, 100);
