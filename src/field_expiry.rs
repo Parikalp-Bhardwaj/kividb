@@ -177,8 +177,11 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
             emptied = removed;
         }
         // Fields went: the indexes that cover the hash are brought up to
-        // date with what it holds now.
-        if !emptied && !expired.is_empty() {
+        // date with what it holds now. Also when none was found here to
+        // expire: a read that came first dropped them (and left the indexes
+        // as they were), and once the watch is dropped below, queries stop
+        // trying this document themselves (see `watched_keys`).
+        if !emptied {
             crate::vector::reindex_key(index_store, store, db, &key, crate::vector::Write::Refresh);
         }
 

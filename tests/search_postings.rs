@@ -13,7 +13,7 @@
 //
 // One server, shared; each test has its own index and prefix.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::OnceLock;
@@ -360,7 +360,7 @@ const N_VALUES: [&str; 12] = [
 fn random_filter(rng: &mut Rng, depth: usize) -> F {
     if depth == 0 || rng.chance(35) {
         let numbers = [-3.0, 0.0, 1.0, 2.5, 4.0, 7.0, 10.0, 15.0];
-        let mut num = |rng: &mut Rng| -> f64 {
+        let num = |rng: &mut Rng| -> f64 {
             match rng.below(10) {
                 0 => f64::NEG_INFINITY,
                 1 => f64::INFINITY,

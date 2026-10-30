@@ -1126,6 +1126,12 @@ pub fn backfill_from_db_progress(
         data_type: VectorType,
         metric: DistanceMetric,
         live: LiveIndex,
+        /// The graph came with the snapshot: its vectors are not inserted
+        /// again. Decided once, before the walk — asked per key, the first
+        /// vector this walk inserts would make the graph look loaded and the
+        /// rest would be skipped, which left a graph rebuilt after an AOF
+        /// replay holding one vector.
+        loaded: bool,
     }
     let mut vec_work: Vec<VecFieldWork> = Vec::new();
     for vf in def.vector_fields() {
@@ -1143,12 +1149,15 @@ pub fn backfill_from_db_progress(
             Some(LiveIndex::Hnsw(a)) => LiveIndex::Hnsw(Arc::clone(a)),
             None => continue,
         };
+        let loaded = skip_hnsw_if_populated
+            && matches!(&live, LiveIndex::Hnsw(idx) if idx.live_count.load(Relaxed) > 0);
         vec_work.push(VecFieldWork {
             name: vf.name.clone(),
             dim,
             data_type,
             metric,
             live,
+            loaded,
         });
     }
 
@@ -1202,7 +1211,7 @@ pub fn backfill_from_db_progress(
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                     LiveIndex::Hnsw(idx) => {
-                        if skip_hnsw_if_populated && idx.live_count.load(Relaxed) > 0 {
+                        if w.loaded {
                             continue;
                         }
                         hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
