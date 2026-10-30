@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 mod entry;
@@ -19,8 +19,15 @@ pub use shard_map::{
 /// constants); the shard is taken from its low bits.
 #[inline]
 pub fn shard_index(shards: usize, key: &str) -> usize {
+    shard_index_of_bytes(shards, key.as_bytes())
+}
+
+/// [`shard_index`] of a key as the command gave it, not yet checked to be
+/// UTF-8 (the same shard: the hash is of the bytes).
+#[inline]
+pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in key.bytes() {
+    for &byte in key {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -30,6 +37,12 @@ pub fn shard_index(shards: usize, key: &str) -> usize {
 #[inline(always)]
 pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
     &db[shard_index(db.len(), key)]
+}
+
+/// [`get_shard`] of a key as the command gave it, in bytes.
+#[inline(always)]
+pub fn get_shard_of_bytes<'a>(db: &'a Db, key: &[u8]) -> &'a Shard {
+    &db[shard_index_of_bytes(db.len(), key)]
 }
 
 pub fn num_shards() -> usize {
@@ -59,6 +72,8 @@ pub struct ShardLock {
     map: RwLock<ShardMap>,
     /// Keys in `map` with a time to live, as of the last writer to let go.
     ttls: AtomicUsize,
+    /// Whether `map` holds any key, as of the last writer to let go.
+    keys: AtomicBool,
 }
 
 /// The write lock of a [`ShardLock`]. It is the table, and on the way out
@@ -67,6 +82,7 @@ pub struct ShardLock {
 pub struct ShardWrite<'a> {
     map: parking_lot::RwLockWriteGuard<'a, ShardMap>,
     ttls: &'a AtomicUsize,
+    keys: &'a AtomicBool,
 }
 
 impl std::ops::Deref for ShardWrite<'_> {
@@ -93,6 +109,10 @@ impl Drop for ShardWrite<'_> {
         if self.ttls.load(Ordering::Relaxed) != ttls {
             self.ttls.store(ttls, Ordering::Release);
         }
+        let keys = !self.map.is_empty();
+        if self.keys.load(Ordering::Relaxed) != keys {
+            self.keys.store(keys, Ordering::Release);
+        }
     }
 }
 
@@ -100,6 +120,7 @@ impl ShardLock {
     pub fn new(map: ShardMap) -> Self {
         ShardLock {
             ttls: AtomicUsize::new(map.ttl_len()),
+            keys: AtomicBool::new(!map.is_empty()),
             map: RwLock::new(map),
         }
     }
@@ -114,6 +135,7 @@ impl ShardLock {
         ShardWrite {
             map: self.map.write(),
             ttls: &self.ttls,
+            keys: &self.keys,
         }
     }
 
@@ -124,6 +146,14 @@ impl ShardLock {
     #[inline(always)]
     pub fn holds_no_ttl(&self) -> bool {
         self.ttls.load(Ordering::Acquire) == 0
+    }
+
+    /// The shard holds no key, as of the last write to it. One load, no
+    /// lock: what eviction asks of every shard of every database before it
+    /// samples, on every write while memory is full.
+    #[inline(always)]
+    pub fn holds_no_keys(&self) -> bool {
+        !self.keys.load(Ordering::Acquire)
     }
 
     /// How many of this shard's keys have a time to live, as of the last
@@ -669,6 +699,11 @@ mod shard_lock_tests {
     fn the_count_follows_what_writers_do() {
         let cell = ShardLock::default();
         assert!(cell.holds_no_ttl());
+        assert!(cell.holds_no_keys());
+        cell.write().insert_str("k", b"v");
+        assert!(!cell.holds_no_keys());
+        cell.write().remove("k");
+        assert!(cell.holds_no_keys());
 
         cell.write().insert_expiring("a", s(), Some(5));
         assert!(!cell.holds_no_ttl());
@@ -697,6 +732,8 @@ mod shard_lock_tests {
         std::mem::swap(&mut *cell.write(), &mut *other.write());
         assert!(!cell.holds_no_ttl());
         assert!(other.holds_no_ttl());
+        assert!(!cell.holds_no_keys());
+        assert!(other.holds_no_keys());
         assert_eq!(cell.read().ttl_len(), 1);
     }
 }
