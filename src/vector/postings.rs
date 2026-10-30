@@ -557,16 +557,16 @@ fn merge_walk<'a>(
     let (mut a, mut b) = (a.peekable(), b.peekable());
     loop {
         let next = match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) if first(*x, *y) => a.next(),
+            (Some(x), Some(y)) if first(x, y) => a.next(),
             (Some(_), Some(_)) => b.next(),
             (Some(_), None) => a.next(),
             (None, Some(_)) => b.next(),
             (None, None) => return,
         };
-        if let Some(&(order, doc)) = next {
-            if !each(order, doc) {
-                return;
-            }
+        if let Some(&(order, doc)) = next
+            && !each(order, doc)
+        {
+            return;
         }
     }
 }
