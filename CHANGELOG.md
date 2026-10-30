@@ -315,6 +315,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A filtered vector search that walks the graph stops at `TIMEOUT`.**
+  With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
+  matches many documents, a filtered KNN query on an HNSW index searched the
+  graph without looking at the clock: with a filter that let few documents
+  through, the search could walk the whole graph and take far longer than
+  the query's `TIMEOUT`. It now stops when the time is up, like the other
+  ways a filtered query is answered. Under `ON_TIMEOUT RETURN`, the default,
+  the reply holds the nearest documents found so far, with the timeout
+  warning in RESP3; under `ON_TIMEOUT FAIL` it is the error `Timeout limit
+  was reached`.
+
 - **Under `maxmemory`, the process holds about what it is allowed (#202).**
   A server at its limit evicts a key for every key it writes, and the room a
   key left in a slab of values was not used again until a quarter of that
