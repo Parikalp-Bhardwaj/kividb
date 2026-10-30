@@ -643,12 +643,15 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     }
     // The databases worth sampling. Found once: a database is not emptied
     // and refilled in the time this takes, and if it is, it is found empty.
+    // Without a lock: this runs on every write while memory is full, and
+    // locking every shard of every empty database (16 x 256 on 32 cores)
+    // cost more than the write and the eviction together.
     let dbs: Vec<usize> = (0..ctx.store.len())
         .filter(|&db| {
             if policy.volatile() {
                 ctx.store[db].iter().any(|shard| !shard.holds_no_ttl())
             } else {
-                ctx.store[db].iter().any(|shard| !shard.read().is_empty())
+                ctx.store[db].iter().any(|shard| !shard.holds_no_keys())
             }
         })
         .collect();
