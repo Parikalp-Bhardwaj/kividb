@@ -229,6 +229,34 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   still return them), and a write in one database no longer touches the
   indexes of another.
 
+- **Search: a TAG or NUMERIC query reads only the documents of its page.**
+  Since TAG and NUMERIC postings, such a query found its matches without
+  reading documents, then still read every match (fields copied, a score
+  each) to sort them and return the ten of `LIMIT 0 10`. Its page is now
+  picked from the postings, only the documents on it are read, and the
+  count is the size of the set. The order is the one it was, so replies are
+  the same: without `SORTBY`, by key (every match scores the same without a
+  word to score), read off a list of each index's documents in key order,
+  which the queries that use it bring up to date; `SORTBY` a NUMERIC field,
+  by its values in order. NUMERIC values are now kept in a sorted list, with
+  a small B-tree of the ones written since, merged in when it holds an
+  eighth as many: a range is read off three to four times as fast as from a
+  B-tree of every value, in less memory. A query with words to score, a
+  vector clause, `SORTBY` a TAG or TEXT field, `SORTBY` a NUMERIC field that
+  holds NaN, or more keys with a time to live than matches, still reads
+  every match. `FT.DEBUG PAGE <index> ON|OFF` turns this off, to compare.
+  On an Azure D16ds_v5, server on 8 CPUs, 1 million hashes, one client
+  (Redis 8.10.3 in brackets): a TAG filter matching half the documents takes
+  0.08 ms instead of 305 (50), a quarter 0.08 instead of 142 (30), 2% 0.10
+  instead of 7.6 (1.5); with `SORTBY` a NUMERIC field 0.11 instead of 752
+  (53); `LIMIT 10000 10` of half 0.13 instead of 300 (53). A NUMERIC range
+  of half takes 1.2 ms instead of 273 (51), a quarter 0.64 instead of 132
+  (25), 2% 0.12 instead of 5.6 (2.0). With 8 clients, half the documents:
+  57,000 queries a second instead of 18 (102). JSON documents are the same
+  (half: 0.09 ms instead of 906). Memory: 10 bytes a document more (its
+  place in key order, its cluster slot), and less for NUMERIC fields: 2
+  million documents took 2,416 MB instead of 2,443.
+
 - **Release candidates are no longer published as GitHub Releases.** A tag
   such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
   (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
@@ -334,6 +362,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   lines on 16 cores for 16 databases: a thread keeps the answer for 10 ms.
   The stream of that test is written in 2.3 s, where it took 2.8 s (Redis
   2.4 s).
+
+- **Search: a document whose key has expired no longer matches.** A key
+  past its time to live that nothing had deleted yet (the expiry cycle runs
+  every 100 ms) was still counted and returned by `FT.SEARCH` and
+  `FT.AGGREGATE`. It is no document now, as a read of it finds.
+
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
   matches many documents, a filtered KNN query on an HNSW index searched the
