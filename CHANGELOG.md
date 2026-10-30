@@ -315,6 +315,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **After a shutdown, the port no longer takes connections nobody answers.**
+  On Linux with io_uring (the default), the server's port went on accepting
+  connections for a moment after the process had exited, until the kernel
+  had cleaned up after it. A client that connected then, such as one
+  waiting for the server to come back after a restart, got a connection
+  that never answered and was then reset, as if the server had come back
+  and failed. A connection made while the final snapshot was being written
+  was accepted and then dropped. The plaintext port now stops listening as
+  soon as the shutdown begins (`SHUTDOWN`, SIGTERM or SIGINT), so those
+  connections are refused at once; the connections already open are kept
+  until the process ends, as before. No data was lost: the final snapshot
+  was complete.
+
 - **Under `maxmemory`, the process holds about what it is allowed (#202).**
   A server at its limit evicts a key for every key it writes, and the room a
   key left in a slab of values was not used again until a quarter of that
