@@ -707,12 +707,42 @@ fn is_script(name: &str) -> bool {
 /// keys they find: see `store::AccessScope`.
 #[cold]
 #[inline(never)]
-fn access_scope(name: &str, now: std::time::Instant) -> crate::store::AccessScope {
+fn access_scope(name: &str, now: std::time::Instant, cmd: &[&[u8]]) -> crate::store::AccessScope {
+    use crate::store::AccessScope;
     if asks_only(name) || is_script(name) {
-        crate::store::AccessScope::none()
-    } else {
-        crate::store::AccessScope::open(crate::eviction::stamp(now))
+        return AccessScope::none();
     }
+    let stamp = crate::eviction::stamp(now);
+    // Under LFU, a key the command names twice (`MGET a a`) is counted
+    // twice, as Redis counts each lookup. Only a command of more than one
+    // argument can, and the hot ones find their keys without the long
+    // match (`keyspec::key_positions`).
+    if !AccessScope::counts(stamp) || cmd.len() < 3 {
+        return AccessScope::open(stamp);
+    }
+    AccessScope::open_naming(stamp, named_more_than_once(name, cmd))
+}
+
+/// The keys the command names more than once, and how many times.
+fn named_more_than_once(name: &str, cmd: &[&[u8]]) -> Vec<(Box<[u8]>, u8)> {
+    let positions = crate::keyspec::key_positions(name, cmd);
+    let mut keys = positions.iter();
+    let (Some(first), Some(second)) = (keys.next(), keys.next()) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<&[u8]> = [first, second]
+        .into_iter()
+        .chain(keys)
+        .map(|pos| cmd[pos])
+        .collect();
+    keys.sort_unstable();
+    let mut named = Vec::new();
+    for run in keys.chunk_by(|a, b| a == b) {
+        if run.len() > 1 {
+            named.push((Box::from(run[0]), run.len().min(u8::MAX as usize) as u8));
+        }
+    }
+    named
 }
 
 /// The keys the command `name` names, used under the access scope it runs
@@ -1123,7 +1153,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     // Under an eviction policy that goes by use, the command's own lookups
     // write it (see `eviction`): one atomic load when there is none.
-    let access = crate::eviction::recording().then(|| access_scope(name, started));
+    let access = crate::eviction::recording().then(|| access_scope(name, started, &ctx.cmd));
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
@@ -1133,6 +1163,21 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // on an error: a key it did look up is not counted again.
     if access.is_some() && result.starts_with(b"-") {
         used_on_error(ctx, name);
+    }
+    // Under LFU, a key the command names more than once is counted as many
+    // times as it is named, as when its use was written after the command,
+    // a lookup for each place it is named. Its own lookups count up to that
+    // many; these make up the rest.
+    if access.is_some()
+        && let Some(named) = crate::store::AccessScope::named_more_than_once()
+    {
+        let db = *ctx.selected_db;
+        for (key, times) in named {
+            let map = crate::read_lock!(crate::store::get_shard_of_bytes(&ctx.store[db], &key));
+            for _ in 0..times {
+                map.use_key(&key);
+            }
+        }
     }
     drop(access);
 

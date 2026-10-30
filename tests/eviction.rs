@@ -921,6 +921,19 @@ fn each_command_family_uses_its_keys_once() {
             &[&["MSET", "a", "2", "b", "3"]],
             &[("a", 1)],
         ),
+        // Named twice, used twice, as Redis counts each lookup; INCR looks
+        // its key up twice and names it once.
+        (&[&["SET", "a", "1"]], &[&["MGET", "a", "a"]], &[("a", 2)]),
+        (
+            &[&["SADD", "a", "x"]],
+            &[&["SUNION", "a", "a"]],
+            &[("a", 2)],
+        ),
+        (
+            &[&["RPUSH", "a", "x", "y"]],
+            &[&["LMOVE", "a", "a", "LEFT", "RIGHT"]],
+            &[("a", 2)],
+        ),
         (&[&["SET", "a", "1"]], &[&["STRLEN", "a"]], &[("a", 1)]),
         (
             &[&["SET", "a", "1"]],
