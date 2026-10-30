@@ -475,7 +475,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms == 0 {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -504,7 +504,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -558,7 +558,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -624,7 +624,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -889,7 +889,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, key);
+                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -906,7 +906,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     delete_key(ctx.store, *ctx.selected_db, key)
                 };
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
