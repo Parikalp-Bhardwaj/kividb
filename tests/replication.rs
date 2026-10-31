@@ -14,7 +14,9 @@ use kividb::config::{Config, IoModel};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const REDIS_HLL_SPARSE: &[u8] = include_bytes!("fixtures/redis-8.0-hll-small-sparse.bin");
 
 // ── Minimal RESP client ───────────────────────────────────────────────────────
 
@@ -118,6 +120,12 @@ impl RespValue {
             _ => panic!("not an array: {:?}", self),
         }
     }
+    fn as_bulk(&self) -> &[u8] {
+        match self {
+            RespValue::Bulk(bytes) => bytes,
+            other => panic!("not a bulk string: {other:?}"),
+        }
+    }
     fn is_ok(&self) -> bool {
         matches!(self, RespValue::SimpleStr(s) if s == "OK")
     }
@@ -202,6 +210,18 @@ fn start_server(port: u16) {
     panic!("server on port {port} did not start listening within 5s");
 }
 
+struct ShutdownServers(Vec<u16>);
+
+impl Drop for ShutdownServers {
+    fn drop(&mut self) {
+        for port in &self.0 {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", *port)) {
+                let _ = stream.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$5\r\nNOSAVE\r\n");
+            }
+        }
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // REPLICATION COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════
@@ -237,6 +257,123 @@ fn test_info_replication_master() {
     assert!(text.contains("connected_slaves:"));
     assert!(text.contains("master_replid:"));
     assert!(text.contains("master_repl_offset:"));
+}
+
+#[test]
+fn redis_hll_replication_keeps_bytes_and_digest_in_step_including_pfdebug() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    start_server(master_port);
+    start_server(replica_port);
+    let _cleanup = ShutdownServers(vec![master_port, replica_port]);
+    let mut master = Conn::connect(master_port);
+    let mut replica = Conn::connect(replica_port);
+
+    for conn in [&mut master, &mut replica] {
+        assert!(
+            conn.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+                .is_ok()
+        );
+        assert_eq!(
+            conn.cmds(&["CONFIG", "GET", "hll-write-format"]).as_array()[1].as_str(),
+            "redis"
+        );
+    }
+    assert!(
+        replica
+            .cmds(&["REPLICAOF", "127.0.0.1", &master_port.to_string()])
+            .is_ok()
+    );
+
+    assert_eq!(master.cmds(&["PFADD", "source", "one", "two"]).as_int(), 1);
+    assert!(master.cmds(&["PFMERGE", "merged", "source"]).is_ok());
+
+    let wait_for_equal = |master: &mut Conn, replica: &mut Conn, keys: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let equal = keys.iter().all(|key| {
+                let master_bytes = master.cmds(&["GET", key]);
+                let replica_bytes = replica.cmds(&["GET", key]);
+                if !matches!(&master_bytes, RespValue::Bulk(_)) {
+                    return false;
+                }
+                if master_bytes != replica_bytes {
+                    return false;
+                }
+                let master_digest = master.cmds(&["DIGEST", key]);
+                let replica_digest = replica.cmds(&["DIGEST", key]);
+                master_digest == replica_digest
+            });
+            if equal {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replica did not converge for {keys:?}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    };
+
+    wait_for_equal(&mut master, &mut replica, &["source", "merged"]);
+    for key in ["source", "merged"] {
+        assert_eq!(master.cmds(&["PFCOUNT", key]).as_int(), 2);
+        assert_eq!(replica.cmds(&["PFCOUNT", key]).as_int(), 2);
+        assert_eq!(master.cmds(&["GET", key]), replica.cmds(&["GET", key]));
+        assert_eq!(
+            master.cmds(&["DIGEST", key]),
+            replica.cmds(&["DIGEST", key])
+        );
+        assert_eq!(
+            master.cmds(&["GET", key]).as_bulk()[4],
+            0,
+            "Redis dense encoding"
+        );
+    }
+
+    assert!(master.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    wait_for_equal(&mut master, &mut replica, &["sparse"]);
+    let sparse_before = master.cmds(&["GET", "sparse"]).as_bulk().to_vec();
+    let master_registers = master.cmds(&["PFDEBUG", "GETREG", "sparse"]);
+    let replica_registers = replica.cmds(&["PFDEBUG", "GETREG", "sparse"]);
+    assert_eq!(master_registers.as_array().len(), 16384);
+    assert_eq!(replica_registers.as_array().len(), 16384);
+    assert_eq!(master_registers, replica_registers);
+    assert_eq!(
+        master.cmds(&["GET", "sparse"]).as_bulk(),
+        sparse_before.as_slice()
+    );
+    assert_eq!(
+        replica.cmds(&["GET", "sparse"]).as_bulk(),
+        sparse_before.as_slice(),
+        "GETREG must not rewrite the sparse value on a replica"
+    );
+
+    assert_eq!(master.cmds(&["PFDEBUG", "TODENSE", "sparse"]).as_int(), 1);
+    wait_for_equal(&mut master, &mut replica, &["sparse"]);
+    let master_sparse = master.cmds(&["GET", "sparse"]);
+    let replica_sparse = replica.cmds(&["GET", "sparse"]);
+    assert_eq!(master_sparse.as_bulk(), replica_sparse.as_bulk());
+    assert_eq!(
+        master_sparse.as_bulk()[4],
+        0,
+        "TODENSE writes Redis dense encoding"
+    );
+    assert_eq!(master.cmds(&["PFCOUNT", "sparse"]).as_int(), 3);
+    assert_eq!(replica.cmds(&["PFCOUNT", "sparse"]).as_int(), 3);
+    assert_eq!(
+        master.cmds(&["DIGEST", "sparse"]),
+        replica.cmds(&["DIGEST", "sparse"])
+    );
+
+    assert!(master.cmds(&["PFDEBUG", "RESET", "sparse"]).is_ok());
+    wait_for_equal(&mut master, &mut replica, &["sparse"]);
+    assert_eq!(master.cmds(&["PFCOUNT", "sparse"]).as_int(), 0);
+    assert_eq!(replica.cmds(&["PFCOUNT", "sparse"]).as_int(), 0);
+    assert_eq!(
+        master.cmds(&["DIGEST", "sparse"]),
+        replica.cmds(&["DIGEST", "sparse"])
+    );
 }
 
 // WAIT returns 0 when no replicas are connected

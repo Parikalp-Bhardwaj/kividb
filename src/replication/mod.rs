@@ -125,6 +125,11 @@ pub struct ReplState {
     /// runs several servers in one process and they need independent values.
     pub repl_timeout_secs: AtomicU64,
     pub repl_ping_period_secs: AtomicU64,
+    /// `hll-write-format`: whether new HyperLogLog values use Redis's dense
+    /// encoding and hash space, or the legacy KiviDB one. Per server rather
+    /// than process-wide: the test harness runs several servers in one
+    /// process, and an AOF-replaying server must have it before replay starts.
+    hll_write_redis: AtomicBool,
     /// Redis `min-replicas-to-write`: a master refuses writes while fewer
     /// replicas than this are good (see `min_replicas_max_lag`). 0 is off.
     pub min_replicas_to_write: AtomicU32,
@@ -399,6 +404,7 @@ impl ReplState {
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
+            hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
             min_replicas_max_lag: AtomicU64::new(10),
             full_sync_guard: AtomicU8::new(FullSyncGuard::Empty as u8),
@@ -579,11 +585,23 @@ impl ReplState {
         state
             .backlog_ttl_secs
             .store(config.repl_backlog_ttl, Ordering::Relaxed);
+        state.hll_write_redis.store(
+            config.hll_write_format.eq_ignore_ascii_case("redis"),
+            Ordering::Relaxed,
+        );
         state.flush_before_load.store(
             flush_before_load(&config.repl_diskless_load).unwrap_or(true),
             Ordering::Relaxed,
         );
         state
+    }
+
+    pub fn hll_write_redis(&self) -> bool {
+        self.hll_write_redis.load(Ordering::Relaxed)
+    }
+
+    pub fn set_hll_write_redis(&self, redis: bool) {
+        self.hll_write_redis.store(redis, Ordering::Relaxed);
     }
 
     pub fn full_sync_guard(&self) -> FullSyncGuard {
@@ -2430,6 +2448,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "LINSERT"
                 | "PERSIST"
                 | "PEXPIRE"
+                | "PFDEBUG"
                 | "PFMERGE"
                 | "RESTORE"
                 | "TS.MADD"
@@ -2620,6 +2639,7 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "PEXPIRE",
     "PEXPIREAT",
     "PFADD",
+    "PFDEBUG",
     "PFMERGE",
     "PSETEX",
     "RENAME",
@@ -2737,7 +2757,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "FT.ALIASDEL" | "FT.ALIASUPDATE" | "FT.SYNUPDATE" |
         "FT.DICTADD" | "FT.DICTDEL" |
         // Bitmaps / HLL / Geo
-        "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFMERGE" |
+        "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFDEBUG" | "PFMERGE" |
         "GEOADD" | "GEOSEARCHSTORE" |
         // Arrays (Redis 8.8). ARSEEK counts as a write: it moves the insert
         // cursor, which is persisted state a replica must mirror or its
@@ -2769,6 +2789,9 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
+        // ENCODING are diagnostics, deliberately read-only here.
+        "PFDEBUG" => pfdebug_mutates(cmd),
         // MIGRATE removes keys from this node.
         "MIGRATE" => true,
         // Only HIMPORT SET writes; PREPARE / DISCARD are session state.
@@ -2825,6 +2848,16 @@ fn georadius_stores(cmd: &[&[u8]]) -> bool {
         .any(|a| a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
 }
 
+/// `PFDEBUG` is a write only for the subcommands that rewrite the value.
+/// `GETREG` used to be listed here: Redis converts a sparse value to dense
+/// while printing the registers, but this implementation returns the registers
+/// without changing the stored encoding.
+fn pfdebug_mutates(cmd: &[&[u8]]) -> bool {
+    cmd.get(1).is_some_and(|sub| {
+        sub.eq_ignore_ascii_case(b"TODENSE") || sub.eq_ignore_ascii_case(b"RESET")
+    })
+}
+
 /// True if the full command should be replicated to replicas / counted as a mutating write.
 #[inline]
 pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
@@ -2833,6 +2866,7 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
         // Writes replicate as inner `redis.call` commands, not as `EVAL` / `EVALSHA` / `FCALL`.
         "EVAL" | "EVALSHA" | "FCALL" => false,
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "PFDEBUG" => pfdebug_mutates(cmd),
         // Propagated as the `DEL` of whatever it moved away; see
         // `script_feed::commands_for_propagation`.
         "MIGRATE" => true,
@@ -2870,6 +2904,7 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
         // writes nothing may do.
         "PUBLISH" | "SPUBLISH" | "PFCOUNT" => true,
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "PFDEBUG" => pfdebug_mutates(cmd),
         "MIGRATE" => true,
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
         "SCRIPT" if cmd.len() >= 2 => {
@@ -3269,6 +3304,44 @@ mod replication_invariants_tests {
             "GEORADIUSBYMEMBER",
             &storedist
         ));
+    }
+
+    /// `PFDEBUG` is a write command by name, but only `TODENSE` and `RESET`
+    /// rewrite the stored HLL. The diagnostic subcommands must stay readable
+    /// on a replica and inside a read-only script, and must not replicate.
+    #[test]
+    fn pfdebug_is_a_write_only_when_it_rewrites() {
+        assert!(super::is_write_command("PFDEBUG"));
+        for sub in ["GETREG", "DECODE", "ENCODING"] {
+            let cmd: Vec<&[u8]> = vec![b"PFDEBUG", sub.as_bytes(), b"k"];
+            assert!(
+                !super::command_mutates_for_replication("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must not propagate"
+            );
+            assert!(
+                !super::is_denied_on_readonly_replica("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be allowed on a read-only replica"
+            );
+            assert!(
+                !super::inner_command_blocked_in_readonly_script("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be allowed in a read-only script"
+            );
+        }
+        for sub in ["TODENSE", "RESET", "todense"] {
+            let cmd: Vec<&[u8]> = vec![b"PFDEBUG", sub.as_bytes(), b"k"];
+            assert!(
+                super::command_mutates_for_replication("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must propagate"
+            );
+            assert!(
+                super::is_denied_on_readonly_replica("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be refused on a read-only replica"
+            );
+            assert!(
+                super::inner_command_blocked_in_readonly_script("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be refused in a read-only script"
+            );
+        }
     }
 
     /// The PING the master writes into an idle stream must be exactly one
