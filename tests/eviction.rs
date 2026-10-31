@@ -517,6 +517,42 @@ fn allkeys_lfu_keeps_what_is_used_often() {
     assert!(busy >= 95, "only {busy} of 100 busy keys are left");
 }
 
+/// A set of keys read again and again outlives a stream of keys written
+/// once and never read, under `allkeys-lfu`: what goes is what was not read.
+/// The keys looked at for an eviction were a run of buckets from a random
+/// one, and in time the runs held nothing but read keys, of which one went:
+/// at a larger size of this, a quarter of the read keys went (Redis 8.10
+/// keeps 96% of them).
+#[test]
+fn allkeys_lfu_keeps_a_read_set_under_a_stream_of_new_keys() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lfu"]);
+    let mut c = server.conn();
+    // Room for about 3,800 keys of 1 KB, of which the read set is a third.
+    c.limit_to(4 * MB);
+    let value = value();
+    const READ: usize = 1_200;
+    for i in 0..READ {
+        assert!(c.cmd(&["SET", &format!("read{i}"), &value]).ok());
+    }
+    // Each new key followed by a read of one of the set, picked at random.
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    for i in 0..16_000 {
+        let reply = c.cmd(&["SET", &format!("once{i}"), &value]);
+        assert!(reply.ok(), "write {i} was refused: {reply:?}");
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        c.cmd(&["GET", &format!("read{}", x % READ as u64)]);
+    }
+    c.lift_the_limit();
+    assert!(c.evicted() > 10_000, "{} evicted", c.evicted());
+    let left = c.surviving("read", READ);
+    assert!(
+        left >= READ * 88 / 100,
+        "only {left} of {READ} read keys are left"
+    );
+}
+
 /// What a master evicts, its replicas delete: an eviction is sent to them
 /// like any other deletion.
 #[test]
