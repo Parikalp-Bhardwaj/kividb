@@ -395,27 +395,54 @@ fn order_key(v: f64) -> u64 {
 }
 
 /// The (value, document) of every document whose value is a number other
-/// than NaN, in the value's order, are in two places: most in a sorted list
-/// (`settled`), which a range is a slice of, read in order; those written
-/// since it was made, in a small B-tree (`recent`). Once that holds an
-/// eighth as many, the two are merged into a new list. A document written
-/// again or gone leaves its old entry in the list, passed over from then on
-/// (`in_settled`), until the next merge drops it. A range read off the list
-/// costs a fraction of one read off a B-tree of every value: an entry after
-/// the other in memory, not a node after the other.
+/// than NaN, in the value's order, are in up to three places: most in a
+/// sorted list (`settled`), which a range is a slice of, read in order;
+/// those written since, in a small B-tree (`recent`). Once that holds an
+/// eighth as many, it is set aside (`frozen`), a new one takes the writes,
+/// and the two older ones are merged into a new list a few thousand entries
+/// at a time, off the write path (see [`tidy`]). A document written again or
+/// gone leaves its old entry where it was, passed over from then on
+/// (`in_settled`, `frozen_gone`), until a merge drops it. A range read off
+/// the list costs a fraction of one read off a B-tree of every value: an
+/// entry after the other in memory, not a node after the other.
 #[derive(Debug, Clone, Default)]
 struct NumericPostings {
     settled: Vec<(u64, u32)>,
     /// The documents whose entry is the one in `settled`.
     in_settled: Bits,
+    /// What `recent` held when the merge under way began.
+    frozen: BTreeSet<(u64, u32)>,
+    /// Documents whose entry in `frozen` is no longer theirs.
+    frozen_gone: Bits,
     recent: BTreeSet<(u64, u32)>,
-    /// How many documents have a value other than NaN: entries of both.
+    merging: Option<NumericMerge>,
+    /// How many documents have a value other than NaN: entries of all three.
     ordered: usize,
     /// By document id: its value, if `has` it.
     values: Vec<f64>,
     /// The documents whose field reads as a number, NaN included.
     has: Bits,
 }
+
+/// A merge of `settled` and `frozen` into a new list, part way.
+#[derive(Debug, Clone, Default)]
+struct NumericMerge {
+    out: Vec<(u64, u32)>,
+    /// The documents whose entry in `out` is still theirs.
+    out_live: Bits,
+    /// The next entry of `settled` to look at.
+    at: usize,
+    /// The last entry of `frozen` looked at.
+    last: Option<(u64, u32)>,
+}
+
+/// Entries a step of a merge looks at.
+const NUMERIC_STEP: usize = 2048;
+
+/// What a step of merging replaced, for the thread to free once it has let
+/// go of the postings' lock: lists of millions of entries take a while to
+/// give back.
+pub type Trash = Vec<Box<dyn std::any::Any + Send>>;
 
 impl NumericPostings {
     /// The number a value holds, as `filter::eval` reads it.
@@ -437,9 +464,6 @@ impl NumericPostings {
         if !v.is_nan() {
             self.recent.insert((order_key(v), doc));
             self.ordered += 1;
-            if self.recent.len() > (self.settled.len() / 8).max(1024) {
-                self.settle();
-            }
         }
     }
 
@@ -451,57 +475,109 @@ impl NumericPostings {
         if !v.is_nan() {
             if self.in_settled.get(doc) {
                 self.in_settled.unset(doc);
-            } else {
-                self.recent.remove(&(order_key(v), doc));
+            } else if !self.recent.remove(&(order_key(v), doc)) {
+                // Neither in the list nor among the recent: set aside.
+                self.frozen_gone.set(doc);
+            }
+            if let Some(merge) = &mut self.merging {
+                merge.out_live.unset(doc);
             }
             self.ordered -= 1;
         }
         self.has.unset(doc);
     }
 
-    /// Merge `recent` into a new `settled`, without the entries passed over.
-    fn settle(&mut self) {
-        let mut recent = std::mem::take(&mut self.recent).into_iter().peekable();
-        let mut merged: Vec<(u64, u32)> = Vec::with_capacity(self.ordered);
-        for &entry in &self.settled {
-            if !self.in_settled.get(entry.1) {
-                continue;
+    /// Whether there is merging to do.
+    fn behind(&self) -> bool {
+        self.merging.is_some() || self.recent.len() > (self.settled.len() / 8).max(1024)
+    }
+
+    /// A step of merging, if there is any to do: true if there was.
+    fn step(&mut self, trash: &mut Trash) -> bool {
+        let Some(merge) = &mut self.merging else {
+            if !self.behind() {
+                return false;
             }
-            while let Some(&next) = recent.peek() {
-                if next < entry {
-                    merged.push(next);
-                    recent.next();
-                } else {
-                    break;
+            self.frozen = std::mem::take(&mut self.recent);
+            self.frozen_gone = Bits::new();
+            self.merging = Some(NumericMerge {
+                out: Vec::with_capacity(self.settled.len() + self.frozen.len()),
+                ..NumericMerge::default()
+            });
+            return true;
+        };
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut frozen = match merge.last {
+            None => self.frozen.range(..),
+            Some(last) => self.frozen.range((Excluded(last), Unbounded)),
+        }
+        .peekable();
+        for _ in 0..NUMERIC_STEP {
+            let settled = self.settled.get(merge.at).copied();
+            let set_aside = frozen.peek().copied().copied();
+            let take_settled = match (settled, set_aside) {
+                (Some(a), Some(b)) => a < b,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => {
+                    let merge = self.merging.take().unwrap_or_default();
+                    trash.push(Box::new(std::mem::replace(&mut self.settled, merge.out)));
+                    trash.push(Box::new(std::mem::take(&mut self.frozen)));
+                    self.in_settled = merge.out_live;
+                    self.frozen_gone = Bits::new();
+                    return true;
                 }
+            };
+            let (entry, live) = if take_settled {
+                merge.at += 1;
+                let entry = settled.unwrap_or_default();
+                (entry, self.in_settled.get(entry.1))
+            } else {
+                frozen.next();
+                let entry = set_aside.unwrap_or_default();
+                merge.last = Some(entry);
+                (entry, !self.frozen_gone.get(entry.1))
+            };
+            if live {
+                merge.out.push(entry);
+                merge.out_live.set(entry.1);
             }
-            merged.push(entry);
         }
-        merged.extend(recent);
-        for &(_, doc) in &merged {
-            self.in_settled.set(doc);
-        }
-        self.settled = merged;
+        true
     }
 
     /// Every entry in order, ascending or not, into `each` until it returns
     /// false.
     fn walk(&self, ascending: bool, each: &mut dyn FnMut(u64, u32) -> bool) {
-        let live = |entry: &&(u64, u32)| self.in_settled.get(entry.1);
-        if ascending {
-            merge_walk(
-                self.settled.iter().filter(live),
+        let settled = |entry: &&(u64, u32)| self.in_settled.get(entry.1);
+        let set_aside = |entry: &&(u64, u32)| !self.frozen_gone.get(entry.1);
+        let entries: Box<dyn Iterator<Item = &(u64, u32)>> = if ascending {
+            let before = |a: &(u64, u32), b: &(u64, u32)| a < b;
+            Box::new(merged(
+                merged(
+                    self.settled.iter().filter(settled),
+                    self.frozen.iter().filter(set_aside),
+                    before,
+                ),
                 self.recent.iter(),
-                |a, b| a < b,
-                each,
-            );
+                before,
+            ))
         } else {
-            merge_walk(
-                self.settled.iter().rev().filter(live),
+            let before = |a: &(u64, u32), b: &(u64, u32)| a > b;
+            Box::new(merged(
+                merged(
+                    self.settled.iter().rev().filter(settled),
+                    self.frozen.iter().rev().filter(set_aside),
+                    before,
+                ),
                 self.recent.iter().rev(),
-                |a, b| a > b,
-                each,
-            );
+                before,
+            ))
+        };
+        for &(order, doc) in entries {
+            if !each(order, doc) {
+                return;
+            }
         }
     }
 
@@ -530,6 +606,11 @@ impl NumericPostings {
                 out.set(doc);
             }
         }
+        for &(_, doc) in self.frozen.range(start..=end) {
+            if !self.frozen_gone.get(doc) {
+                out.set(doc);
+            }
+        }
         for &(_, doc) in self.recent.range(start..=end) {
             out.set(doc);
         }
@@ -538,62 +619,118 @@ impl NumericPostings {
     fn bytes(&self) -> usize {
         // A B-tree node holds up to 11 entries of 16 bytes and two words; at
         // two thirds full, some 26 bytes an entry.
+        let merging = self
+            .merging
+            .as_ref()
+            .map_or(0, |m| m.out.capacity() * 16 + m.out_live.bytes());
         self.settled.capacity() * 16
             + self.in_settled.bytes()
-            + self.recent.len() * 26
+            + (self.frozen.len() + self.recent.len()) * 26
+            + self.frozen_gone.bytes()
+            + merging
             + self.values.capacity() * 8
             + self.has.bytes()
     }
 }
 
-/// Two runs of entries, each in order, into `each` in one order, until it
-/// returns false: `first(a, b)` says whether `a` comes before `b`.
-fn merge_walk<'a>(
-    a: impl Iterator<Item = &'a (u64, u32)>,
-    b: impl Iterator<Item = &'a (u64, u32)>,
-    first: impl Fn(&(u64, u32), &(u64, u32)) -> bool,
-    each: &mut dyn FnMut(u64, u32) -> bool,
-) {
+/// Two runs of entries, each in order, as one in that order: `before(a, b)`
+/// says whether `a` comes before `b`.
+fn merged<'a>(
+    a: impl Iterator<Item = &'a (u64, u32)> + 'a,
+    b: impl Iterator<Item = &'a (u64, u32)> + 'a,
+    before: fn(&(u64, u32), &(u64, u32)) -> bool,
+) -> impl Iterator<Item = &'a (u64, u32)> + 'a {
     let (mut a, mut b) = (a.peekable(), b.peekable());
-    loop {
-        let next = match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) if first(x, y) => a.next(),
-            (Some(_), Some(_)) => b.next(),
-            (Some(_), None) => a.next(),
-            (None, Some(_)) => b.next(),
-            (None, None) => return,
-        };
-        if let Some(&(order, doc)) = next
-            && !each(order, doc)
-        {
-            return;
-        }
-    }
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) if before(x, y) => a.next(),
+        (Some(_), Some(_)) => b.next(),
+        (Some(_), None) => a.next(),
+        (None, _) => b.next(),
+    })
 }
 
 // ── The order of the keys ────────────────────────────────────────────────────
 //
 // A page ordered by key (FT.SEARCH without SORTBY or words to score) is read
 // off the ids in their keys' order, kept here: the first ten of 500,000
-// matches are the first ten matches met walking down this list, not the
-// least of 500,000 keys compared, each a cache miss away. It is brought up
-// to date by the queries that use it, not by writes: an id given out since
-// is kept aside (`added`) and compared by its key, and once those are many
-// they are merged in. An id that left, or went to another key, keeps its
-// old place in `sorted`, which no longer points back at it (`place`), and
-// is passed over.
+// matches are the first ten matches met walking down a list, not the least of
+// 500,000 keys compared, each a cache miss away.
+//
+// The order is in four parts, each always whole to a query:
+// * `sorted`, most of the ids in key order, with each one's place (`place`);
+// * a few `runs`, each in key order, of ids given out since: sealed ones at
+//   level 0, and eight of a level merged into one of the next (so an id is
+//   copied once a level, not once a merge);
+// * `waiting`, the latest ids, in no order: a few thousand at most, as a rule;
+// * a merge under way, of runs together, or of the runs into `sorted`.
+// A write only adds its id to `waiting`. The rest is done a step at a time,
+// off the write path ([`tidy`]): a step seals up to 4,096 waiting ids into a
+// run, or merges a few thousand entries. A merge into `sorted` writes the
+// places of the new list beside the old ones, and notes each id written
+// meanwhile; when it is done the two lists change places, and only the ids
+// noted are looked at again. So no write and no query waits on more than one
+// step, at any size.
+//
+// An id that left, or went to another key, keeps its old entry, which no
+// longer matches its place, and is passed over until a merge drops it.
 
 const NO_PLACE: u32 = u32::MAX;
+/// The place of an id in `waiting`.
+const WAITING: u32 = u32::MAX - 1;
+/// Places from here up (below `WAITING`) name a run; below it, a rank in
+/// `sorted`.
+const RUN_TAGS: u32 = 1 << 31;
+/// Ids sealed into a run at a time.
+const SEAL_STEP: usize = 512;
+/// Entries a step of a merge takes: each is a few comparisons of keys, each
+/// a cache miss away, and the step holds the postings' write lock.
+const KEY_STEP: usize = 256;
+/// Waiting ids that make a run worth sealing.
+const SEAL_AT: usize = 512;
+/// Runs of one level that are merged into one of the next.
+const MERGE_RUNS_AT: usize = 8;
+/// Ids in runs that make it worth merging them into `sorted`: half as many
+/// as it holds (each merge copies it whole), and at least this.
+const MERGE_SORTED_AT: usize = 4096;
+
+#[derive(Debug, Default)]
+struct Run {
+    tag: u32,
+    ids: Vec<u32>,
+    level: u32,
+}
+
+#[derive(Debug, Default)]
+struct KeyMerge {
+    /// Into `sorted` (with every run), or the `inputs` runs from `start`
+    /// into one of `level`.
+    into_sorted: bool,
+    start: usize,
+    inputs: usize,
+    level: u32,
+    /// For each input (`sorted` first if it is one), the next entry.
+    at: Vec<usize>,
+    out: Vec<u32>,
+    /// A merge of runs: the tag of the new run, which its ids have as they
+    /// are taken (`out` is a run, in part).
+    tag: u32,
+    /// A merge into `sorted`: the places of the new list, and the ids whose
+    /// place changed meanwhile.
+    place: Vec<u32>,
+    touched: Vec<u32>,
+    /// For each input, the entry its head was last read at and the first
+    /// bytes of its key: most comparisons are of these.
+    heads: Vec<(usize, u128)>,
+}
 
 #[derive(Debug, Default)]
 struct KeyOrder {
-    /// Ids in the order of their keys, as of the last merge.
     sorted: Vec<u32>,
-    /// By id: its place in `sorted`, or `NO_PLACE`.
     place: Vec<u32>,
-    /// Ids given out since the last merge, in no order. Some have left
-    /// since, and some are here twice.
-    added: Vec<u32>,
+    runs: Vec<Run>,
+    waiting: Vec<u32>,
+    merging: Option<KeyMerge>,
+    next_tag: u32,
 }
 
 /// The key of document `id`, from the postings' table of keys.
@@ -615,102 +752,439 @@ fn key_prefix(key: &str) -> u128 {
     u128::from_be_bytes(bytes)
 }
 
+/// `ids` in the order of their keys.
+fn sort_by_key(ids: &mut [u32], keys: &[Option<Arc<str>>]) {
+    // By the first bytes of the keys, in a list of their own, then by the
+    // whole keys where those are equal: sorting by the keys themselves would
+    // go to each, at random, at each comparison.
+    let mut tagged: Vec<(u128, u32)> = ids
+        .iter()
+        .map(|&id| (key_prefix(key_text(keys, id)), id))
+        .collect();
+    tagged.sort_unstable();
+    let mut start = 0;
+    while start < tagged.len() {
+        let mut end = start + 1;
+        while end < tagged.len() && tagged[end].0 == tagged[start].0 {
+            end += 1;
+        }
+        if end - start > 1 {
+            tagged[start..end]
+                .sort_unstable_by(|a, b| key_text(keys, a.1).cmp(key_text(keys, b.1)));
+        }
+        start = end;
+    }
+    for (slot, (_, id)) in ids.iter_mut().zip(tagged) {
+        *slot = id;
+    }
+}
+
 impl KeyOrder {
-    fn added(&mut self, id: u32) {
+    fn set_place(&mut self, id: u32, place: u32) {
         let at = id as usize;
         if at >= self.place.len() {
             self.place.resize(at + 1, NO_PLACE);
         }
-        self.place[at] = NO_PLACE;
-        self.added.push(id);
+        self.place[at] = place;
+        if let Some(merge) = &mut self.merging
+            && merge.into_sorted
+        {
+            merge.touched.push(id);
+        }
+    }
+
+    fn added(&mut self, id: u32) {
+        self.set_place(id, WAITING);
+        self.waiting.push(id);
     }
 
     fn removed(&mut self, id: u32) {
-        if let Some(place) = self.place.get_mut(id as usize) {
-            *place = NO_PLACE;
+        if (id as usize) < self.place.len() {
+            self.set_place(id, NO_PLACE);
         }
     }
 
     #[inline]
-    fn placed(&self, id: u32) -> Option<u32> {
-        match self.place.get(id as usize) {
-            Some(&place) if place != NO_PLACE => Some(place),
-            _ => None,
+    fn place_of(&self, id: u32) -> u32 {
+        self.place.get(id as usize).copied().unwrap_or(NO_PLACE)
+    }
+
+    fn runs_len(&self) -> usize {
+        self.runs.iter().map(|run| run.ids.len()).sum()
+    }
+
+    /// Whether there is work for [`KeyOrder::step`].
+    fn behind(&self) -> bool {
+        self.merging.is_some()
+            || self.waiting.len() >= SEAL_AT
+            || self.runs_due().is_some()
+            || self.sorted_due()
+    }
+
+    /// The last runs, if `MERGE_RUNS_AT` or more of them are of one level:
+    /// where they start, and how many.
+    fn runs_due(&self) -> Option<(usize, usize)> {
+        let level = self.runs.last()?.level;
+        let same = self
+            .runs
+            .iter()
+            .rev()
+            .take_while(|run| run.level == level)
+            .count();
+        (same >= MERGE_RUNS_AT).then(|| (self.runs.len() - same, same))
+    }
+
+    fn sorted_due(&self) -> bool {
+        !self.runs.is_empty() && self.runs_len() > (self.sorted.len() / 2).max(MERGE_SORTED_AT)
+    }
+
+    /// How large a list of places the next step wants, if it is to begin a
+    /// merge into `sorted`: the thread makes it before it takes the lock.
+    fn spare_wanted(&self, ids: usize) -> usize {
+        let next_merges_sorted = self.merging.is_none()
+            && self.waiting.len() < SEAL_AT
+            && self.runs_due().is_none()
+            && self.sorted_due();
+        if next_merges_sorted { ids } else { 0 }
+    }
+
+    fn new_tag(&mut self) -> u32 {
+        if self.next_tag < RUN_TAGS || self.next_tag >= WAITING {
+            self.next_tag = RUN_TAGS;
+        }
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        tag
+    }
+
+    /// A step of the work, if there is any: true if there was.
+    fn step(
+        &mut self,
+        keys: &[Option<Arc<str>>],
+        spare: &mut Option<Vec<u32>>,
+        trash: &mut Trash,
+    ) -> bool {
+        if self.waiting.len() >= SEAL_AT {
+            self.seal(keys);
+            return true;
+        }
+        if self.merging.is_some() {
+            self.merge_step(keys, trash);
+            return true;
+        }
+        if let Some((start, inputs)) = self.runs_due() {
+            let tag = self.new_tag();
+            let level = self.runs[start].level + 1;
+            self.merging = Some(KeyMerge {
+                start,
+                inputs,
+                level,
+                at: vec![0; inputs],
+                heads: vec![(usize::MAX, 0); inputs],
+                tag,
+                ..KeyMerge::default()
+            });
+            return true;
+        }
+        let inputs = self.runs.len();
+        if self.sorted_due() {
+            // The ids waiting now keep their place through the swap.
+            let touched: Vec<u32> = self.waiting.clone();
+            // Made by the thread before it took the lock, if it could: all
+            // `NO_PLACE`, long enough or nearly.
+            let mut place = spare.take().unwrap_or_default();
+            if place.len() < keys.len() {
+                place.resize(keys.len(), NO_PLACE);
+            }
+            self.merging = Some(KeyMerge {
+                into_sorted: true,
+                inputs,
+                at: vec![0; inputs + 1],
+                heads: vec![(usize::MAX, 0); inputs + 1],
+                out: Vec::with_capacity(self.sorted.len() + self.runs_len()),
+                place,
+                touched,
+                ..KeyMerge::default()
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Up to `SEAL_STEP` waiting ids into a run of their own.
+    fn seal(&mut self, keys: &[Option<Arc<str>>]) {
+        let take = self.waiting.len().min(SEAL_STEP);
+        let mut ids: Vec<u32> = self.waiting.drain(..take).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|&id| self.place_of(id) == WAITING);
+        if ids.is_empty() {
+            return;
+        }
+        sort_by_key(&mut ids, keys);
+        let tag = self.new_tag();
+        for &id in &ids {
+            self.set_place(id, tag);
+        }
+        self.runs.push(Run { tag, ids, level: 0 });
+    }
+
+    /// The entries of input `i` of the merge: `sorted` first if it is one.
+    fn input<'a>(&'a self, merge: &KeyMerge, i: usize) -> (&'a [u32], Option<u32>) {
+        match (merge.into_sorted, i) {
+            (true, 0) => (&self.sorted, None),
+            (true, i) => (&self.runs[i - 1].ids, Some(self.runs[i - 1].tag)),
+            (false, i) => {
+                let run = &self.runs[merge.start + i];
+                (&run.ids, Some(run.tag))
+            }
         }
     }
 
-    /// The ids of `added` still waiting for a place, once each.
-    fn waiting(&self, keys: &[Option<Arc<str>>]) -> Vec<u32> {
-        let mut waiting: Vec<u32> = self
-            .added
-            .iter()
-            .copied()
-            .filter(|&id| {
-                self.placed(id).is_none() && keys.get(id as usize).is_some_and(Option::is_some)
-            })
-            .collect();
-        waiting.sort_unstable();
-        waiting.dedup();
-        waiting
-    }
-
-    /// Give every id waiting its place: sorted by key, merged with those in
-    /// place, every place written again.
-    fn merge(&mut self, keys: &[Option<Arc<str>>]) {
-        let mut fresh = self.waiting(keys);
-        self.added = Vec::new();
-        // By the first bytes of the keys, in a list of their own, then by
-        // the whole keys where those are equal: sorting by the keys
-        // themselves would go to each, at random, at each comparison.
-        let mut tagged: Vec<(u128, u32)> = fresh
-            .iter()
-            .map(|&id| (key_prefix(key_text(keys, id)), id))
-            .collect();
-        tagged.sort_unstable();
-        let mut start = 0;
-        while start < tagged.len() {
-            let mut end = start + 1;
-            while end < tagged.len() && tagged[end].0 == tagged[start].0 {
-                end += 1;
-            }
-            if end - start > 1 {
-                tagged[start..end]
-                    .sort_unstable_by(|a, b| key_text(keys, a.1).cmp(key_text(keys, b.1)));
-            }
-            start = end;
-        }
-        fresh.clear();
-        fresh.extend(tagged.iter().map(|&(_, id)| id));
-
-        let mut merged: Vec<u32> = Vec::with_capacity(self.sorted.len() + fresh.len());
-        let mut fresh = fresh.into_iter().peekable();
-        for (at, &id) in self.sorted.iter().enumerate() {
-            if self.place.get(id as usize) != Some(&(at as u32)) {
-                continue;
-            }
-            let key = key_text(keys, id);
-            while let Some(&next) = fresh.peek() {
-                if key_text(keys, next) < key {
-                    merged.push(next);
-                    fresh.next();
-                } else {
-                    break;
+    /// Up to `KEY_STEP` entries of the merge under way, and its end.
+    fn merge_step(&mut self, keys: &[Option<Arc<str>>], trash: &mut Trash) {
+        let Some(mut merge) = self.merging.take() else {
+            return;
+        };
+        let inputs = merge.at.len();
+        let mut looked = 0;
+        while looked < KEY_STEP {
+            // The least key among the next live entry of each input.
+            let mut least: Option<(usize, u32)> = None;
+            for i in 0..inputs {
+                let (ids, tag) = self.input(&merge, i);
+                while let Some(&id) = ids.get(merge.at[i]) {
+                    let live = match tag {
+                        None => self.place_of(id) == merge.at[i] as u32,
+                        Some(tag) => self.place_of(id) == tag,
+                    };
+                    if live {
+                        break;
+                    }
+                    merge.at[i] += 1;
+                    looked += 1;
+                }
+                let Some(&id) = ids.get(merge.at[i]) else {
+                    continue;
+                };
+                if merge.heads[i].0 != merge.at[i] {
+                    merge.heads[i] = (merge.at[i], key_prefix(key_text(keys, id)));
+                }
+                let prefix = merge.heads[i].1;
+                let before = match least {
+                    None => true,
+                    Some((l, other)) => {
+                        let other_prefix = merge.heads[l].1;
+                        prefix < other_prefix
+                            || (prefix == other_prefix
+                                && key_text(keys, id) < key_text(keys, other))
+                    }
+                };
+                if before {
+                    least = Some((i, id));
                 }
             }
-            merged.push(id);
+            let Some((i, id)) = least else {
+                self.finish(merge, keys, trash);
+                return;
+            };
+            merge.at[i] += 1;
+            looked += 1;
+            if merge.into_sorted {
+                merge.place[id as usize] = merge.out.len() as u32;
+            } else {
+                // Its place is now in the new run, which queries read.
+                self.place[id as usize] = merge.tag;
+            }
+            merge.out.push(id);
         }
-        merged.extend(fresh);
-        if self.place.len() < keys.len() {
-            self.place.resize(keys.len(), NO_PLACE);
+        self.merging = Some(merge);
+    }
+
+    fn finish(&mut self, merge: KeyMerge, keys: &[Option<Arc<str>>], trash: &mut Trash) {
+        let inputs = merge.inputs;
+        if merge.into_sorted {
+            self.runs.drain(..inputs);
+            let mut place = merge.place;
+            place.resize(keys.len().max(self.place.len()), NO_PLACE);
+            // Whatever an id written meanwhile has now is its place: the
+            // entry the merge took for it, if any, is not.
+            for id in merge.touched {
+                place[id as usize] = self.place_of(id);
+            }
+            trash.push(Box::new(std::mem::replace(&mut self.place, place)));
+            trash.push(Box::new(std::mem::replace(&mut self.sorted, merge.out)));
+        } else {
+            // Where its inputs were: the runs sealed meanwhile stay last.
+            let run = Run {
+                tag: merge.tag,
+                ids: merge.out,
+                level: merge.level,
+            };
+            let start = merge.start;
+            trash.push(Box::new(
+                self.runs
+                    .splice(start..start + inputs, std::iter::once(run))
+                    .collect::<Vec<Run>>(),
+            ));
         }
-        for (at, &id) in merged.iter().enumerate() {
-            self.place[id as usize] = at as u32;
-        }
-        self.sorted = merged;
     }
 
     fn bytes(&self) -> usize {
-        (self.sorted.capacity() + self.place.capacity() + self.added.capacity()) * 4
+        let merging = self.merging.as_ref().map_or(0, |m| {
+            m.out.capacity() + m.place.capacity() + m.touched.capacity() + m.at.len()
+        });
+        (self.sorted.capacity()
+            + self.place.capacity()
+            + self.waiting.capacity()
+            + self
+                .runs
+                .iter()
+                .map(|run| run.ids.capacity())
+                .sum::<usize>()
+            + merging)
+            * 4
+    }
+
+    /// The first `need` of `ids` (`of` of them) in the order of their keys:
+    /// see [`Postings::first_by_key`].
+    fn first(
+        &self,
+        keys: &[Option<Arc<str>>],
+        ids: &Bits,
+        need: usize,
+        of: usize,
+        ran_out: &mut dyn FnMut() -> bool,
+    ) -> Vec<u32> {
+        // Lists in key order, each of the first `need` of `ids` in a part,
+        // then merged.
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        // Ids in no order yet: picked by their keys.
+        let mut late: Vec<u32> = Vec::new();
+        // Walking a list meets the `need` first after about need * len / of
+        // of its entries, if `ids` are spread through it; looking up the place
+        // of each of `ids`, after `of`. Whichever is fewer. Where `ids` are
+        // bunched up late in the order, a walk goes on far longer than that:
+        // past four times as long, it gives up, and the places are looked up.
+        let places = self.sorted.len() + self.runs_len();
+        let expected = (need as u128) * (places as u128) / (of.max(1) as u128);
+        let budget = std::cell::Cell::new((expected * 4).max(4096));
+        let gave_up = std::cell::Cell::new(false);
+        let walk =
+            |list: &[u32], live: &dyn Fn(usize, u32) -> bool, ran_out: &mut dyn FnMut() -> bool| {
+                let mut found = Vec::new();
+                for (at, &id) in list.iter().enumerate() {
+                    if ran_out() {
+                        break;
+                    }
+                    let left = budget.get();
+                    if left == 0 {
+                        gave_up.set(true);
+                        break;
+                    }
+                    budget.set(left - 1);
+                    if live(at, id) && ids.get(id) {
+                        found.push(id);
+                        if found.len() == need {
+                            break;
+                        }
+                    }
+                }
+                found
+            };
+        let mut look_up = (need as u128) * (places as u128) >= (of as u128) * (of as u128);
+        if !look_up {
+            lists.push(walk(
+                &self.sorted,
+                &|at, id| self.place_of(id) == at as u32,
+                &mut *ran_out,
+            ));
+            for run in &self.runs {
+                lists.push(walk(
+                    &run.ids,
+                    &|_, id| self.place_of(id) == run.tag,
+                    &mut *ran_out,
+                ));
+            }
+            if let Some(merge) = &self.merging
+                && !merge.into_sorted
+            {
+                lists.push(walk(
+                    &merge.out,
+                    &|_, id| self.place_of(id) == merge.tag,
+                    &mut *ran_out,
+                ));
+            }
+            late.extend(
+                self.waiting
+                    .iter()
+                    .copied()
+                    .filter(|&id| ids.get(id) && self.place_of(id) == WAITING),
+            );
+            late.sort_unstable();
+            late.dedup();
+            if gave_up.get() {
+                lists.clear();
+                late.clear();
+                look_up = true;
+            }
+        }
+        if look_up {
+            let mut ranked: Vec<(u32, u32)> = Vec::new();
+            for id in ids.iter() {
+                if ran_out() {
+                    break;
+                }
+                match self.place_of(id) {
+                    NO_PLACE => {}
+                    place if place < RUN_TAGS => ranked.push((place, id)),
+                    _ => late.push(id),
+                }
+            }
+            if need < ranked.len() {
+                ranked.select_nth_unstable(need);
+                ranked.truncate(need);
+            }
+            ranked.sort_unstable();
+            lists.push(ranked.into_iter().map(|(_, id)| id).collect());
+        }
+        let key = |id: u32| key_text(keys, id);
+        if !late.is_empty() {
+            if need < late.len() {
+                late.select_nth_unstable_by(need, |&a, &b| key(a).cmp(key(b)));
+                late.truncate(need);
+            }
+            late.sort_unstable_by(|&a, &b| key(a).cmp(key(b)));
+            lists.push(late);
+        }
+        lists.retain(|list| !list.is_empty());
+        match lists.len() {
+            0 => Vec::new(),
+            1 => {
+                let mut only = lists.pop().unwrap_or_default();
+                only.truncate(need);
+                only
+            }
+            _ => {
+                use std::cmp::Reverse;
+                let mut heads: std::collections::BinaryHeap<Reverse<(&str, usize, usize)>> = lists
+                    .iter()
+                    .enumerate()
+                    .map(|(l, list)| Reverse((key(list[0]), l, 0)))
+                    .collect();
+                let mut out = Vec::with_capacity(need);
+                while out.len() < need {
+                    let Some(Reverse((_, l, at))) = heads.pop() else {
+                        break;
+                    };
+                    out.push(lists[l][at]);
+                    if let Some(&next) = lists[l].get(at + 1) {
+                        heads.push(Reverse((key(next), l, at + 1)));
+                    }
+                }
+                out
+            }
+        }
     }
 }
 
@@ -749,14 +1223,44 @@ pub struct Postings {
     /// they return (`FT.DEBUG PAGE index OFF`): see `search::page_from_postings`.
     /// For comparing the two.
     pub read_all: bool,
-    /// The ids in the order of their keys: see `KeyOrder`. Behind a lock of
-    /// its own, as queries bring it up to date under a read lock of these:
-    /// they read it together, and one at a time merges into it.
-    order: parking_lot::RwLock<KeyOrder>,
+    /// The ids in the order of their keys: see `KeyOrder`.
+    order: KeyOrder,
+    /// A thread is doing the merging these are behind on ([`tidy`]).
+    tidying: bool,
     /// By id: its key's cluster hash slot, for a query in a cluster to keep
     /// only the documents of the slots its node serves without hashing
     /// every key it matches.
     slots: Vec<u16>,
+}
+
+/// Do the merging `shared`'s postings are behind on, on a thread of its own,
+/// a step at a time: each step holds the postings' write lock for a few
+/// thousand entries, then hands it to whoever waits. The caller had
+/// [`Postings::wants_tidy`] say so; the thread ends when there is no more.
+pub fn tidy(shared: &SharedPostings) {
+    let worker = Arc::clone(shared);
+    let started = std::thread::Builder::new()
+        .name("kividb-postings".into())
+        .spawn(move || {
+            let mut spare: Option<Vec<u32>> = None;
+            loop {
+                let wanted = worker.read().spare_wanted();
+                if wanted > 0 && spare.as_ref().is_none_or(|s| s.len() < wanted) {
+                    spare = Some(vec![NO_PLACE; wanted + wanted / 8]);
+                }
+                let mut trash: Trash = Vec::new();
+                let mut postings = worker.write();
+                if !postings.tidy_step_with(&mut spare, &mut trash) {
+                    postings.tidying = false;
+                    return;
+                }
+                parking_lot::RwLockWriteGuard::unlock_fair(postings);
+                drop(trash);
+            }
+        });
+    if started.is_err() {
+        shared.write().tidying = false;
+    }
 }
 
 /// The postings of an index, shared by its clones.
@@ -851,13 +1355,49 @@ impl Postings {
         self.slots[at] = crate::cluster::key_hash_slot(key.as_bytes());
         self.ids.insert(key, id);
         self.live.set(id);
-        let order = self.order.get_mut();
-        order.added(id);
-        // Never queried by key, the list of ids waiting would only grow.
-        if order.added.len() > 2 * self.ids.len() + 4096 {
-            order.added = order.waiting(&self.keys);
-        }
+        self.order.added(id);
         id
+    }
+
+    /// Whether merging is due that no thread is doing: then the caller,
+    /// once it has let go of these, starts one with [`tidy`].
+    pub fn wants_tidy(&mut self) -> bool {
+        if self.tidying || !self.behind() {
+            return false;
+        }
+        self.tidying = true;
+        true
+    }
+
+    fn behind(&self) -> bool {
+        self.order.behind()
+            || self.fields.iter().any(|f| match &f.kind {
+                Kind::Numeric(n) => n.behind(),
+                Kind::Tag(_) => false,
+            })
+    }
+
+    /// One step of the merging that is due, if any: true if there was.
+    pub fn tidy_step(&mut self) -> bool {
+        self.tidy_step_with(&mut None, &mut Vec::new())
+    }
+
+    /// [`Postings::tidy_step`], with a list of places made beforehand (see
+    /// [`Postings::spare_wanted`]), and what it replaces left in `trash`.
+    pub fn tidy_step_with(&mut self, spare: &mut Option<Vec<u32>>, trash: &mut Trash) -> bool {
+        let mut did = self.order.step(&self.keys, spare, trash);
+        for field in &mut self.fields {
+            if let Kind::Numeric(numbers) = &mut field.kind {
+                did |= numbers.step(trash);
+            }
+        }
+        did
+    }
+
+    /// The length of the list of places the next step would make under the
+    /// lock: 0 if none.
+    pub fn spare_wanted(&self) -> usize {
+        self.order.spare_wanted(self.keys.len())
     }
 
     /// Record what the document at `key` holds now, from `fields`, which are
@@ -913,7 +1453,7 @@ impl Postings {
         self.keys[id as usize] = None;
         self.live.unset(id);
         self.free.push(id);
-        self.order.get_mut().removed(id);
+        self.order.removed(id);
     }
 
     /// Forget every document (the index is being filled again).
@@ -921,6 +1461,7 @@ impl Postings {
         let mut fresh = Postings {
             unused: self.unused,
             read_all: self.read_all,
+            tidying: self.tidying,
             ..Postings::default()
         };
         for field in &self.fields {
@@ -980,86 +1521,7 @@ impl Postings {
         if need == 0 {
             return Vec::new();
         }
-        // A sixteenth more, and at least a few hundred: a merge goes through
-        // every place, and the waiting are sorted again at each query.
-        let behind = |order: &KeyOrder| order.added.len() > (order.sorted.len() / 16).max(256);
-        let mut order = self.order.read();
-        if behind(&order) {
-            drop(order);
-            let mut merging = self.order.write();
-            // Unless another query has merged meanwhile.
-            if behind(&merging) {
-                merging.merge(&self.keys);
-            }
-            order = parking_lot::RwLockWriteGuard::downgrade(merging);
-        }
-        let order = &*order;
-        // Those with a place. Walking the places meets the `need` first
-        // after about need * places / of of them; looking up the place of
-        // each, after `of`. Whichever is fewer.
-        let mut first: Vec<u32> = Vec::with_capacity(need.min(of));
-        let places = order.sorted.len();
-        if (need as u128) * (places as u128) < (of as u128) * (of as u128) {
-            for (at, &id) in order.sorted.iter().enumerate() {
-                if ran_out() {
-                    break;
-                }
-                if order.place[id as usize] == at as u32 && ids.get(id) {
-                    first.push(id);
-                    if first.len() == need {
-                        break;
-                    }
-                }
-            }
-        } else {
-            let mut placed: Vec<(u32, u32)> = Vec::with_capacity(of);
-            for id in ids.iter() {
-                if ran_out() {
-                    break;
-                }
-                if let Some(place) = order.placed(id) {
-                    placed.push((place, id));
-                }
-            }
-            if need < placed.len() {
-                placed.select_nth_unstable(need);
-                placed.truncate(need);
-            }
-            placed.sort_unstable();
-            first.extend(placed.iter().map(|&(_, id)| id));
-        }
-        // Those still waiting for a place: by their keys, then the two lists
-        // merged.
-        let mut late: Vec<u32> = order
-            .added
-            .iter()
-            .copied()
-            .filter(|&id| ids.get(id) && order.placed(id).is_none())
-            .collect();
-        if late.is_empty() {
-            return first;
-        }
-        late.sort_unstable();
-        late.dedup();
-        let key = |id: u32| key_text(&self.keys, id);
-        if need < late.len() {
-            late.select_nth_unstable_by(need, |&a, &b| key(a).cmp(key(b)));
-            late.truncate(need);
-        }
-        late.sort_unstable_by(|&a, &b| key(a).cmp(key(b)));
-        let mut out = Vec::with_capacity(need);
-        let (mut a, mut b) = (first.into_iter().peekable(), late.into_iter().peekable());
-        while out.len() < need {
-            let next = match (a.peek(), b.peek()) {
-                (Some(&x), Some(&y)) if key(x) < key(y) => a.next(),
-                (Some(_), Some(_)) => b.next(),
-                (Some(_), None) => a.next(),
-                (None, Some(_)) => b.next(),
-                (None, None) => break,
-            };
-            out.extend(next);
-        }
-        out
+        self.order.first(&self.keys, ids, need, of, ran_out)
     }
 
     /// The postings of the NUMERIC field read from `field`, to order by.
@@ -1106,7 +1568,7 @@ impl Postings {
             + self.free.capacity() * 4
             + self.slots.capacity() * 2
             + self.live.bytes()
-            + self.order.read().bytes();
+            + self.order.bytes();
         let mut tags = 0;
         let mut numbers = 0;
         let mut tag_values = 0;
@@ -1342,6 +1804,14 @@ mod tests {
                 } else {
                     put(&mut p, &key, "", "1");
                 }
+                // Merging a step at a time, as the thread does, and queries
+                // in between: every state of it is read.
+                if next() % 3 == 0 {
+                    p.tidy_step();
+                }
+            }
+            if round % 5 == 4 {
+                while p.tidy_step() {}
             }
             let keep = [100, 60, 20, 3][round % 4];
             let mut ids = Bits::new();
@@ -1375,7 +1845,7 @@ mod tests {
         ] {
             put(&mut p, key, "", "1");
         }
-        p.order.write().merge(&p.keys);
+        while p.tidy_step() {}
         let all = p.live().clone();
         let first: Vec<String> = p
             .first_by_key(&all, 5, 5, &mut ran_out)
@@ -1426,6 +1896,9 @@ mod tests {
                         put(&mut p, &key, "", &v.to_string());
                         model.insert(key, v);
                     }
+                }
+                if next() % 4 == 0 {
+                    p.tidy_step();
                 }
             }
             let numbers = p.numbers("n").unwrap();

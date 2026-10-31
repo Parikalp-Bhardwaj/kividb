@@ -1059,6 +1059,10 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
             } else {
                 postings.ensure(key);
             }
+            if postings.wants_tidy() {
+                drop(postings);
+                postings::tidy(&def.postings);
+            }
         }
     }
 }
@@ -1195,7 +1199,13 @@ pub fn backfill_from_db_progress(
                 continue;
             };
             let doc = if keeps_postings {
-                def.postings.write().write_doc(key, &inner)
+                let mut postings = def.postings.write();
+                let doc = postings.write_doc(key, &inner);
+                if postings.wants_tidy() {
+                    drop(postings);
+                    postings::tidy(&def.postings);
+                }
+                doc
             } else {
                 postings::NO_DOC
             };
@@ -1914,7 +1924,13 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // Every document of the index is given an id, whatever it holds: `*`
     // and `NOT` are in terms of all of them.
     let doc = if def.keeps_postings() {
-        def.postings.write().write(key, fields, whole)
+        let mut postings = def.postings.write();
+        let doc = postings.write(key, fields, whole);
+        if postings.wants_tidy() {
+            drop(postings);
+            postings::tidy(&def.postings);
+        }
+        doc
     } else {
         postings::NO_DOC
     };

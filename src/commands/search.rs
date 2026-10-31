@@ -1275,6 +1275,21 @@ impl Clock {
     }
 }
 
+/// Whether every document `filter` matches has the same relevance, so that
+/// without SORTBY the order is the key's alone (the full path's tie-break).
+/// It is so when the query has no word to score: `relevance` is then 1 for
+/// every document. The one place this is decided: a scorer that also scores
+/// TAG clauses or `*` (by a document's length, say) narrows it here (for
+/// instance to an index without a TEXT field, where every length is the same),
+/// or orders the page another way.
+fn every_match_scores_the_same(
+    _def: &IndexDef,
+    _filter: &Filter,
+    terms: &AHashSet<String>,
+) -> bool {
+    terms.is_empty()
+}
+
 /// FT.SEARCH's page and count from postings, reading only the documents of
 /// the page: see above. `None` where the full path is to answer.
 fn page_from_postings(
@@ -1290,7 +1305,7 @@ fn page_from_postings(
         return None;
     }
     let (order, numeric) = match &args.sortby {
-        None if terms.is_empty() => (PageOrder::Key, None),
+        None if every_match_scores_the_same(def, filter, terms) => (PageOrder::Key, None),
         None => return None,
         Some((name, ascending)) => {
             let field = def
@@ -1464,7 +1479,12 @@ fn first_by_number(
         // about want * ordered / with_number of them; taking the number of
         // each, after with_number. Whichever is fewer.
         let walked = want as u128 * numbers.ordered() as u128 / with_number as u128;
+        // Matches bunched up late in the numbers' order make the walk far
+        // longer than that: past four times as long, it gives up, and the
+        // number of each is taken instead.
+        let mut gave_up = false;
         if walked < with_number as u128 {
+            let mut budget = (walked * 4).max(4096);
             // Those equal to the last one wanted are taken too: their keys
             // decide which of them are on the page.
             let mut last: Option<u64> = None;
@@ -1472,6 +1492,11 @@ fn first_by_number(
                 if clock.ran_out() || last.is_some_and(|last| last != place) {
                     return false;
                 }
+                if budget == 0 {
+                    gave_up = true;
+                    return false;
+                }
+                budget -= 1;
                 if valued.get(id) {
                     picked.push((value(id), id));
                     if picked.len() == want {
@@ -1480,7 +1505,9 @@ fn first_by_number(
                 }
                 true
             });
-        } else {
+        }
+        if walked >= with_number as u128 || gave_up {
+            picked.clear();
             for id in valued.iter() {
                 if clock.ran_out() {
                     break;
@@ -2711,6 +2738,8 @@ mod tests {
             let value: Arc<[u8]> = Arc::from(values[i % values.len()].as_bytes());
             p.write(&format!("k{i}"), &[("n".to_string(), value)], true);
         }
+        // What the postings' thread does once there is enough of it.
+        while p.tidy_step() {}
         p
     }
 

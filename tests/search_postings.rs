@@ -1468,6 +1468,78 @@ fn a_count_from_postings_leaves_out_what_is_gone() {
     assert_eq!(checked, 20);
 }
 
+/// The postings' thread merges while queries read: thousands of documents
+/// written and deleted between queries, so that queries meet waiting ids,
+/// runs, and merges under way, of the key order and of a NUMERIC field. Each
+/// page is the page of every match.
+#[test]
+fn a_page_is_right_while_the_postings_merge() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "pm",
+            "PREFIX",
+            "1",
+            "pm:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "o",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    let mut rng = Rng(0x452821e638d01377);
+    let mut written: Vec<String> = Vec::new();
+    for round in 0..24 {
+        // A burst of new documents, pipelined, and some deleted.
+        for _ in 0..12 {
+            for _ in 0..250 {
+                let key = format!("pm:{}", rng.below(1 << 30));
+                let tag = rng.pick(&["red", "blue", "green"]);
+                let o = (rng.below(2000) as i64 - 1000).to_string();
+                c.send(&[
+                    b"HSET",
+                    key.as_bytes(),
+                    b"c",
+                    tag.as_bytes(),
+                    b"o",
+                    o.as_bytes(),
+                ]);
+                written.push(key);
+            }
+            for _ in 0..250 {
+                c.read();
+            }
+        }
+        for _ in 0..200 {
+            let key = written.swap_remove(rng.below(written.len()));
+            c.cmd(&["DEL", &key]);
+        }
+        for query in [
+            vec!["@c:{red}"],
+            vec!["*", "LIMIT", "500", "10"],
+            vec!["@c:{blue}", "SORTBY", "o", "DESC", "LIMIT", "0", "15"],
+            vec!["@o:[-200 300]", "NOCONTENT", "LIMIT", "0", "40"],
+            vec![
+                "@c:{green}",
+                "SORTBY",
+                "o",
+                "LIMIT",
+                "1000",
+                "5",
+                "WITHSORTKEYS",
+            ],
+        ] {
+            let args: Vec<String> = query.iter().map(|a| a.to_string()).collect();
+            let (paged, whole, scanned) = three_ways(&mut c, "pm", &args);
+            assert_eq!(paged, whole, "round {round}: {args:?}");
+            assert_eq!(scanned, whole, "round {round}: {args:?}");
+        }
+    }
+}
+
 /// `TIMEOUT` cuts a query answered from postings short, as it does a scan:
 /// documents are added until a 1 ms query reports it. Its matches are read
 /// (`FT.DEBUG PAGE … OFF`): a count read off postings takes no time to
