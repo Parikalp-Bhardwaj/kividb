@@ -1635,7 +1635,7 @@ pub(crate) fn knn_planned(
             return Some((nearest, cut));
         }
         for key in gone {
-            if let Some(id) = def.postings.read().id(key) {
+            if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }
             crate::vector::maybe_unindex(ctx.index_store, def.db_index, key);
@@ -1674,9 +1674,11 @@ fn knn_among(
             let mut admit = |node: &crate::vector::HnswNode| {
                 let mut doc = node.doc.load(Relaxed);
                 if doc == crate::vector::postings::NO_DOC {
-                    // Not known yet (a compaction or a snapshot made the
-                    // node): looked up once, and kept.
-                    match def.postings.read().id(&node.key) {
+                    // Not known yet (a compaction, a snapshot, or a write
+                    // that was queued made the node): looked up once, and
+                    // kept. A document written before the query began has
+                    // its id: the query's plan applied the queue.
+                    match def.postings.peek().id(&node.key) {
                         Some(id) => {
                             node.doc.store(id, Relaxed);
                             doc = id;
@@ -2141,6 +2143,7 @@ fn ft_debug(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match sub.as_str() {
         "COMPACT" => ft_debug_compact(ctx),
         "POSTINGS" => ft_debug_postings(ctx),
+        "PAGE" => ft_debug_page(ctx),
         _ => Some(resp_error(&format!(
             "ERR unknown FT.DEBUG subcommand '{sub}'"
         ))),
@@ -2161,6 +2164,24 @@ fn ft_debug_postings(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&crate::commands::search::no_such_index(&name)));
     };
     def.postings.write().unused = !on;
+    Some(resp_simple("OK"))
+}
+
+/// `FT.DEBUG PAGE index ON|OFF`: whether a query whose page the postings
+/// know reads only the documents of that page (`search::page_from_postings`)
+/// or every document it matches, for comparing the two.
+fn ft_debug_page(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let cmd = &ctx.cmd;
+    let on = match cmd.get(3) {
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"ON") => true,
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"OFF") => false,
+        _ => return Some(resp_error("ERR syntax: FT.DEBUG PAGE <index> ON|OFF")),
+    };
+    let name = String::from_utf8_lossy(cmd[2]).into_owned();
+    let Some(def) = ctx.index_store.read().get(&name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(&name)));
+    };
+    def.postings.write().read_all = !on;
     Some(resp_simple("OK"))
 }
 

@@ -321,6 +321,50 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   still return them), and a write in one database no longer touches the
   indexes of another.
 
+- **Search: a TAG or NUMERIC query reads only the documents of its page.**
+  Since TAG and NUMERIC postings, such a query found its matches without
+  reading documents, then still read every match (fields copied, a score
+  each) to sort them and return the ten of `LIMIT 0 10`. Its page is now
+  picked from the postings, only the documents on it are read, and the
+  count is the size of the set. The order is the one it was, so replies are
+  the same: without `SORTBY`, by key (every match scores the same without a
+  word to score), read off a list of each index's documents in key order;
+  `SORTBY` a NUMERIC field, by its values in order. NUMERIC values are now
+  kept in a sorted list, with a small B-tree of the ones written since: a
+  range is read off three to four times as fast as from a B-tree of every
+  value, in less memory. Both are kept up to date by a thread of the index's
+  own, started by writes when there is work, a few steps at a time under the
+  index's lock: no query waits on a merge or a sort of the whole index. A
+  write never waits for the lock: one that finds a query or the merging
+  thread holding it is queued, and the next query applies the queue before
+  it reads, so it sees every write that returned before it began. On 1
+  million documents the first query ordered by key after a load, an
+  `FT.CREATE` or a restart takes 2.6 to 3.3 ms, where sorting every key on
+  demand took 93 to 100 ms with writes to the index waiting. Four writers
+  adding documents to an index of 1 million write as fast as before postings
+  with two readers asking a page each, flat out or 200 times a second: 98,000
+  to 101,000 writes a second (p99 0.06 ms, p99.9 0.10 to 0.29 ms), where they
+  managed 82,000 to 85,000 with the readers reading every match, and 18,000
+  with the readers holding the postings' lock; the pages take 0.3 to 2.5 ms
+  (p99 7 ms). Past 1.8 million documents, a write no longer waits 150 ms
+  while the table of keys grows: the most any took, up to 2.3 million, was 7
+  ms. A query with words to score,
+  a
+  vector clause, `SORTBY` a TAG or TEXT field, `SORTBY` a NUMERIC field that
+  holds NaN, or more keys with a time to live than matches, still reads
+  every match. `FT.DEBUG PAGE <index> ON|OFF` turns this off, to compare.
+  On an Azure D16ds_v5, server on 8 CPUs, 1 million hashes, one client
+  (Redis 8.10.3 in brackets): a TAG filter matching half the documents takes
+  0.08 ms instead of 305 (50), a quarter 0.08 instead of 142 (30), 2% 0.10
+  instead of 7.6 (1.5); with `SORTBY` a NUMERIC field 0.11 instead of 752
+  (53); `LIMIT 10000 10` of half 0.13 instead of 300 (53). A NUMERIC range
+  of half takes 1.0 ms instead of 273 (51), a quarter 0.51 instead of 132
+  (25), 2% 0.12 instead of 5.6 (2.0). With 8 clients, half the documents:
+  57,000 queries a second instead of 18 (102). JSON documents are the same
+  (half: 0.09 ms instead of 906). Memory: 10 bytes a document more (its
+  place in key order, its cluster slot), and less for NUMERIC fields: 2
+  million documents took 2,416 MB instead of 2,443.
+
 - **Release candidates are no longer published as GitHub Releases.** A tag
   such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
   (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
@@ -455,6 +499,10 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   The stream of that test is written in 2.3 s, where it took 2.8 s (Redis
   2.4 s).
 
+- **Search: a document whose key has expired no longer matches.** A key
+  past its time to live that nothing had deleted yet (the expiry cycle runs
+  every 100 ms) was still counted and returned by `FT.SEARCH` and
+  `FT.AGGREGATE`. It is no document now, as a read of it finds.
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
   matches many documents, a filtered KNN query on an HNSW index searched the
