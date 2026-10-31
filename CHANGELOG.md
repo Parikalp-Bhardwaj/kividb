@@ -20,6 +20,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded. A name that is not a command is omitted, as Redis omits it. Arity
   and key positions stay on `COMMAND` / `COMMAND INFO`.
 
+### Fixed
+
+- **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
+  it deleted.** The command was sent on as typed, and each replica, and an
+  AOF replayed at startup, ran `DD` again and deleted whatever its own copy
+  of the index covered then, which need not be what the master deleted. A
+  replica could lose a document its master kept, or keep one its master
+  deleted. As in Redis 8.10, replicas and the AOF now get `DEL`s of the
+  documents deleted, and then the drop without `DD`, for HASH and JSON
+  indexes and for an index in any database (its `DEL`s are sent in it). A
+  replica writes the same to its own AOF. A `DD` sent by an older master is
+  run as that master ran it: a 1.2.0 release candidate deleted the
+  documents, 1.1 kept them (the replica asks its master which release it
+  is). A `DD` found in an AOF keeps the documents, as 1.1 did: nothing in
+  the file says which release wrote it, and keeping loses no data. An AOF
+  written by a 1.2.0 release candidate that ran `DD` brings back, on
+  replay, the documents it deleted; rewrite it (`BGREWRITEAOF`) before
+  upgrading, or delete them again after. The documents are deleted 256 at a time, each 256 a
+  write of its own sent as one `DEL`, so an index of millions of documents
+  does not hold up a replica's full sync, a checkpoint, or writes to other
+  keys while it goes; the index itself goes last, so a `DD` cut short can
+  be run again. Redis sends a `DEL` per document and the drop as
+  `_FT._DROPINDEXIFX … _FORCEKEEPDOCS`, all inside `MULTI`/`EXEC`; KiviDB
+  sends `FT.DROPINDEX index`, which a replica of an older release also
+  understands, and no `MULTI`, which for a large index would be one
+  transaction of millions of commands. `DD` of a large index takes longer
+  than it did, as each document now leaves the index before the index goes:
+  about 3 seconds a million documents rather than 1, while the replicas
+  that each took as long again afterwards now keep up as it goes.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
