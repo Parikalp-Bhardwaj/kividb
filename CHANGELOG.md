@@ -53,7 +53,9 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   built again from their documents whenever the server starts, so an index
   made by an older release gets its stems the first time 1.2.0 loads it.
   An index's `LANGUAGE` and `LANGUAGE_FIELD` are kept in snapshots, in a
-  section of its own that older releases skip. It costs memory and indexing time: on a million short texts (6 to 14 words each) the dataset took 2.60 KB a document instead of 1.94 KB, and indexing a document took about 60% more of the server's CPU; a `NOSTEM` field costs what it did. Each stem is one more word in the inverted and forward indexes, which hold each word and each document key as a string of its own.
+  section of its own that older releases skip. Stems are words of the
+  TEXT index like any other, which now costs less than it did without them
+  (see *Full-text search: the TEXT index holds numbers, not strings*).
 
 - **Signed build provenance for every release file and image.** The
   release workflow signs a GitHub artifact attestation (Sigstore, with the
@@ -193,6 +195,32 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   skip it. Config file, command line, and `CONFIG SET` at runtime.
 
 ### Changed
+
+- **Full-text search: the TEXT index holds numbers, not strings.** The
+  inverted index kept, for every word of every TEXT field, a set of the
+  keys of the documents holding it, each key a string of its own; the
+  forward index kept every word of every document as a string again, and
+  the vocabulary and document frequencies a third and fourth copy of each
+  word. Now each word (or stem) is kept once and known by a number, and each
+  document by the number its index gives it (the one TAG and NUMERIC
+  postings use, now given in every index with a TEXT field too): a word's
+  documents are a sorted list of numbers, or a bitmap when that is smaller,
+  and a document's words one list of numbers, in order, which is where its
+  positions come from. A query's word, stem, prefix, suffix or infix, and
+  `AND`, `OR` and `NOT` of them, are now exactly the documents the index
+  names, which are no longer read and checked one by one; a phrase still
+  is, and a fuzzy word still reads every document. On an Azure D16s_v5, a
+  million hashes of a short text (6 to 14 words) and a tag, written by 8
+  clients: the dataset takes 827 bytes a document, stems included, instead
+  of 1,944 without them in 1.1 (2,596 with stems before this change);
+  indexing takes 18.7 to 20.7 microseconds of server CPU a document instead
+  of 25 (40), and the writes finish in 7 s instead of 22 (33); a one-word
+  query matching 16,000 documents takes 20 ms instead of 34 (49), a prefix
+  27 ms instead of 36 (91), a word and a tag 0.3 ms instead of 4.2 (7.3).
+  With 100,000 texts of 60 to 200 words: 3.8 KB a document instead of 13.7
+  (21.7), 110 microseconds of CPU instead of 189 (315), a one-word query
+  17 ms instead of 87 (93). `FT.INFO` gives what the TEXT index holds in
+  `text_terms_bytes`, `text_postings_bytes` and `text_docs_bytes`.
 
 - **Search scores are Redis's.** `WITHSCORES`, `ADDSCORES`, and the order
   of results now come out as Redis 8.10 gives them for the same data and

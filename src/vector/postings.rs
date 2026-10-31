@@ -12,7 +12,8 @@
 // A query's TAG and NUMERIC clauses, and `AND`, `OR` and `NOT` of them, are
 // then a set of ids computed from these (see `commands::search::plan`),
 // instead of a filter tried on every document. An index without a TAG or a
-// NUMERIC field keeps none of this, and gives out no ids.
+// NUMERIC field keeps none of this; it gives out ids only if it has a TEXT
+// field, whose index (`text`) is in terms of them.
 //
 // What a document holds is read as the filter reads it (`filter::eval`): a
 // TAG value split at the field's separator, trimmed, lower-cased unless the

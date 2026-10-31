@@ -520,11 +520,19 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     );
     put("num_docs", resp_integer(num_docs as i64));
     put("max_doc_id", resp_integer(num_docs as i64));
-    put("num_terms", resp_integer(def.vocab.read().len() as i64));
+    let (num_terms, num_records, text_bytes) = {
+        let text = def.text.read();
+        (text.num_terms(), text.num_records(), text.bytes())
+    };
+    put("num_terms", resp_integer(num_terms as i64));
+    put("num_records", resp_integer(num_records as i64));
+    // What the TEXT index holds, and what it costs.
+    put("text_terms_bytes", resp_integer(text_bytes.terms as i64));
     put(
-        "num_records",
-        resp_integer(def.inverted.read().values().map(|s| s.len()).sum::<usize>() as i64),
+        "text_postings_bytes",
+        resp_integer(text_bytes.postings as i64),
     );
+    put("text_docs_bytes", resp_integer(text_bytes.docs as i64));
     // What the TAG and NUMERIC postings hold, and what they cost.
     if def.keeps_postings() {
         let p = def.postings.read();
@@ -796,46 +804,42 @@ pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     }
 }
 
-/// The documents that could match, read off the inverted index — or `None`
-/// if the filter has to be tried on every document.
+/// The documents that could match, read off the TEXT index (by their ids),
+/// and whether they are exactly the documents that match — or `None` if the
+/// filter has to be tried on every document.
 ///
-/// What comes back is a superset: every key is evaluated before it counts.
-/// (The index is only ever added to as documents change, so it may name a
-/// document that no longer holds the word.)
-fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
-    let postings = |fields: &[String], pick: &dyn Fn(&str) -> bool, exact: Option<&str>| {
-        let inverted = def.inverted.read();
-        let mut keys: AHashSet<String> = AHashSet::new();
-        for field in fields {
-            match exact {
-                Some(term) => {
-                    if let Some(set) = inverted.get(&format!("{field}\x00{term}")) {
-                        keys.extend(set.iter().cloned());
-                    }
-                }
-                None => {
-                    let start = format!("{field}\x00");
-                    for (entry, set) in inverted.iter() {
-                        if entry.strip_prefix(&start).is_some_and(pick) {
-                            keys.extend(set.iter().cloned());
-                        }
-                    }
-                }
-            }
-        }
-        keys
+/// A word, a stem, a prefix, suffix or infix, and `AND` and `OR` of them,
+/// are exact: the TEXT index holds every document's words as they are now
+/// (and no stopword, which a pattern does not match, as in Redis). A phrase
+/// gives the documents to try: it is about where the words are.
+fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
+    let numbers = |fields: &[String]| -> Vec<u16> {
+        fields.iter().filter_map(|f| def.text_field(f)).collect()
+    };
+    let word = |fields: &[String], term: &str| {
+        let mut out = Bits::new();
+        def.text.read().docs_with(term, &numbers(fields), &mut out);
+        out
+    };
+    let matching = |fields: &[String], pick: &dyn Fn(&str) -> bool| {
+        let mut out = Bits::new();
+        def.text
+            .read()
+            .docs_matching(&numbers(fields), pick, &mut out);
+        out
     };
     match filter {
-        Filter::MatchNone => Some(AHashSet::new()),
+        Filter::MatchNone => Some((Bits::new(), true)),
         Filter::Text { fields, term } => Some(match term {
-            TextMatch::Exact(t) | TextMatch::Expanded(t) => postings(fields, &|_| false, Some(t)),
+            // A stopword a synonym brings in is in no index.
+            TextMatch::Exact(t) | TextMatch::Expanded(t) => (word(fields, t), !def.is_stopword(t)),
             TextMatch::Stem(stem) => {
                 let term = format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem);
-                postings(fields, &|_| false, Some(&term))
+                (word(fields, &term), true)
             }
-            TextMatch::Prefix(p) => postings(fields, &|tok| tok.starts_with(p.as_str()), None),
-            TextMatch::Suffix(s) => postings(fields, &|tok| tok.ends_with(s.as_str()), None),
-            TextMatch::Infix(s) => postings(fields, &|tok| tok.contains(s.as_str()), None),
+            TextMatch::Prefix(p) => (matching(fields, &|tok| tok.starts_with(p.as_str())), true),
+            TextMatch::Suffix(s) => (matching(fields, &|tok| tok.ends_with(s.as_str())), true),
+            TextMatch::Infix(s) => (matching(fields, &|tok| tok.contains(s.as_str())), true),
             // Every word of the vocabulary would have to be measured against
             // it; trying the documents costs the same.
             TextMatch::Fuzzy(..) => return None,
@@ -845,21 +849,25 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
             let mut sets = terms
                 .iter()
                 .filter(|t| !def.is_stopword(t))
-                .map(|t| postings(fields, &|_| false, Some(t)));
-            let first = sets.next()?;
-            Some(sets.fold(first, |acc, set| {
-                acc.into_iter().filter(|k| set.contains(k)).collect()
-            }))
+                .map(|t| word(fields, t));
+            let mut all = sets.next()?;
+            for set in sets {
+                all.and_with(&set);
+            }
+            Some((all, false))
         }
         Filter::And(l, r) => match (candidates(l, def), candidates(r, def)) {
-            (Some(a), Some(b)) => Some(a.into_iter().filter(|k| b.contains(k)).collect()),
-            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some((mut a, exact_a)), Some((b, exact_b))) => {
+                a.and_with(&b);
+                Some((a, exact_a && exact_b))
+            }
+            (Some((a, _)), None) | (None, Some((a, _))) => Some((a, false)),
             (None, None) => None,
         },
         Filter::Or(l, r) => match (candidates(l, def), candidates(r, def)) {
-            (Some(mut a), Some(b)) => {
-                a.extend(b);
-                Some(a)
+            (Some((mut a, exact_a)), Some((b, exact_b))) => {
+                a.or_with(&b);
+                Some((a, exact_a && exact_b))
             }
             _ => None,
         },
@@ -872,8 +880,9 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
 // An index with a TAG or NUMERIC field keeps postings for them (see
 // `vector::postings`). A filter made of TAG and NUMERIC clauses, `AND`, `OR`,
 // `NOT`, `*` and `~`, is then a set of document ids read off them, exactly
-// the documents the filter matches: nothing is read to find them. A TEXT
-// clause narrows the set to the documents its words are in, and the set is
+// the documents the filter matches: nothing is read to find them. So is a
+// TEXT word, stem or pattern, read off the TEXT index (`vector::text`); a
+// phrase narrows the set to the documents its words are in, and the set is
 // then one to try the filter on. A clause the postings know nothing of
 // (a fuzzy word, a vector range) leaves the documents the rest allows, if
 // the rest allows fewer than all: those are tried. Only a filter that
@@ -912,15 +921,8 @@ fn resolve(filter: &Filter, def: &IndexDef, p: &Postings) -> Cand {
         } => known(p.range(field, *lo, *lo_exclusive, *hi, *hi_exclusive)),
         Filter::NumericNot { field, value } => known(p.not_equal(field, *value)),
         Filter::Text { .. } | Filter::Phrase { .. } => match candidates(filter, def) {
-            Some(keys) => {
-                let mut ids = Bits::new();
-                for key in &keys {
-                    if let Some(id) = p.id(key) {
-                        ids.set(id);
-                    }
-                }
-                Cand::Superset(ids)
-            }
+            Some((ids, true)) => Cand::Exact(ids),
+            Some((ids, false)) => Cand::Superset(ids),
             None => Cand::Unknown,
         },
         Filter::VectorRange { .. } => Cand::Unknown,
@@ -1124,16 +1126,31 @@ pub(crate) fn filter_each(
     };
 
     // The keys to look at, if they are known without reading everything: the
-    // ones the caller named, or the ones the inverted index names.
-    let known: Option<AHashSet<String>> = match (only, candidates(filter, def)) {
-        (Some(only), Some(found)) => Some(found.into_iter().filter(|k| only.contains(k)).collect()),
-        (Some(only), None) => Some(only.clone()),
-        (None, found) => found,
+    // ones the caller named, or the ones the TEXT index names. Those are the
+    // matches if the TEXT index says so, and it is of this database.
+    let found = candidates(filter, def).map(|(ids, exact)| {
+        (
+            keys_of(def, &ids),
+            exact && def.db_index == *ctx.selected_db,
+        )
+    });
+    let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
+        (Some(only), Some((found, exact))) => (
+            Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
+            exact,
+        ),
+        (Some(only), None) => (
+            Some(only.iter().map(|k| Arc::from(k.as_str())).collect()),
+            false,
+        ),
+        (None, Some((found, exact))) => (Some(found), exact),
+        (None, None) => (None, false),
     };
     match known {
         Some(keys) => {
             let mut seen = 0u32;
             for key in &keys {
+                let key: &str = key;
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
                     break;
@@ -1141,7 +1158,11 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, _| consider(key, fields));
+                with_doc(db, def, key, |fields, _| {
+                    if exact || filter::eval(filter, fields) {
+                        accept(key, fields);
+                    }
+                });
             }
         }
         None => {

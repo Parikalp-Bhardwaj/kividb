@@ -1157,13 +1157,13 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The vocab is maintained incrementally by maybe_index and backfill_index.
     // We clone the Arc to drop the IndexStore lock before doing the lookup
     // loop — keeps the fast path uncontended.
-    let vocab_arc = {
+    let text_arc = {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
             None => return Some(resp_error("ERR no such index")),
         };
-        Arc::clone(&def.vocab)
+        Arc::clone(&def.text)
     };
 
     // Take a read lock on the vocab itself. We need to convert it into a
@@ -1173,10 +1173,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     //
     // The vocab is then a local owned BTreeSet; we drop the read lock before
     // any further work so concurrent HSETs can keep updating the index.
-    let mut vocab: BTreeSet<String> = {
-        let v = vocab_arc.read();
-        v.clone()
-    };
+    let mut vocab: BTreeSet<String> = text_arc.read().words().map(str::to_string).collect();
 
     // AFTER the vocab-building loop over shards,
     // this block is used to merge in any INCLUDE dicts and remove EXCLUDE dicts.

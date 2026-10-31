@@ -35,9 +35,11 @@
 // BM25 (RediSearch's older variant), TFIDF, TFIDF.DOCNORM, DISMAX, DOCSCORE
 // and HAMMING (no payloads here: always 0).
 
+use super::IndexDef;
 use super::filter::{Doc, Filter, TextMatch};
-use super::stem::{STEM_PREFIX, is_stem};
-use super::{FieldType, IndexDef};
+use super::postings::Bits;
+use super::stem::STEM_PREFIX;
+use super::text::{TextIndex, Token};
 use ahash::AHashMap;
 
 /// A ranking function of `SCORER`.
@@ -125,67 +127,87 @@ struct Stat {
 
 /// One document's terms, as the index has them (its forward index).
 #[derive(Default)]
-struct DocTerms<'a> {
+struct DocTerms {
     /// Its words, each counted by its field's weight.
     len: u32,
     max_freq: u32,
-    terms: AHashMap<&'a str, Stat>,
+    /// By term id, sorted.
+    terms: Vec<(u32, Stat)>,
 }
 
 /// The bit of TEXT field `name` (see [`Stat::fields`]).
 fn field_bit(def: &IndexDef, name: &str) -> u64 {
-    def.fields
-        .iter()
-        .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
-        .position(|f| f.name == name)
-        .map_or(0, |i| 1u64 << i.min(63))
+    def.text_field(name)
+        .map_or(0, |i| 1u64 << u32::from(i).min(63))
 }
 
 fn fields_mask(def: &IndexDef, fields: &[String]) -> u64 {
     fields.iter().fold(0, |mask, f| mask | field_bit(def, f))
 }
 
-impl<'a> DocTerms<'a> {
-    /// The document's length, and the terms of `wanted` it holds; every term
-    /// if `wanted` is `None`.
-    fn read(
-        def: &IndexDef,
-        fields: &'a AHashMap<String, Vec<String>>,
-        wanted: Option<&ahash::AHashSet<String>>,
-    ) -> Self {
+impl DocTerms {
+    /// The document's length, and the terms of `wanted` it holds, from its
+    /// entry in the TEXT index. `units` is, by TEXT field number, what a
+    /// word and a stem there count. With `max_freq`, the frequency of its
+    /// most frequent term, whichever it is (TFIDF's norm); otherwise of its
+    /// most frequent wanted one.
+    fn read(units: &[(u32, u32)], entry: &[u32], wanted: &Bits, max_freq: bool) -> Self {
         let mut doc = DocTerms::default();
         let mut pos = 0u32;
-        let text = def
-            .fields
-            .iter()
-            .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex);
-        for (i, field) in text.enumerate() {
-            let Some(tokens) = fields.get(&field.name) else {
-                continue;
-            };
-            let weight = field.options.weight as f32;
-            let unit = (weight as u32).max(1);
-            let stem_unit = ((weight * STEM_FACTOR) as u32).max(1);
-            let bit = 1u64 << i.min(63);
-            for token in tokens {
-                let freq = if is_stem(token) {
+        // (term, position, frequency, field bit), in the document's order.
+        let mut found: Vec<(u32, u32, u32, u64)> = Vec::new();
+        // (term, frequency) of every term, for `max_freq`.
+        let mut all: Vec<(u32, u32)> = Vec::new();
+        for (field, tokens) in super::text::fields(entry) {
+            let (unit, stem_unit) = units.get(field as usize).copied().unwrap_or((1, 1));
+            let bit = 1u64 << u32::from(field).min(63);
+            for &raw in tokens {
+                let token = Token(raw);
+                let freq = if token.is_stem() {
                     stem_unit
                 } else {
                     pos += 1;
                     doc.len += unit;
                     unit
                 };
-                if wanted.is_some_and(|w| !w.contains(token.as_str())) {
-                    continue;
+                let id = token.term();
+                if max_freq {
+                    all.push((id, freq));
                 }
-                let stat = doc.terms.entry(token.as_str()).or_default();
+                if wanted.get(id) {
+                    found.push((id, pos, freq, bit));
+                }
+            }
+        }
+        // Stable: each term's positions stay in order.
+        found.sort_by_key(|f| f.0);
+        for (id, pos, freq, bit) in found {
+            if doc.terms.last().is_none_or(|(last, _)| *last != id) {
+                doc.terms.push((id, Stat::default()));
+            }
+            if let Some((_, stat)) = doc.terms.last_mut() {
                 stat.freq += freq;
                 stat.fields |= bit;
                 stat.offsets.push(pos);
             }
         }
-        doc.max_freq = doc.terms.values().map(|s| s.freq).max().unwrap_or(0);
+        doc.max_freq = if max_freq {
+            all.sort_unstable_by_key(|(id, _)| *id);
+            all.chunk_by(|a, b| a.0 == b.0)
+                .map(|run| run.iter().map(|(_, f)| f).sum::<u32>())
+                .max()
+                .unwrap_or(0)
+        } else {
+            doc.terms.iter().map(|(_, s)| s.freq).max().unwrap_or(0)
+        };
         doc
+    }
+
+    fn get(&self, id: u32) -> Option<&Stat> {
+        self.terms
+            .binary_search_by_key(&id, |(t, _)| *t)
+            .ok()
+            .map(|at| &self.terms[at].1)
     }
 }
 
@@ -292,41 +314,65 @@ pub struct Scoring<'q> {
     /// Documents in the index.
     n: usize,
     avgdl: f64,
-    /// Document frequencies of the words and stems the query names.
-    term_df: AHashMap<String, usize>,
+    /// The ids of the words and stems the query names that the index
+    /// holds, and their document frequencies.
+    term_ids: AHashMap<String, (u32, usize)>,
+    /// By TEXT field number: what a word and a stem there count.
+    units: Vec<(u32, u32)>,
     /// Of the TAG values it names, by field.
     tag_df: AHashMap<(String, String), usize>,
-    /// The terms a document's are read for: `None` for all of them (a
-    /// pattern matches terms not known in advance, and TFIDF divides by the
-    /// frequency of the document's most frequent term).
-    wanted: Option<ahash::AHashSet<String>>,
+    /// By id, the terms a document's are read for: those the query names,
+    /// and those of the index its patterns (a prefix, a fuzzy word, ...)
+    /// match.
+    wanted: Bits,
     tanh_factor: f64,
 }
 
 impl<'q> Scoring<'q> {
     pub fn new(def: &IndexDef, filter: &'q Filter, scorer: Scorer) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
         let mut words = Vec::new();
         let mut tags = Vec::new();
         let patterns = named_terms(filter, &mut words, &mut tags);
-        let wanted =
-            (!patterns && scorer != Scorer::Tfidf).then(|| words.iter().cloned().collect());
-        let term_df = {
-            let df = def.doc_freq.read();
-            words
+        let mut wanted = Bits::new();
+        let (term_ids, doc_count, total_len) = {
+            let text = def.text.read();
+            let ids: AHashMap<String, (u32, usize)> = words
                 .into_iter()
-                .map(|w| {
-                    let n = df.get(&w).copied().unwrap_or(0);
-                    (w, n)
+                .filter_map(|w| {
+                    let id = text.term(&w)?;
+                    Some((w, (id, text.df(id))))
                 })
-                .collect()
+                .collect();
+            for (id, _) in ids.values() {
+                wanted.set(*id);
+            }
+            if patterns {
+                let mut matches = Vec::new();
+                pattern_terms(filter, &mut matches);
+                for (id, word) in text.live_words() {
+                    if matches.iter().any(|m| m.matches(word)) {
+                        wanted.set(id);
+                    }
+                }
+            }
+            (ids, text.doc_count(), text.total_len())
         };
+        let units = def
+            .text_fields()
+            .map(|f| {
+                let weight = f.options.weight as f32;
+                (
+                    (weight as u32).max(1),
+                    ((weight * STEM_FACTOR) as u32).max(1),
+                )
+            })
+            .collect();
         let (n, tag_df) = {
             let postings = def.postings.read();
             let n = if postings.enabled() {
                 postings.len()
             } else {
-                def.doc_count.load(Relaxed)
+                doc_count
             };
             let tag_df = tags
                 .into_iter()
@@ -337,11 +383,11 @@ impl<'q> Scoring<'q> {
                 .collect();
             (n, tag_df)
         };
-        let n = n.max(def.doc_count.load(Relaxed));
+        let n = n.max(doc_count);
         let avgdl = if n == 0 {
             0.0
         } else {
-            def.total_tokens.load(Relaxed) as f64 / n as f64
+            total_len as f64 / n as f64
         };
         let tanh_factor =
             crate::commands::search_tools::config_number("BM25STD_TANH_FACTOR", 4).max(1) as f64;
@@ -350,7 +396,8 @@ impl<'q> Scoring<'q> {
             scorer,
             n,
             avgdl,
-            term_df,
+            term_ids,
+            units,
             tag_df,
             wanted,
             tanh_factor,
@@ -361,20 +408,35 @@ impl<'q> Scoring<'q> {
     /// document matches the query.
     pub fn score(&self, def: &IndexDef, key: &str, doc: &dyn Doc) -> f64 {
         match self.scorer {
+            Scorer::DocScore => 1.0,
+            Scorer::Hamming => 0.0,
+            _ => {
+                let id = def.postings.read().id(key);
+                self.score_id(def, id, doc)
+            }
+        }
+    }
+
+    /// [`Scoring::score`] of the document whose id in the index is `id`
+    /// (`None`: it has none, and no words).
+    pub fn score_id(&self, def: &IndexDef, id: Option<u32>, doc: &dyn Doc) -> f64 {
+        match self.scorer {
             Scorer::DocScore => return 1.0,
             Scorer::Hamming => return 0.0,
             _ => {}
         }
-        let forward = def.forward.read();
-        let empty = AHashMap::new();
+        let text = def.text.read();
+        let entry = id.map_or(&[][..], |id| text.doc(id));
         let terms = DocTerms::read(
-            def,
-            forward.get(key).unwrap_or(&empty),
-            self.wanted.as_ref(),
+            &self.units,
+            entry,
+            &self.wanted,
+            self.scorer == Scorer::Tfidf,
         );
-        let Some(res) = self.node(def, self.filter, &terms, doc) else {
+        let Some(res) = self.node(def, &text, self.filter, &terms, doc) else {
             return 0.0;
         };
+        drop(text);
         let raw = res.value;
         match self.scorer {
             Scorer::Bm25Std => raw,
@@ -435,11 +497,10 @@ impl<'q> Scoring<'q> {
         }
     }
 
-    fn word(&self, def: &IndexDef, term: &str, stat: &Stat, len: u32) -> Res {
-        let df = match self.term_df.get(term) {
-            Some(df) => *df,
-            None => def.doc_freq.read().get(term).copied().unwrap_or(0),
-        };
+    /// Term `id`, named by the query (`named`, with its document frequency
+    /// as the query found it) or matched by a pattern.
+    fn word(&self, text: &TextIndex, id: u32, named: Option<usize>, stat: &Stat, len: u32) -> Res {
+        let df = named.unwrap_or_else(|| text.df(id));
         Res::leaf(
             Kind::Term,
             self.term(stat.freq, df, len),
@@ -472,6 +533,7 @@ impl<'q> Scoring<'q> {
     fn node(
         &self,
         def: &IndexDef,
+        text: &TextIndex,
         filter: &Filter,
         doc: &DocTerms,
         fields: &dyn Doc,
@@ -488,28 +550,30 @@ impl<'q> Scoring<'q> {
                 term,
             } => {
                 let mask = fields_mask(def, scope);
-                let present = |t: &str| doc.terms.get(t).filter(|s| s.fields & mask != 0);
+                let present = |t: &str| {
+                    let &(id, df) = self.term_ids.get(t)?;
+                    let stat = doc.get(id).filter(|s| s.fields & mask != 0)?;
+                    Some(self.word(text, id, Some(df), stat, doc.len))
+                };
                 match term {
-                    TextMatch::Exact(word) | TextMatch::Expanded(word) => {
-                        present(word).map(|stat| self.word(def, word, stat, doc.len))
-                    }
-                    TextMatch::Stem(stem) => {
-                        let term = format!("{STEM_PREFIX}{}", stem.stem);
-                        present(&term).map(|stat| self.word(def, &term, stat, doc.len))
-                    }
+                    TextMatch::Exact(word) | TextMatch::Expanded(word) => present(word),
+                    TextMatch::Stem(stem) => present(&format!("{STEM_PREFIX}{}", stem.stem)),
                     other => {
                         // RediSearch's union of the words a pattern expands
                         // to stops at the first that matches.
                         // Which one is not always the first in order, there:
                         // that is what is taken here.
-                        let (word, stat) = doc
+                        let (id, stat) = doc
                             .terms
                             .iter()
-                            .filter(|(t, s)| {
-                                s.fields & mask != 0 && !is_stem(t) && other.matches(t)
+                            .filter(|(id, s)| {
+                                let t = text.text(*id);
+                                s.fields & mask != 0
+                                    && !t.starts_with(STEM_PREFIX)
+                                    && other.matches(t)
                             })
-                            .min_by_key(|(t, _)| **t)?;
-                        let child = self.word(def, word, stat, doc.len);
+                            .min_by_key(|(id, _)| text.text(*id))?;
+                        let child = self.word(text, *id, None, stat, doc.len);
                         self.aggregate(Kind::Union, vec![child])
                     }
                 }
@@ -521,11 +585,9 @@ impl<'q> Scoring<'q> {
                 let mask = fields_mask(def, scope);
                 let mut children = Vec::new();
                 for term in terms.iter().filter(|t| !def.is_stopword(t)) {
-                    let stat = doc
-                        .terms
-                        .get(term.as_str())
-                        .filter(|s| s.fields & mask != 0)?;
-                    children.push(self.word(def, term, stat, doc.len));
+                    let &(id, df) = self.term_ids.get(term.as_str())?;
+                    let stat = doc.get(id).filter(|s| s.fields & mask != 0)?;
+                    children.push(self.word(text, id, Some(df), stat, doc.len));
                 }
                 self.aggregate(Kind::Intersection, children)
             }
@@ -577,13 +639,13 @@ impl<'q> Scoring<'q> {
                 super::filter::eval(filter, fields)
                     .then(|| Res::leaf(Kind::Numeric, self.numeric_value(), Vec::new()))
             }
-            Filter::Not(inner) => match self.node(def, inner, doc, fields) {
+            Filter::Not(inner) => match self.node(def, text, inner, doc, fields) {
                 Some(_) => None,
                 None if super::filter::eval(inner, fields) => None,
                 None => Some(Res::leaf(Kind::Virtual, 0.0, Vec::new())),
             },
             Filter::Optional(inner) => Some(
-                self.node(def, inner, doc, fields)
+                self.node(def, text, inner, doc, fields)
                     .unwrap_or_else(|| Res::leaf(Kind::Virtual, 0.0, Vec::new())),
             ),
             Filter::And(..) | Filter::Or(..) => {
@@ -592,7 +654,7 @@ impl<'q> Scoring<'q> {
                 operands(filter, &mut parts);
                 let mut children = Vec::with_capacity(parts.len());
                 for part in parts {
-                    match self.node(def, part, doc, fields) {
+                    match self.node(def, text, part, doc, fields) {
                         Some(res) => children.push(res),
                         None if and => return None,
                         None => {}
@@ -634,6 +696,26 @@ fn named_terms(filter: &Filter, words: &mut Vec<String>, tags: &mut Vec<(String,
         }
         Filter::Not(inner) | Filter::Optional(inner) => named_terms(inner, words, tags),
         _ => false,
+    }
+}
+
+/// The patterns of a query: its prefixes, suffixes, infixes and fuzzy words.
+fn pattern_terms<'f>(filter: &'f Filter, out: &mut Vec<&'f TextMatch>) {
+    match filter {
+        Filter::Text { term, .. } => {
+            if !matches!(
+                term,
+                TextMatch::Exact(_) | TextMatch::Expanded(_) | TextMatch::Stem(_)
+            ) {
+                out.push(term);
+            }
+        }
+        Filter::And(l, r) | Filter::Or(l, r) => {
+            pattern_terms(l, out);
+            pattern_terms(r, out);
+        }
+        Filter::Not(inner) | Filter::Optional(inner) => pattern_terms(inner, out),
+        _ => {}
     }
 }
 
