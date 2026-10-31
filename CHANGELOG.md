@@ -315,6 +315,25 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Eviction keeps the keys the policy wants kept.** Under `allkeys-lfu`,
+  with 20,000 keys read again and again and 300,000 keys of 1 KB written
+  once into 64 MB, 76% of the read keys were left at the end, where Redis
+  8.10 keeps 96%; and of the read keys that went, four in five had been
+  read more often than every key still there that never was. The keys
+  looked at to choose one were a run of buckets from a random one, and the
+  first key after a run of empty buckets came up far more often than any
+  other: the same few places were looked at again and again, what the
+  policy did not want went from them, and in time they held only keys it
+  wanted, one of which then went. Each key looked at is now at a place
+  picked at random, every key as likely as any other, and the four keys a
+  thread wanted least after the one it deleted are looked at again at its
+  next eviction, read as they are then. The same test now keeps 96%; with
+  the writes spread over a minute under `allkeys-lru`, 26% of the read keys
+  are kept (16% before, Redis 23%). An evicting write no longer asks every
+  shard of every database whether it has keys, a load from each of 2,048
+  lines on 16 cores for 16 databases: a thread keeps the answer for 10 ms.
+  The stream of that test is written in 2.3 s, where it took 2.8 s (Redis
+  2.4 s).
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
   matches many documents, a filtered KNN query on an HNSW index searched the
