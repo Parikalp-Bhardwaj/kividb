@@ -24,6 +24,7 @@ use super::{FieldType, SchemaField};
 use ahash::AHashMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
 /// A node of a graph whose document id is not known (yet): see
 /// [`super::HnswNode::doc`].
@@ -1124,9 +1125,22 @@ impl KeyOrder {
                 &|at, id| self.place_of(id) == at as u32,
                 &mut *ran_out,
             ));
-            for run in &self.runs {
+            for (r, run) in self.runs.iter().enumerate() {
+                // Of a run being merged into another, what is before the
+                // merge's place in it has gone to the merge's output (walked
+                // below): passing over it, entry by entry, would use up the
+                // walk's budget.
+                let from = match &self.merging {
+                    Some(merge)
+                        if !merge.into_sorted
+                            && (merge.start..merge.start + merge.inputs).contains(&r) =>
+                    {
+                        merge.at[r - merge.start].min(run.ids.len())
+                    }
+                    _ => 0,
+                };
                 lists.push(walk(
-                    &run.ids,
+                    &run.ids[from..],
                     &|_, id| self.place_of(id) == run.tag,
                     &mut *ran_out,
                 ));
@@ -1215,6 +1229,65 @@ impl KeyOrder {
 
 // ── The postings of an index ─────────────────────────────────────────────────
 
+/// Key to id, in [`KEY_MAPS`] maps by a hash of the key. A map that grows
+/// moves everything it holds, under the postings' write lock: one map of
+/// 1.8 million keys took 150 ms to. Each of these holds a 256th of the keys,
+/// and they grow at different writes.
+#[derive(Debug)]
+struct KeyIds {
+    maps: Vec<AHashMap<Arc<str>, u32>>,
+    len: usize,
+}
+
+const KEY_MAPS: usize = 256;
+
+impl Default for KeyIds {
+    fn default() -> Self {
+        Self {
+            maps: (0..KEY_MAPS).map(|_| AHashMap::new()).collect(),
+            len: 0,
+        }
+    }
+}
+
+impl KeyIds {
+    #[inline]
+    fn map_of(key: &str) -> usize {
+        const PICK: ahash::RandomState = ahash::RandomState::with_seeds(
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        );
+        (PICK.hash_one(key) >> 56) as usize % KEY_MAPS
+    }
+
+    #[inline]
+    fn get(&self, key: &str) -> Option<u32> {
+        self.maps[Self::map_of(key)].get(key).copied()
+    }
+
+    fn insert(&mut self, key: Arc<str>, id: u32) {
+        if self.maps[Self::map_of(&key)].insert(key, id).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &str) -> Option<u32> {
+        let id = self.maps[Self::map_of(key)].remove(key)?;
+        self.len -= 1;
+        Some(id)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.maps.iter().map(|m| m.capacity()).sum()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Kind {
     Tag(TagPostings),
@@ -1234,7 +1307,7 @@ struct FieldPostings {
 pub struct Postings {
     /// By id: the document's key.
     keys: Vec<Option<Arc<str>>>,
-    ids: AHashMap<Arc<str>, u32>,
+    ids: KeyIds,
     /// Ids given back by documents that left, to be given out again.
     free: Vec<u32>,
     /// Every id in use: every document of the index.
@@ -1250,8 +1323,6 @@ pub struct Postings {
     pub read_all: bool,
     /// The ids in the order of their keys: see `KeyOrder`.
     order: KeyOrder,
-    /// A thread is doing the merging these are behind on ([`tidy`]).
-    tidying: bool,
     /// Writes so far: the thread settles what is left once it stops moving.
     writes: u64,
     /// By id: its key's cluster hash slot, for a query in a cluster to keep
@@ -1264,32 +1335,249 @@ pub struct Postings {
 /// some waiting ids, recent numbers) is merged anyway.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The least and the most time the postings' thread spends merging each
+/// time it takes the lock (see [`tidy`]).
+const STEP_LEAST: std::time::Duration = std::time::Duration::from_micros(100);
+const STEP_MOST: std::time::Duration = std::time::Duration::from_millis(4);
+
+// ── Sharing the postings ─────────────────────────────────────────────────────
+//
+// A query reads the postings under a read lock for as long as it takes to
+// build its sets and pick its page: a broad NUMERIC range is hundreds of
+// thousands of entries, a millisecond or more. A write that waited for the
+// lock would wait for every query in front of it, and the lock being fair,
+// the queries behind it would wait for the write: with queries coming one
+// after the other, writes went at the queries' pace. So a write never waits
+// for the lock. If it is free, the write is applied there and then; if not,
+// it is queued (`Pending`), and whoever takes the lock next applies the
+// queue first, in order: a write, the merging thread, or a query, which so
+// sees every write that returned before it began.
+
+/// A write that found the postings' lock taken.
+enum Pending {
+    Write {
+        key: Box<str>,
+        fields: Vec<(String, Arc<[u8]>)>,
+        whole: bool,
+    },
+    Remove(Box<str>),
+}
+
+/// Writes queued past this many wait for the lock instead: a bound on what
+/// the queue holds when queries never let go of it.
+const QUEUE_MAX: usize = 1 << 16;
+
+/// The postings of an index and the writes queued for them: see above.
+pub struct PostingsLock {
+    lock: parking_lot::RwLock<Postings>,
+    queue: parking_lot::Mutex<Vec<Pending>>,
+    /// The queue is not empty: set and cleared under its mutex.
+    queued: AtomicBool,
+    /// A thread is doing the merging the postings are behind on ([`tidy`]).
+    /// Set and cleared under the postings' write lock.
+    tidying: AtomicBool,
+}
+
+impl std::fmt::Debug for PostingsLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostingsLock").finish_non_exhaustive()
+    }
+}
+
+/// The postings of an index, shared by its clones.
+pub type SharedPostings = Arc<PostingsLock>;
+
+/// Exclusive access to the postings, the queue applied.
+pub type PostingsWrite<'a> = parking_lot::RwLockWriteGuard<'a, Postings>;
+/// Shared access to the postings, the queue applied.
+pub type PostingsRead<'a> = parking_lot::RwLockReadGuard<'a, Postings>;
+
+impl PostingsLock {
+    pub fn new(postings: Postings) -> SharedPostings {
+        Arc::new(Self {
+            lock: parking_lot::RwLock::new(postings),
+            queue: parking_lot::Mutex::new(Vec::new()),
+            queued: AtomicBool::new(false),
+            tidying: AtomicBool::new(false),
+        })
+    }
+
+    /// Shared access, every write queued so far applied first.
+    pub fn read(self: &Arc<Self>) -> PostingsRead<'_> {
+        if !self.queued.load(SeqCst) {
+            return self.lock.read();
+        }
+        let mut postings = self.lock.write();
+        self.apply(&mut postings);
+        let tidy_now = self.wants_tidy(&postings);
+        let postings = parking_lot::RwLockWriteGuard::downgrade(postings);
+        if tidy_now {
+            tidy(self);
+        }
+        postings
+    }
+
+    /// Shared access to the postings as they are, what is queued left
+    /// queued: for what writes do not change, or a query's second look at
+    /// them, its first ([`PostingsLock::read`]) having applied the queue.
+    pub fn peek(&self) -> PostingsRead<'_> {
+        self.lock.read()
+    }
+
+    /// Exclusive access, every write queued so far applied first. Hand it
+    /// back with [`PostingsLock::done`] once it has changed the postings, so
+    /// that the merging it calls for is started.
+    pub fn write(&self) -> PostingsWrite<'_> {
+        let mut postings = self.lock.write();
+        self.apply(&mut postings);
+        postings
+    }
+
+    /// Let go of exclusive access from [`PostingsLock::write`]: start the
+    /// merging the postings are now behind on, and apply what was queued
+    /// meanwhile if the lock is free.
+    pub fn done(self: &Arc<Self>, postings: PostingsWrite<'_>) {
+        let tidy_now = self.wants_tidy(&postings);
+        drop(postings);
+        if tidy_now {
+            tidy(self);
+        }
+        self.flush();
+    }
+
+    /// What the document at `key` holds now, from `fields` (see
+    /// [`Postings::write`]): applied at once if the lock is free, queued if
+    /// not. Its id, or [`NO_DOC`] if it was queued.
+    pub fn write_fields(
+        self: &Arc<Self>,
+        key: &str,
+        fields: &[(String, Arc<[u8]>)],
+        whole: bool,
+    ) -> u32 {
+        if let Some(mut postings) = self.lock.try_write() {
+            self.apply(&mut postings);
+            let doc = postings.write(key, fields, whole);
+            self.done(postings);
+            return doc;
+        }
+        self.enqueue(Pending::Write {
+            key: key.into(),
+            fields: fields.to_vec(),
+            whole,
+        });
+        NO_DOC
+    }
+
+    /// The document at `key` has left the index ([`Postings::remove`]): at
+    /// once if the lock is free, queued if not.
+    pub fn remove(self: &Arc<Self>, key: &str) {
+        if let Some(mut postings) = self.lock.try_write() {
+            self.apply(&mut postings);
+            postings.remove(key);
+            self.done(postings);
+            return;
+        }
+        self.enqueue(Pending::Remove(key.into()));
+    }
+
+    fn enqueue(self: &Arc<Self>, write: Pending) {
+        let full = {
+            let mut queue = self.queue.lock();
+            queue.push(write);
+            self.queued.store(true, SeqCst);
+            queue.len() >= QUEUE_MAX
+        };
+        if full {
+            let postings = self.write();
+            self.done(postings);
+        } else {
+            // Whoever held the lock may have let go of it before this was
+            // queued, and found nothing to apply.
+            self.flush();
+        }
+    }
+
+    /// Apply what is queued while the lock is free; a holder of the lock
+    /// applies it otherwise, or, at the latest, the next query.
+    fn flush(self: &Arc<Self>) {
+        while self.queued.load(SeqCst) {
+            let Some(mut postings) = self.lock.try_write() else {
+                return;
+            };
+            self.apply(&mut postings);
+            let tidy_now = self.wants_tidy(&postings);
+            drop(postings);
+            if tidy_now {
+                tidy(self);
+            }
+        }
+    }
+
+    /// Apply the queue, in order, under the write lock.
+    fn apply(&self, postings: &mut Postings) {
+        if !self.queued.load(SeqCst) {
+            return;
+        }
+        let writes = {
+            let mut queue = self.queue.lock();
+            self.queued.store(false, SeqCst);
+            std::mem::take(&mut *queue)
+        };
+        for write in writes {
+            match write {
+                Pending::Write { key, fields, whole } => {
+                    postings.write(&key, &fields, whole);
+                }
+                Pending::Remove(key) => postings.remove(&key),
+            }
+        }
+    }
+
+    /// Whether merging is due that no thread is doing: then the caller,
+    /// once it has let go of the lock, starts one with [`tidy`]. Called
+    /// under the lock.
+    fn wants_tidy(&self, postings: &Postings) -> bool {
+        postings.behind() && !self.tidying.swap(true, SeqCst)
+    }
+}
+
 /// Do the merging `shared`'s postings are behind on, on a thread of its own,
-/// a step at a time: each step holds the postings' write lock for a few
-/// hundred entries, then hands it to whoever waits. The caller had
-/// [`Postings::wants_tidy`] say so. Once nothing is due, what is left is
+/// a few steps at a time: each step holds the postings' write lock for a few
+/// hundred entries, and the thread hands it to whoever waits after
+/// [`STEP_LEAST`], or half as long as it waited for it. The caller had
+/// [`PostingsLock::wants_tidy`] say so. Once nothing is due, what is left is
 /// merged when writes have paused for [`QUIET`], so that a quiet index is
 /// read off one list; then the thread ends.
-pub fn tidy(shared: &SharedPostings) {
+fn tidy(shared: &SharedPostings) {
     let worker = Arc::clone(shared);
     let started = std::thread::Builder::new()
         .name("kividb-postings".into())
         .spawn(move || {
             let mut spare: Option<Vec<u32>> = None;
             loop {
-                let wanted = worker.read().spare_wanted();
+                let wanted = worker.lock.read().spare_wanted();
                 if wanted > 0 && spare.as_ref().is_none_or(|s| s.len() < wanted) {
                     spare = Some(vec![NO_PLACE; wanted + wanted / 8]);
                 }
                 let mut trash: Trash = Vec::new();
+                let asked = std::time::Instant::now();
                 let mut postings = worker.write();
-                if postings.tidy_step_with(&mut spare, &mut trash) {
+                // Queries that hold the lock long make the thread wait long
+                // for it, and the more they find unmerged, the longer they
+                // hold it: so the longer it waited, the more it does, up to
+                // half its wait.
+                let budget = (asked.elapsed() / 2).clamp(STEP_LEAST, STEP_MOST);
+                if postings.tidy_steps(&mut spare, &mut trash, budget) {
                     parking_lot::RwLockWriteGuard::unlock_fair(postings);
                     drop(trash);
                     continue;
                 }
                 if !postings.unsettled() {
-                    postings.tidying = false;
+                    // Under the lock: whoever holds it next and finds the
+                    // postings behind starts another thread.
+                    worker.tidying.store(false, SeqCst);
+                    drop(postings);
+                    worker.flush();
                     return;
                 }
                 let seen = postings.writes;
@@ -1302,12 +1590,9 @@ pub fn tidy(shared: &SharedPostings) {
             }
         });
     if started.is_err() {
-        shared.write().tidying = false;
+        shared.tidying.store(false, SeqCst);
     }
 }
-
-/// The postings of an index, shared by its clones.
-pub type SharedPostings = Arc<parking_lot::RwLock<Postings>>;
 
 impl Postings {
     /// Postings for the TAG and NUMERIC fields of `schema`.
@@ -1349,7 +1634,7 @@ impl Postings {
     }
 
     pub fn id(&self, key: &str) -> Option<u32> {
-        self.ids.get(key).copied()
+        self.ids.get(key)
     }
 
     pub fn key(&self, id: u32) -> Option<&Arc<str>> {
@@ -1372,12 +1657,12 @@ impl Postings {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.ids.len() == 0
     }
 
     /// The document at `key`'s id, given it one if it has none.
     pub fn ensure(&mut self, key: &str) -> u32 {
-        if let Some(&id) = self.ids.get(key) {
+        if let Some(id) = self.ids.get(key) {
             return id;
         }
         let key: Arc<str> = Arc::from(key);
@@ -1400,16 +1685,6 @@ impl Postings {
         self.live.set(id);
         self.order.added(id);
         id
-    }
-
-    /// Whether merging is due that no thread is doing: then the caller,
-    /// once it has let go of these, starts one with [`tidy`].
-    pub fn wants_tidy(&mut self) -> bool {
-        if self.tidying || !self.behind() {
-            return false;
-        }
-        self.tidying = true;
-        true
     }
 
     fn behind(&self) -> bool {
@@ -1454,6 +1729,27 @@ impl Postings {
             }
         }
         did
+    }
+
+    /// Steps of the merging that is due, one after the other for up to
+    /// `budget`: true if there was any. It stops before a step that would
+    /// make a list of places under the lock (see [`Postings::spare_wanted`])
+    /// larger than `spare`.
+    pub fn tidy_steps(
+        &mut self,
+        spare: &mut Option<Vec<u32>>,
+        trash: &mut Trash,
+        budget: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        if !self.tidy_step_with(spare, trash) {
+            return false;
+        }
+        while start.elapsed() < budget
+            && self.spare_wanted() <= spare.as_ref().map_or(0, Vec::len)
+            && self.tidy_step_with(spare, trash)
+        {}
+        true
     }
 
     /// The length of the list of places the next step would make under the
@@ -1525,7 +1821,6 @@ impl Postings {
         let mut fresh = Postings {
             unused: self.unused,
             read_all: self.read_all,
-            tidying: self.tidying,
             ..Postings::default()
         };
         for field in &self.fields {
@@ -2062,5 +2357,121 @@ mod tests {
         }
         let even = p.tag("t", &["even".into()], &[], ',', false).unwrap();
         assert_eq!(keys(&p, &even), ["k0", "k2", "k4", "k6", "k8"]);
+    }
+
+    #[test]
+    fn writes_that_find_the_lock_taken_are_queued_and_read_back() {
+        // Two readers hold the lock most of the time, so that most writes
+        // are queued, and the postings' thread merges meanwhile. Each writer
+        // reads back what it wrote at once; in the end the postings are what
+        // the writes, one after the other, make.
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let shared = PostingsLock::new(Postings::new(&schema()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(SeqCst) {
+                        let p = shared.read();
+                        let all = p.live().clone();
+                        let first = p.first_by_key(&all, 10, all.count(), &mut || false);
+                        assert!(first.len() <= 10);
+                        std::thread::sleep(std::time::Duration::from_micros(300));
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..4u64)
+            .map(|w| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ ((w + 1) << 40);
+                    let mut next = move || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed
+                    };
+                    let mut model: BTreeMap<String, Option<(String, u64)>> = BTreeMap::new();
+                    let mut queued = 0;
+                    for _ in 0..3000 {
+                        let key = format!("w{w}:{}", next() % 400);
+                        if next() % 5 == 0 {
+                            shared.remove(&key);
+                            assert_eq!(shared.read().id(&key), None);
+                            model.insert(key, None);
+                            continue;
+                        }
+                        let tag = format!("t{}", next() % 7);
+                        let n = next() % 100;
+                        let fields = [
+                            ("t".to_string(), Arc::from(tag.as_bytes())),
+                            ("n".to_string(), Arc::from(n.to_string().as_bytes())),
+                        ];
+                        if shared.write_fields(&key, &fields, true) == NO_DOC {
+                            queued += 1;
+                        }
+                        let p = shared.read();
+                        let id = p.id(&key).expect("a write read back");
+                        let tagged = p.tag("t", std::slice::from_ref(&tag), &[], ',', false);
+                        assert!(tagged.unwrap().get(id));
+                        let n = n as f64;
+                        assert!(p.range("n", n, false, n, false).unwrap().get(id));
+                        drop(p);
+                        model.insert(key, Some((tag, n as u64)));
+                    }
+                    (model, queued)
+                })
+            })
+            .collect();
+        let mut model = BTreeMap::new();
+        let mut queued = 0;
+        for writer in writers {
+            let (written, q) = writer.join().unwrap();
+            model.extend(written);
+            queued += q;
+        }
+        stop.store(true, SeqCst);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(queued > 0, "no write found the lock taken");
+        let p = shared.read();
+        let live: Vec<(&String, &(String, u64))> = model
+            .iter()
+            .filter_map(|(key, doc)| doc.as_ref().map(|doc| (key, doc)))
+            .collect();
+        assert_eq!(p.len(), live.len());
+        assert_eq!(p.live().count(), live.len());
+        for t in 0..7 {
+            let tag = format!("t{t}");
+            let want: Vec<String> = live
+                .iter()
+                .filter(|(_, doc)| doc.0 == tag)
+                .map(|(key, _)| key.to_string())
+                .collect();
+            let got = p.tag("t", &[tag], &[], ',', false).unwrap();
+            assert_eq!(keys(&p, &got), want);
+        }
+        for n in 0..100u64 {
+            let want: Vec<String> = live
+                .iter()
+                .filter(|(_, doc)| doc.1 == n)
+                .map(|(key, _)| key.to_string())
+                .collect();
+            let n = n as f64;
+            assert_eq!(keys(&p, &p.range("n", n, false, n, false).unwrap()), want);
+        }
+        let all = p.live().clone();
+        let first: Vec<String> = p
+            .first_by_key(&all, live.len(), live.len(), &mut || false)
+            .into_iter()
+            .map(|id| p.key(id).unwrap().to_string())
+            .collect();
+        let want: Vec<String> = live.iter().map(|(key, _)| key.to_string()).collect();
+        assert_eq!(first, want);
     }
 }

@@ -1015,7 +1015,7 @@ pub(crate) fn plan(
 
 /// The keys of the documents `ids` names, in id order.
 pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
-    let p = def.postings.read();
+    let p = def.postings.peek();
     ids.iter().filter_map(|id| p.key(id).cloned()).collect()
 }
 
@@ -1318,7 +1318,7 @@ fn page_from_postings(
             (order, Some(field.name.as_str()))
         }
     };
-    if def.postings.read().read_all {
+    if def.postings.peek().read_all {
         return None;
     }
     let plan = plan(ctx, def, filter, args.inkeys.as_ref())?;
@@ -1353,7 +1353,8 @@ fn page_from_postings(
         args.offset.saturating_add(args.count)
     };
     let (picked, total, timed_out) = {
-        let p = def.postings.read();
+        // What was written since the plan is not among its ids.
+        let p = def.postings.peek();
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {

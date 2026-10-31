@@ -1491,7 +1491,7 @@ pub(crate) fn knn_planned(
             return Some((nearest, cut));
         }
         for key in gone {
-            if let Some(id) = def.postings.read().id(key) {
+            if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }
             crate::vector::maybe_unindex(ctx.index_store, def.db_index, key);
@@ -1530,9 +1530,11 @@ fn knn_among(
             let mut admit = |node: &crate::vector::HnswNode| {
                 let mut doc = node.doc.load(Relaxed);
                 if doc == crate::vector::postings::NO_DOC {
-                    // Not known yet (a compaction or a snapshot made the
-                    // node): looked up once, and kept.
-                    match def.postings.read().id(&node.key) {
+                    // Not known yet (a compaction, a snapshot, or a write
+                    // that was queued made the node): looked up once, and
+                    // kept. A document written before the query began has
+                    // its id: the query's plan applied the queue.
+                    match def.postings.peek().id(&node.key) {
                         Some(id) => {
                             node.doc.store(id, Relaxed);
                             doc = id;

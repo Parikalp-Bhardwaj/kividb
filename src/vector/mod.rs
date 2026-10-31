@@ -987,7 +987,7 @@ impl IndexSchema {
                 indexes.insert(f.name.clone(), live);
             }
         }
-        let postings = Arc::new(RwLock::new(postings::Postings::new(&self.fields)));
+        let postings = postings::PostingsLock::new(postings::Postings::new(&self.fields));
         IndexDef {
             name: self.name,
             db_index: self.db_index,
@@ -1059,10 +1059,7 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
             } else {
                 postings.ensure(key);
             }
-            if postings.wants_tidy() {
-                drop(postings);
-                postings::tidy(&def.postings);
-            }
+            def.postings.done(postings);
         }
     }
 }
@@ -1201,10 +1198,7 @@ pub fn backfill_from_db_progress(
             let doc = if keeps_postings {
                 let mut postings = def.postings.write();
                 let doc = postings.write_doc(key, &inner);
-                if postings.wants_tidy() {
-                    drop(postings);
-                    postings::tidy(&def.postings);
-                }
+                def.postings.done(postings);
                 doc
             } else {
                 postings::NO_DOC
@@ -1922,15 +1916,11 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // ── TAG and NUMERIC postings ─────────────────────────────────────────────
     //
     // Every document of the index is given an id, whatever it holds: `*`
-    // and `NOT` are in terms of all of them.
+    // and `NOT` are in terms of all of them. A write that finds a query
+    // reading them is queued, not kept waiting (see `postings`): its vector
+    // then learns its id when a filtered search first asks.
     let doc = if def.keeps_postings() {
-        let mut postings = def.postings.write();
-        let doc = postings.write(key, fields, whole);
-        if postings.wants_tidy() {
-            drop(postings);
-            postings::tidy(&def.postings);
-        }
-        doc
+        def.postings.write_fields(key, fields, whole)
     } else {
         postings::NO_DOC
     };
@@ -2009,7 +1999,7 @@ fn unindex_from(def: &IndexDef, key: &str) {
         unindex_vector(live, key);
     }
     if def.keeps_postings() {
-        def.postings.write().remove(key);
+        def.postings.remove(key);
     }
     def.remove_text(key);
 }

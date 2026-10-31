@@ -1673,3 +1673,120 @@ fn a_query_from_postings_keeps_its_timeout() {
     assert_eq!(counted.get("total_results").i(), n as i64, "{counted:?}");
     c.cmd(&["HELLO", "2"]);
 }
+
+/// A write never waits for a query to let go of the postings: one that
+/// finds them read is queued, and the next query applies the queue before
+/// it reads. Four writers, each reading back what it has just written, race
+/// two readers of broad pages and the postings' thread; in the end the
+/// counts are the model's, and every page is the page of every match.
+#[test]
+fn writes_racing_queries_are_seen_by_the_next_query() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "pr",
+            "PREFIX",
+            "1",
+            "pr:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "u",
+            "TAG",
+            "o",
+            "NUMERIC",
+            "SORTABLE",
+        ])
+        .ok()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = [
+        vec!["@o:[0 600]", "SORTBY", "o", "LIMIT", "0", "10"],
+        vec!["@c:{red|blue}", "NOCONTENT", "LIMIT", "200", "10"],
+    ]
+    .into_iter()
+    .map(|query| {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut c = conn();
+            let mut cmd = vec!["FT.SEARCH", "pr"];
+            cmd.extend(query);
+            let mut queries = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let reply = c.cmd(&cmd);
+                assert!(matches!(reply, V::Arr(_)), "{reply:?}");
+                queries += 1;
+            }
+            queries
+        })
+    })
+    .collect();
+    let writers: Vec<_> = (0..4u64)
+        .map(|w| {
+            thread::spawn(move || {
+                let mut c = conn();
+                let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ ((w + 1) << 40));
+                let mut model: BTreeMap<String, Option<(String, usize)>> = BTreeMap::new();
+                for i in 0..2500 {
+                    let key = format!("pr:{w}:{}", rng.below(600));
+                    if rng.chance(15) {
+                        c.cmd(&["DEL", &key]);
+                        model.insert(key, None);
+                        continue;
+                    }
+                    let colour = rng.pick(&["red", "blue", "green"]).to_string();
+                    let o = rng.below(1000);
+                    let u = format!("w{w}x{i}");
+                    let reply = c.cmd(&["HSET", &key, "c", &colour, "u", &u, "o", &o.to_string()]);
+                    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+                    model.insert(key.clone(), Some((colour, o)));
+                    if i % 4 == 0 {
+                        // Read back at once: its own tag names it alone.
+                        let query = format!("@u:{{{u}}}");
+                        let found = c.cmd(&["FT.SEARCH", "pr", &query, "NOCONTENT"]);
+                        assert_eq!(found.ordered_keys(), [key], "writer {w}, write {i}");
+                    }
+                }
+                model
+            })
+        })
+        .collect();
+    let mut model: BTreeMap<String, Option<(String, usize)>> = BTreeMap::new();
+    for writer in writers {
+        model.extend(writer.join().unwrap());
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        assert!(reader.join().unwrap() > 0);
+    }
+    let live: Vec<&(String, usize)> = model.values().flatten().collect();
+    let count = |c: &mut Conn, query: &str| -> i64 {
+        total_of(&c.cmd(&["FT.SEARCH", "pr", query, "NOCONTENT", "LIMIT", "0", "0"]))
+    };
+    assert_eq!(count(&mut c, "*"), live.len() as i64);
+    assert_eq!(
+        c.cmd(&["FT.INFO", "pr"]).get("doc_ids").i(),
+        live.len() as i64
+    );
+    for colour in ["red", "blue", "green"] {
+        let want = live.iter().filter(|doc| doc.0 == colour).count();
+        assert_eq!(count(&mut c, &format!("@c:{{{colour}}}")), want as i64);
+    }
+    for (lo, hi) in [(0, 99), (250, 600), (990, 999)] {
+        let want = live.iter().filter(|doc| (lo..=hi).contains(&doc.1)).count();
+        assert_eq!(count(&mut c, &format!("@o:[{lo} {hi}]")), want as i64);
+    }
+    for query in [
+        vec!["@o:[0 600]", "SORTBY", "o", "LIMIT", "0", "10"],
+        vec!["@c:{red|blue}", "NOCONTENT", "LIMIT", "200", "10"],
+        vec!["@c:{green}", "SORTBY", "o", "DESC", "LIMIT", "5", "20"],
+    ] {
+        let args: Vec<String> = query.iter().map(|a| a.to_string()).collect();
+        let (paged, whole, scanned) = three_ways(&mut c, "pr", &args);
+        assert_eq!(paged, whole, "{args:?}");
+        assert_eq!(scanned, whole, "{args:?}");
+    }
+}
