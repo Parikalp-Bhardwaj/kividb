@@ -315,6 +315,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **After a shutdown, the port no longer takes connections nobody answers.**
+  On Linux with io_uring (the default), the server's port went on accepting
+  connections for a moment after the process had exited, until the kernel
+  had cleaned up after it. A client that connected then, such as one
+  waiting for the server to come back after a restart, got a connection
+  that never answered and was then reset, as if the server had come back
+  and failed. A connection made while the final snapshot was being written
+  was accepted and then dropped. The plaintext port now stops listening as
+  soon as the shutdown begins (`SHUTDOWN`, SIGTERM or SIGINT), so those
+  connections are refused at once; the connections already open are kept
+  until the process ends, as before. No data was lost: the final snapshot
+  was complete.
+
 - **Eviction keeps the keys the policy wants kept.** Under `allkeys-lfu`,
   with 20,000 keys read again and again and 300,000 keys of 1 KB written
   once into 64 MB, 76% of the read keys were left at the end, where Redis
@@ -334,6 +347,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   lines on 16 cores for 16 databases: a thread keeps the answer for 10 ms.
   The stream of that test is written in 2.3 s, where it took 2.8 s (Redis
   2.4 s).
+
 - **A filtered vector search that walks the graph stops at `TIMEOUT`.**
   With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
   matches many documents, a filtered KNN query on an HNSW index searched the
