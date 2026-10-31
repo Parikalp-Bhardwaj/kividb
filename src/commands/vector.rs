@@ -1420,6 +1420,10 @@ impl Best {
 //
 // `HYBRID_POLICY ADHOC_BF` always measures; `BATCHES` always searches the
 // graph, however long the walk. A FLAT index is always measured.
+//
+// Each way keeps the query's deadline: cut short, it answers with the
+// nearest it found so far and says it was cut, and the command then applies
+// `ON_TIMEOUT` as it does after a scan.
 
 /// The most documents a filtered KNN measures one by one rather than search
 /// the graph for, by default. Measuring costs a distance per document; a
@@ -1546,8 +1550,9 @@ fn knn_among(
                 metric,
                 &mut admit,
                 budget,
+                deadline,
             ) {
-                return (found, false);
+                return found;
             }
         }
     }
