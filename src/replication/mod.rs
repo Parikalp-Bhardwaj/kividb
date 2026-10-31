@@ -61,6 +61,10 @@ pub struct ReplState {
     /// than 0. From then on every write travels with its own `SELECT`; see
     /// [`ReplState::note_database_selected`].
     pub several_databases: AtomicBool,
+    /// Whether a `FT.DROPINDEX … DD` this replica's master sends deleted the
+    /// documents on the master. Set at each connection to a master, from the
+    /// release it says it is (`INFO server`); see [`dd_deleted_by`].
+    pub master_dd_deletes: AtomicBool,
     /// How many taps are attached (see `taps`). Read on every write, so that
     /// the common case — none — costs one relaxed load.
     pub stream_taps: std::sync::atomic::AtomicUsize,
@@ -386,6 +390,7 @@ impl ReplState {
             slave_sync_in_progress: AtomicBool::new(false),
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
+            master_dd_deletes: AtomicBool::new(false),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
             repl_generation: AtomicU64::new(0),
@@ -1390,6 +1395,37 @@ const REPL_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
 // NEW: global replica id counter
 static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether KiviDB `version` (`kividb_version` of `INFO server`) deleted the
+/// documents of `FT.DROPINDEX … DD`, and sent the command on as typed.
+/// 1.1 and before kept them. 1.2.0's release candidates deleted them;
+/// releases since send the deletes instead, and never `DD`, so whatever
+/// this says of them is not asked. A version that cannot be read is taken
+/// to have kept them: deleting what such a master kept would lose data.
+pub fn dd_deleted_by(version: &str) -> bool {
+    let mut numbers = version
+        .split(['.', '-'])
+        .map(|part| part.parse::<u32>().ok());
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (1, 2),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod dd_version_tests {
+    use super::dd_deleted_by;
+
+    #[test]
+    fn only_1_2_and_later_deleted_the_documents_of_dd() {
+        for kept in ["1.1.2", "1.1.0-rc1", "1.0.6", "0.9.0", "", "garbage", "1"] {
+            assert!(!dd_deleted_by(kept), "{kept}");
+        }
+        for deleted in ["1.2.0-rc1", "1.2.0-rc2", "1.2.0", "1.3.0", "2.0.0"] {
+            assert!(dd_deleted_by(deleted), "{deleted}");
+        }
+    }
+}
 
 pub fn next_replica_id() -> u64 {
     NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed)

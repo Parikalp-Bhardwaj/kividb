@@ -30,8 +30,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deleted. As in Redis 8.10, replicas and the AOF now get `DEL`s of the
   documents deleted, and then the drop without `DD`, for HASH and JSON
   indexes and for an index in any database (its `DEL`s are sent in it). A
-  `DD` already in an AOF written by 1.2.0, or sent by a 1.2.0 master, is run
-  as 1.2.0 ran it. The documents are deleted 256 at a time, each 256 a
+  replica writes the same to its own AOF. A `DD` sent by an older master is
+  run as that master ran it: a 1.2.0 release candidate deleted the
+  documents, 1.1 kept them (the replica asks its master which release it
+  is). A `DD` found in an AOF keeps the documents, as 1.1 did: nothing in
+  the file says which release wrote it, and keeping loses no data. An AOF
+  written by a 1.2.0 release candidate that ran `DD` brings back, on
+  replay, the documents it deleted; rewrite it (`BGREWRITEAOF`) before
+  upgrading, or delete them again after. The documents are deleted 256 at a time, each 256 a
   write of its own sent as one `DEL`, so an index of millions of documents
   does not hold up a replica's full sync, a checkpoint, or writes to other
   keys while it goes; the index itself goes last, so a `DD` cut short can

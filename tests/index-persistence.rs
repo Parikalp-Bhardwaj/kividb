@@ -2606,12 +2606,13 @@ fn dropindex_dd_is_logged_as_a_del_of_each_document_then_the_drop() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An AOF written by 1.2.0 has `FT.DROPINDEX … DD` in it, from a server
-/// that logged the command as typed and deleted the documents again on
-/// replay. Replayed now, it does the same: the documents the index covered
-/// then are deleted, and what was written after the drop stays.
+/// An AOF written by 1.1.2 has `FT.DROPINDEX … DD` in it, as it was typed,
+/// from a server that kept the documents. Replayed now, it drops the index
+/// and keeps them, as that server did. (A 1.2.0 release candidate logged
+/// `DD` the same way and deleted them; nothing in the file tells the two
+/// apart, and keeping is what loses no data.)
 #[test]
-fn a_dd_in_an_older_aof_deletes_the_documents_as_it_did() {
+fn a_dd_in_an_aof_written_by_1_1_2_keeps_the_documents() {
     let _serial = persist_serial();
     let dir = temp_dir("aof_old_dd");
     let records: &[&[&str]] = &[
@@ -2650,8 +2651,7 @@ fn a_dd_in_an_older_aof_deletes_the_documents_as_it_did() {
     );
     {
         let mut c = Conn::connect(port);
-        assert_eq!(c.cmds(&["EXISTS", "doc:1"]).as_int(), 0);
-        assert_eq!(c.cmds(&["EXISTS", "doc:2", "other:1"]).as_int(), 2);
+        assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "other:1"]).as_int(), 3);
         assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
     }
     send_shutdown_nosave(port);

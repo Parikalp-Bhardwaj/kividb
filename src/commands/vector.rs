@@ -115,14 +115,25 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
-    // `DD` deletes the documents too. A master sends what it deleted as a
-    // DEL of each, and the drop without `DD` (below), so a `DD` a replica or
-    // an AOF replay meets was written by a master before this one, which
-    // sent the command as typed and had each replica delete what it found:
-    // it is run as that master ran it.
+    // `DD` deletes the documents too. A server sends what it deleted as
+    // DELs, and the drop without `DD` (below), so a `DD` a replica or an AOF
+    // replay meets was written by a release before this one, and is run as
+    // that release ran it, where that can be known: 1.1 and before kept the
+    // documents; a 1.2.0 release candidate deleted them, and had each
+    // replica delete what it found. A replica knows which release its
+    // master is (`ReplState::master_dd_deletes`). An AOF does not say
+    // which release wrote a record, and one file can hold the records of
+    // several, so a replay keeps the documents: wrongly kept, a 1.2.0
+    // candidate's deleted documents come back and can be deleted again;
+    // wrongly deleted, a 1.1 server's documents would be lost.
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
     let delete_documents = match &cmd[2..] {
         [] => false,
-        [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
+        [dd] if dd.eq_ignore_ascii_case(b"DD") => {
+            !ctx.apply_replication
+                || (!crate::vector::DEFER_INDEXING.load(relaxed)
+                    && ctx.repl_state.master_dd_deletes.load(relaxed))
+        }
         _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
     };
 
@@ -176,7 +187,10 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // cluster, one DEL names the keys of one slot only, as a command from a
     // client would: a slot migration following the stream sends a command
     // on by its first key. So the documents are taken a slot at a time.
-    let propagate = !ctx.apply_replication && crate::replication::write_is_observed(ctx);
+    //
+    // A replica sends the same to its own AOF, whatever its master sent, so
+    // that no `DD` is ever written again.
+    let propagate = crate::replication::write_is_observed(ctx);
     let by_slot = propagate && ctx.cluster.enabled;
     let slot_of = |key: &str| {
         if by_slot {
@@ -193,7 +207,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut del: Vec<Vec<u8>> = Vec::new();
     for chunk in documents.chunks(DROPINDEX_DOCUMENTS_PER_WRITE) {
         let _gate = dropindex_write_gate(ctx, nested);
-        let _order = propagate
+        let _order = (propagate && !ctx.apply_replication)
             .then(|| crate::write_order::lock_keys(db, chunk.iter().map(|k| k.as_bytes())));
         let mut slot = chunk.first().map(|key| slot_of(key));
         for key in chunk {

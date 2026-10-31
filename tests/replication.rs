@@ -967,6 +967,7 @@ fn spawn_master_that_goes_silent() -> u16 {
                     match args.first().map(String::as_str) {
                         Some("PING") => stream.write_all(b"+PONG\r\n").unwrap(),
                         Some("REPLCONF") => stream.write_all(b"+OK\r\n").unwrap(),
+                        Some("INFO") => stream.write_all(b"-ERR unknown command\r\n").unwrap(),
                         Some("PSYNC") => {
                             let payload = kividb::snapshot::full_sync_payload(
                                 &kividb::store::new_store(16),
@@ -1562,6 +1563,7 @@ fn full_sync_payload_of(master_port: u16) -> Vec<u8> {
 fn spawn_master_trickling(payload: Vec<u8>, started: std::sync::mpsc::Sender<()>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let info_reply = info_server_reply(None);
     thread::spawn(move || {
         let Some(Ok(mut stream)) = listener.incoming().next() else {
             return;
@@ -1587,6 +1589,7 @@ fn spawn_master_trickling(payload: Vec<u8>, started: std::sync::mpsc::Sender<()>
             match args[0].as_str() {
                 "PING" => stream.write_all(b"+PONG\r\n").unwrap(),
                 "REPLCONF" => stream.write_all(b"+OK\r\n").unwrap(),
+                "INFO" => stream.write_all(&info_reply).unwrap(),
                 "PSYNC" => break,
                 _ => return,
             }
@@ -2186,11 +2189,29 @@ fn dels_merged(commands: &[String]) -> Vec<String> {
     merged
 }
 
-/// A stand-in master that answers the handshake, sends `payload` and then
-/// `commands`, and keeps the link open. Returns its port.
-fn spawn_master_sending(payload: Vec<u8>, commands: Vec<Vec<String>>) -> u16 {
+/// What a stand-in master answers `INFO server` with: the KiviDB release
+/// `version`, or with none, an error, as a server that does not say.
+fn info_server_reply(version: Option<&str>) -> Vec<u8> {
+    match version {
+        Some(version) => {
+            let body = format!("# Server\r\nredis_version:8.10.0\r\nkividb_version:{version}\r\n");
+            format!("${}\r\n{body}\r\n", body.len()).into_bytes()
+        }
+        None => b"-ERR unknown command\r\n".to_vec(),
+    }
+}
+
+/// A stand-in master that answers the handshake as KiviDB `version` (see
+/// [`info_server_reply`]), sends `payload` and then `commands`, and keeps
+/// the link open. Returns its port.
+fn spawn_master_sending(
+    version: Option<&str>,
+    payload: Vec<u8>,
+    commands: Vec<Vec<String>>,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let info_reply = info_server_reply(version);
     thread::spawn(move || {
         let Some(Ok(mut stream)) = listener.incoming().next() else {
             return;
@@ -2216,6 +2237,7 @@ fn spawn_master_sending(payload: Vec<u8>, commands: Vec<Vec<String>>) -> u16 {
             match args[0].as_str() {
                 "PING" => stream.write_all(b"+PONG\r\n").unwrap(),
                 "REPLCONF" => stream.write_all(b"+OK\r\n").unwrap(),
+                "INFO" => stream.write_all(&info_reply).unwrap(),
                 "PSYNC" => break,
                 _ => return,
             }
@@ -2242,13 +2264,11 @@ fn spawn_master_sending(payload: Vec<u8>, commands: Vec<Vec<String>>) -> u16 {
     port
 }
 
-/// A replica deletes the documents its master sends it a DEL of, and no
-/// others: the drop it is sent after them, without `DD`, drops the index
-/// only. A `DD` it is sent comes from a master before this release, which
-/// left each replica to delete the documents itself, and is run as such a
-/// replica ran it.
-#[test]
-fn test_a_replica_deletes_only_the_documents_its_master_sends() {
+/// A replica of a master `version` (`None`: one that does not say) is sent
+/// a drop of this release's kind, after the DEL of the one document its
+/// master deleted, and then a drop with `DD`. It returns whether the
+/// documents of the second were deleted. The first is checked here.
+fn replica_fed_a_dd(version: Option<&str>) -> bool {
     let empty = spawn_server(Config::default());
     let payload = full_sync_payload_of(empty);
     let commands: Vec<Vec<String>> = [
@@ -2292,7 +2312,7 @@ fn test_a_replica_deletes_only_the_documents_its_master_sends() {
     .iter()
     .map(|command| command.iter().map(|part| part.to_string()).collect())
     .collect();
-    let master = spawn_master_sending(payload, commands);
+    let master = spawn_master_sending(version, payload, commands);
     let replica_port = spawn_server(replica_of(master));
     let mut replica = Conn::connect(replica_port);
     wait_until("the stream is applied", Duration::from_secs(10), || {
@@ -2305,7 +2325,36 @@ fn test_a_replica_deletes_only_the_documents_its_master_sends() {
         1,
         "the replica deleted a document its master did not"
     );
-    assert_eq!(replica.cmds(&["EXISTS", "o:1", "o:2"]).as_int(), 0);
     assert_eq!(replica.cmds(&["EXISTS", "o:3"]).as_int(), 1);
     assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
+    match replica.cmds(&["EXISTS", "o:1", "o:2"]).as_int() {
+        0 => true,
+        2 => false,
+        n => panic!("{n} of the two documents left"),
+    }
+}
+
+/// A replica deletes the documents its master sends it a DEL of, and no
+/// others: the drop it is sent after them, without `DD`, drops the index
+/// only. A `DD` it is sent comes from a release before this one, and is run
+/// as that release ran it: a 1.2.0 release candidate deleted the documents
+/// and left each replica to delete its own.
+#[test]
+fn test_a_replica_of_a_1_2_0_candidate_deletes_the_documents_of_its_dd() {
+    assert!(replica_fed_a_dd(Some("1.2.0-rc2")));
+}
+
+/// 1.1 kept the documents of `DD`: a replica of a 1.1 master keeps them
+/// too, as one of that release did. They were deleted, and the replica no
+/// longer had what its master had.
+#[test]
+fn test_a_replica_of_a_1_1_master_keeps_the_documents_of_its_dd() {
+    assert!(!replica_fed_a_dd(Some("1.1.2")));
+}
+
+/// A master that does not say which release it is is taken to have kept
+/// the documents of a `DD`: deleting what it kept would lose data.
+#[test]
+fn test_a_replica_of_a_master_that_does_not_say_keeps_the_documents_of_its_dd() {
+    assert!(!replica_fed_a_dd(None));
 }
