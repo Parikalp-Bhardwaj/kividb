@@ -416,6 +416,8 @@ struct NumericPostings {
     frozen_gone: Bits,
     recent: BTreeSet<(u64, u32)>,
     merging: Option<NumericMerge>,
+    /// Writes have paused: merge `recent` whatever its size.
+    settle: bool,
     /// How many documents have a value other than NaN: entries of all three.
     ordered: usize,
     /// By document id: its value, if `has` it.
@@ -489,15 +491,21 @@ impl NumericPostings {
 
     /// Whether there is merging to do.
     fn behind(&self) -> bool {
-        self.merging.is_some() || self.recent.len() > (self.settled.len() / 8).max(1024)
+        self.merging.is_some()
+            || self.recent.len() > (self.settled.len() / 8).max(1024)
+            || (self.settle && !self.recent.is_empty())
     }
 
     /// A step of merging, if there is any to do: true if there was.
     fn step(&mut self, trash: &mut Trash) -> bool {
         let Some(merge) = &mut self.merging else {
             if !self.behind() {
+                self.settle = false;
                 return false;
             }
+            // Settling is this merge: values written meanwhile wait for the
+            // next pause.
+            self.settle = false;
             self.frozen = std::mem::take(&mut self.recent);
             self.frozen_gone = Bits::new();
             self.merging = Some(NumericMerge {
@@ -731,6 +739,9 @@ struct KeyOrder {
     waiting: Vec<u32>,
     merging: Option<KeyMerge>,
     next_tag: u32,
+    /// Writes have paused: every waiting id and run into `sorted`, whatever
+    /// their number.
+    settle: bool,
 }
 
 /// The key of document `id`, from the postings' table of keys.
@@ -819,6 +830,12 @@ impl KeyOrder {
             || self.waiting.len() >= SEAL_AT
             || self.runs_due().is_some()
             || self.sorted_due()
+            || (self.settle && self.unsettled())
+    }
+
+    /// Ids not in `sorted` yet.
+    fn unsettled(&self) -> bool {
+        !self.waiting.is_empty() || !self.runs.is_empty()
     }
 
     /// The last runs, if `MERGE_RUNS_AT` or more of them are of one level:
@@ -841,10 +858,14 @@ impl KeyOrder {
     /// How large a list of places the next step wants, if it is to begin a
     /// merge into `sorted`: the thread makes it before it takes the lock.
     fn spare_wanted(&self, ids: usize) -> usize {
-        let next_merges_sorted = self.merging.is_none()
-            && self.waiting.len() < SEAL_AT
-            && self.runs_due().is_none()
-            && self.sorted_due();
+        let next_merges_sorted = if self.settle {
+            self.merging.is_none() && self.waiting.is_empty() && !self.runs.is_empty()
+        } else {
+            self.merging.is_none()
+                && self.waiting.len() < SEAL_AT
+                && self.runs_due().is_none()
+                && self.sorted_due()
+        };
         if next_merges_sorted { ids } else { 0 }
     }
 
@@ -864,7 +885,7 @@ impl KeyOrder {
         spare: &mut Option<Vec<u32>>,
         trash: &mut Trash,
     ) -> bool {
-        if self.waiting.len() >= SEAL_AT {
+        if self.waiting.len() >= SEAL_AT || (self.settle && !self.waiting.is_empty()) {
             self.seal(keys);
             return true;
         }
@@ -872,7 +893,7 @@ impl KeyOrder {
             self.merge_step(keys, trash);
             return true;
         }
-        if let Some((start, inputs)) = self.runs_due() {
+        if let Some((start, inputs)) = self.runs_due().filter(|_| !self.settle) {
             let tag = self.new_tag();
             let level = self.runs[start].level + 1;
             self.merging = Some(KeyMerge {
@@ -887,7 +908,10 @@ impl KeyOrder {
             return true;
         }
         let inputs = self.runs.len();
-        if self.sorted_due() {
+        if self.sorted_due() || (self.settle && inputs > 0) {
+            // Settling is this merge: ids written meanwhile wait for the
+            // next pause, not another merge of everything.
+            self.settle = false;
             // The ids waiting now keep their place through the swap.
             let touched: Vec<u32> = self.waiting.clone();
             // Made by the thread before it took the lock, if it could: all
@@ -908,6 +932,7 @@ impl KeyOrder {
             });
             return true;
         }
+        self.settle = false;
         false
     }
 
@@ -1227,16 +1252,24 @@ pub struct Postings {
     order: KeyOrder,
     /// A thread is doing the merging these are behind on ([`tidy`]).
     tidying: bool,
+    /// Writes so far: the thread settles what is left once it stops moving.
+    writes: u64,
     /// By id: its key's cluster hash slot, for a query in a cluster to keep
     /// only the documents of the slots its node serves without hashing
     /// every key it matches.
     slots: Vec<u16>,
 }
 
+/// How long writes have to pause before what is left unmerged (a few runs,
+/// some waiting ids, recent numbers) is merged anyway.
+const QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Do the merging `shared`'s postings are behind on, on a thread of its own,
 /// a step at a time: each step holds the postings' write lock for a few
-/// thousand entries, then hands it to whoever waits. The caller had
-/// [`Postings::wants_tidy`] say so; the thread ends when there is no more.
+/// hundred entries, then hands it to whoever waits. The caller had
+/// [`Postings::wants_tidy`] say so. Once nothing is due, what is left is
+/// merged when writes have paused for [`QUIET`], so that a quiet index is
+/// read off one list; then the thread ends.
 pub fn tidy(shared: &SharedPostings) {
     let worker = Arc::clone(shared);
     let started = std::thread::Builder::new()
@@ -1250,12 +1283,22 @@ pub fn tidy(shared: &SharedPostings) {
                 }
                 let mut trash: Trash = Vec::new();
                 let mut postings = worker.write();
-                if !postings.tidy_step_with(&mut spare, &mut trash) {
+                if postings.tidy_step_with(&mut spare, &mut trash) {
+                    parking_lot::RwLockWriteGuard::unlock_fair(postings);
+                    drop(trash);
+                    continue;
+                }
+                if !postings.unsettled() {
                     postings.tidying = false;
                     return;
                 }
-                parking_lot::RwLockWriteGuard::unlock_fair(postings);
-                drop(trash);
+                let seen = postings.writes;
+                drop(postings);
+                std::thread::sleep(QUIET);
+                let mut postings = worker.write();
+                if postings.writes == seen {
+                    postings.settle_all();
+                }
             }
         });
     if started.is_err() {
@@ -1377,6 +1420,25 @@ impl Postings {
             })
     }
 
+    /// Whether anything is left unmerged, due or not.
+    fn unsettled(&self) -> bool {
+        self.order.unsettled()
+            || self.fields.iter().any(|f| match &f.kind {
+                Kind::Numeric(n) => !n.recent.is_empty() || n.merging.is_some(),
+                Kind::Tag(_) => false,
+            })
+    }
+
+    /// Have the next steps merge everything left, due or not.
+    pub fn settle_all(&mut self) {
+        self.order.settle = true;
+        for field in &mut self.fields {
+            if let Kind::Numeric(numbers) = &mut field.kind {
+                numbers.settle = true;
+            }
+        }
+    }
+
     /// One step of the merging that is due, if any: true if there was.
     pub fn tidy_step(&mut self) -> bool {
         self.tidy_step_with(&mut None, &mut Vec::new())
@@ -1405,6 +1467,7 @@ impl Postings {
     /// field kept here that is not among them is one it no longer holds.
     /// Returns its id.
     pub fn write(&mut self, key: &str, fields: &[(String, Arc<[u8]>)], whole: bool) -> u32 {
+        self.writes += 1;
         let id = self.ensure(key);
         let slots = self.keys.len();
         for field in &mut self.fields {
@@ -1425,6 +1488,7 @@ impl Postings {
 
     /// [`Postings::write`] of a document's fields as an index reads them.
     pub fn write_doc(&mut self, key: &str, doc: &super::Fields) -> u32 {
+        self.writes += 1;
         let id = self.ensure(key);
         let slots = self.keys.len();
         for field in &mut self.fields {
@@ -1812,6 +1876,12 @@ mod tests {
             }
             if round % 5 == 4 {
                 while p.tidy_step() {}
+            }
+            if round % 7 == 6 {
+                p.settle_all();
+                while p.tidy_step() {}
+                assert!(!p.order.unsettled(), "round {round}");
+                assert!(!p.order.settle);
             }
             let keep = [100, 60, 20, 3][round % 4];
             let mut ids = Bits::new();
