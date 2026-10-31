@@ -1,11 +1,13 @@
 pub mod filter;
 pub mod postings;
+pub mod score;
 pub mod simd;
+pub mod stem;
+pub mod text;
 use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use parking_lot::RwLock;
 use rand::Rng;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
@@ -379,6 +381,7 @@ impl IndexDef {
             a.push(self.prefixes.len().to_string());
             a.extend(self.prefixes.iter().cloned());
         }
+        a.extend(self.language.words());
         if let Some(words) = &self.stopwords {
             a.push("STOPWORDS".into());
             a.push(words.len().to_string());
@@ -649,155 +652,172 @@ pub struct IndexDef {
     /// index. `None` is the default list; an empty list is "none at all".
     pub stopwords: Option<Arc<Vec<String>>>,
     pub synonyms: SynonymGroups,
-    /// Indexed vocabulary — every distinct token observed in any TEXT field
-    /// of any indexed key. Used by FT.SPELLCHECK to find candidates near
-    /// a misspelled query term without re-scanning the keyspace.
-    ///
-    /// Append-only between rebuilds (see backfill_index for the rebuild path).
-    /// Wrapped in Arc<RwLock<>> so the IndexStore's outer lock can be
-    /// dropped before reading or writing the vocab — keeps the fast path
-    /// (HSET / DEL / FT.SEARCH) free of vocab lock contention.
-    pub vocab: Arc<RwLock<BTreeSet<String>>>,
-    // ── BM25 corpus statistics ─────────────────────────────────────────────
-    //
-    // These three are everything BM25 needs beyond per-document data:
-    //
-    //   doc_count    — total documents indexed. The "N" in the IDF formula.
-    //   total_tokens — sum of token counts across every document. Dividing
-    //                  this by doc_count gives avgdl (average document length).
-    //   doc_freq     — for each term, how many *documents* contain it (df(t)).
-    //                  Note: this is documents, not occurrences. "rust rust"
-    //                  in one doc contributes df("rust") += 1, not += 2.
-    //
-    // All three live behind their own Arc<RwLock> so the IndexStore's outer
-    // lock can be released before touching them — same pattern as `vocab`.
-    // AtomicUsize for doc_count/total_tokens avoids a lock on the read path
-    // (BM25 reads them once per query, not per document).
-    pub doc_count: Arc<AtomicUsize>,
-    pub total_tokens: Arc<AtomicUsize>,
-    pub doc_freq: Arc<RwLock<AHashMap<String, usize>>>,
-    pub inverted: Arc<RwLock<AHashMap<String, AHashSet<String>>>>,
-    //                                     ^^^^^^  ^^^^^^^^^^^^^^^^^^
-    //                                     token   set of doc keys containing it
-    /// What each document's TEXT fields put into the inverted index and the
-    /// statistics above, by key and field, stopwords left out: what is taken
-    /// back out when a field is written again or the document goes. Without
-    /// it nothing was: an update added a document's words again, a delete
-    /// left them counted, and BM25 scores drifted until a restart (#162).
-    pub forward: Arc<RwLock<ForwardIndex>>,
+    /// `LANGUAGE` and `LANGUAGE_FIELD`: what TEXT fields are stemmed in.
+    pub language: stem::LanguageOptions,
+    /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
+    /// language other than the index's, and that language. For a write of
+    /// some fields of a hash that leaves its language field as it was.
+    pub doc_languages: Arc<RwLock<AHashMap<String, stem::Language>>>,
+    /// The TEXT fields' inverted and forward index, and their BM25
+    /// statistics, in terms of the document ids of [`IndexDef::postings`]
+    /// (see [`text`]). Every document of an index with a TEXT field has an
+    /// id, whether or not the index has a TAG or NUMERIC field.
+    pub text: Arc<RwLock<text::TextIndex>>,
     /// The TAG and NUMERIC postings, and the document ids they are kept in
-    /// (see [`postings`]). Empty, and given no document, for an index with
-    /// no TAG or NUMERIC field.
+    /// (see [`postings`]). For an index with no TAG or NUMERIC field, only
+    /// the ids, and only if it has a TEXT field.
     pub postings: postings::SharedPostings,
 }
 
-/// By document key, by TEXT field: the words it put in (see
-/// [`IndexDef::forward`]).
-pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
-
 impl IndexDef {
-    /// Make `tokens` — stopwords already left out — what TEXT field `field`
-    /// of the document at `key` holds: the inverted index, the vocabulary
-    /// and the BM25 statistics become what they would be had the document
-    /// always held them.
-    pub fn set_text(&self, key: &str, field: &str, tokens: Vec<String>) {
-        self.change_text(key, |fields| {
-            if tokens.is_empty() {
-                fields.remove(field);
-            } else {
-                fields.insert(field.to_string(), tokens);
-            }
+    /// The indexed TEXT fields, in the schema's order: a field's place among
+    /// them is its number in [`IndexDef::text`].
+    pub fn text_fields(&self) -> impl Iterator<Item = &SchemaField> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
+    }
+
+    /// The number of TEXT field `name` in [`IndexDef::text`]: `None` if it
+    /// is not an indexed TEXT field.
+    pub fn text_field(&self, name: &str) -> Option<u16> {
+        self.text_fields()
+            .position(|f| f.name == name)
+            .map(|i| i as u16)
+    }
+
+    /// By TEXT field number: what an occurrence of a word there counts, its
+    /// `WEIGHT`, truncated, and at least 1 (RediSearch's frequencies are
+    /// whole numbers).
+    pub fn text_units(&self) -> Vec<u32> {
+        self.text_fields()
+            .map(|f| (f.options.weight as u32).max(1))
+            .collect()
+    }
+
+    /// Whether the index gives its documents ids: it has a TEXT, TAG or
+    /// NUMERIC field.
+    #[inline]
+    pub fn gives_ids(&self) -> bool {
+        self.fields.iter().any(|f| match f.field_type {
+            FieldType::Tag | FieldType::Numeric => true,
+            FieldType::Text => !f.options.noindex,
+            _ => false,
+        })
+    }
+
+    /// Make what the TEXT fields numbered in `changes` of document `doc` hold
+    /// the words given, stopwords already left out, each followed by its stem
+    /// if it has one (`stem::index_words`): the inverted index, the
+    /// vocabulary and the BM25 statistics become what they would be had the
+    /// document always held them.
+    pub fn write_text(&self, doc: u32, changes: &[(u16, Vec<String>)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let units = self.text_units();
+        self.text.write().set(doc, changes, |f| {
+            units.get(f as usize).copied().unwrap_or(1)
         });
     }
 
-    /// The document at `key` is gone: take out everything its TEXT fields
-    /// put in.
-    pub fn remove_text(&self, key: &str) {
-        self.change_text(key, |fields| fields.clear());
+    /// The TEXT index's part of a write, run by the postings with the
+    /// document's id, under their lock (see [`postings::WithId`]): what
+    /// [`IndexDef::write_text`] does with `changes`, after the fields
+    /// numbered in `restemmed` (with whether they stem) are stemmed again
+    /// in `language` from the words they hold. `None` if there is nothing
+    /// to do.
+    fn text_write(
+        &self,
+        mut changes: Vec<(u16, Vec<String>)>,
+        restemmed: Vec<(u16, bool)>,
+        language: stem::Language,
+    ) -> Option<postings::WithId> {
+        if changes.is_empty() && restemmed.is_empty() {
+            return None;
+        }
+        let text = Arc::clone(&self.text);
+        let units = self.text_units();
+        Some(Box::new(move |doc| {
+            let mut text = text.write();
+            for (number, stems) in restemmed {
+                if let Some(tokens) = restem(&text, doc, number, stems, language) {
+                    changes.push((number, tokens));
+                }
+            }
+            if !changes.is_empty() {
+                text.set(doc, &changes, |f| {
+                    units.get(f as usize).copied().unwrap_or(1)
+                });
+            }
+        }))
     }
 
-    fn change_text(&self, key: &str, change: impl FnOnce(&mut AHashMap<String, Vec<String>>)) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut forward = self.forward.write();
-        let old = forward.remove(key).unwrap_or_default();
-        let mut new = old.clone();
-        change(&mut new);
-        if old.is_empty() && new.is_empty() {
-            return;
+    /// The TEXT index's part of a removal: take out everything the
+    /// document's TEXT fields put in, by the postings, under their lock,
+    /// before its id is given back (see [`postings::WithId`]).
+    fn text_removal(&self) -> Option<postings::WithId> {
+        self.text_fields().next()?;
+        let text = Arc::clone(&self.text);
+        let units = self.text_units();
+        Some(Box::new(move |doc| {
+            text.write()
+                .remove(doc, |f| units.get(f as usize).copied().unwrap_or(1));
+        }))
+    }
+
+    /// The document at `key` is gone: forget the language it was in.
+    fn forget_language(&self, key: &str) {
+        if self.language.field.is_some() {
+            self.doc_languages.write().remove(key);
         }
-        let words = |fields: &AHashMap<String, Vec<String>>| -> (usize, AHashSet<String>) {
-            let total = fields.values().map(Vec::len).sum();
-            let unique = fields.values().flatten().cloned().collect();
-            (total, unique)
+    }
+
+    /// The language the words of the document at `key` are stemmed in, for a
+    /// write of `fields` (all of the document's if `whole`): the one its
+    /// language field names, or for a write that leaves that field as it
+    /// was, the one it had. Kept for the next write.
+    fn doc_language(
+        &self,
+        key: &str,
+        fields: &[(String, Arc<[u8]>)],
+        whole: bool,
+    ) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
         };
-        let postings = |fields: &AHashMap<String, Vec<String>>| -> AHashSet<String> {
-            fields
-                .iter()
-                .flat_map(|(field, tokens)| tokens.iter().map(move |t| format!("{field}\x00{t}")))
-                .collect()
+        let given = fields.iter().find(|(n, _)| n == name).map(|(_, v)| &**v);
+        if given.is_none() && !whole {
+            return self
+                .doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(self.language.language);
+        }
+        let language = self.language.of(given);
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
+        }
+        language
+    }
+
+    /// The language of the document at `key`, whose fields are all of `doc`.
+    fn language_of(&self, key: &str, doc: &Fields) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
         };
-        let (old_total, old_unique) = words(&old);
-        let (new_total, new_unique) = words(&new);
-        let (old_postings, new_postings) = (postings(&old), postings(&new));
-        {
-            let mut inverted = self.inverted.write();
-            for gone in old_postings.difference(&new_postings) {
-                if let Some(set) = inverted.get_mut(gone) {
-                    set.remove(key);
-                    if set.is_empty() {
-                        inverted.remove(gone);
-                    }
-                }
-            }
-            for came in new_postings.difference(&old_postings) {
-                inverted
-                    .entry(came.clone())
-                    .or_default()
-                    .insert(key.to_string());
-            }
+        let language = self.language.of(doc.get(name.as_str()).map(|v| &**v));
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
         }
-        {
-            let mut doc_freq = self.doc_freq.write();
-            for gone in old_unique.difference(&new_unique) {
-                if let Some(n) = doc_freq.get_mut(gone) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        doc_freq.remove(gone);
-                    }
-                }
-            }
-            for came in new_unique.difference(&old_unique) {
-                *doc_freq.entry(came.clone()).or_insert(0) += 1;
-            }
-        }
-        if !new_unique.is_empty() {
-            let mut vocab = self.vocab.write();
-            for word in &new_unique {
-                if !vocab.contains(word) {
-                    vocab.insert(word.clone());
-                }
-            }
-        }
-        // Only changed here, under the forward index's lock: a load and a
-        // store do not race.
-        match (old_total > 0, new_total > 0) {
-            (false, true) => {
-                self.doc_count.fetch_add(1, Relaxed);
-            }
-            (true, false) => {
-                let n = self.doc_count.load(Relaxed);
-                self.doc_count.store(n.saturating_sub(1), Relaxed);
-            }
-            _ => {}
-        }
-        let tokens = self.total_tokens.load(Relaxed);
-        self.total_tokens.store(
-            tokens.saturating_sub(old_total).saturating_add(new_total),
-            Relaxed,
-        );
-        if !new.is_empty() {
-            forward.insert(key.to_string(), new);
-        }
+        language
     }
 
     /// Whether the index has a TAG or a NUMERIC field: whether it keeps
@@ -915,6 +935,7 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         aliases: Vec::new(),
         stopwords: None,
         synonyms: Default::default(),
+        language: Default::default(),
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -969,6 +990,8 @@ pub struct IndexSchema {
     pub stopwords: Option<Vec<String>>,
     /// The index's synonym groups (`FT.SYNUPDATE`).
     pub synonyms: SynonymGroups,
+    /// See [`IndexDef::language`].
+    pub language: stem::LanguageOptions,
 }
 
 impl IndexSchema {
@@ -997,12 +1020,9 @@ impl IndexSchema {
             indexes,
             stopwords: self.stopwords.map(Arc::new),
             synonyms: self.synonyms,
-            vocab: Arc::new(RwLock::new(BTreeSet::new())),
-            doc_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            total_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            doc_freq: Arc::new(RwLock::new(AHashMap::new())),
-            inverted: Arc::new(RwLock::new(AHashMap::new())),
-            forward: Arc::new(RwLock::new(AHashMap::new())),
+            language: self.language,
+            doc_languages: Arc::new(RwLock::new(AHashMap::new())),
+            text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
         }
     }
@@ -1024,14 +1044,23 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
+            let language = def.language_of(key, &inner);
+            let mut changes = Vec::new();
             for field in fields {
                 let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                     continue;
                 };
-                let tokens: Vec<String> = tokenize_for_vocab(text)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect();
-                def.set_text(key, field, tokens);
+                let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
+                    continue;
+                };
+                let Some(number) = def.text_field(field) else {
+                    continue;
+                };
+                changes.push((number, stem::index_words(def, schema, language, text)));
+            }
+            if !changes.is_empty() {
+                let doc = def.postings.write().ensure(key);
+                def.write_text(doc, &changes);
             }
         }
     }
@@ -1086,6 +1115,7 @@ pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
                 aliases: Vec::new(),
                 stopwords: def.stopwords.as_deref().cloned(),
                 synonyms: def.synonyms.clone(),
+                language: def.language.clone(),
             }
             .into_def();
             indexes.insert(name, fresh.clone());
@@ -1162,13 +1192,8 @@ pub fn backfill_from_db_progress(
         });
     }
 
-    let text_field_names: Vec<String> = def
-        .fields
-        .iter()
-        .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
-        .map(|f| f.name.clone())
-        .collect();
-    let keeps_postings = def.keeps_postings();
+    let text_fields: Vec<&SchemaField> = def.text_fields().collect();
+    let gives_ids = def.gives_ids();
 
     let mut keys_matched: usize = 0;
 
@@ -1195,7 +1220,7 @@ pub fn backfill_from_db_progress(
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
-            let doc = if keeps_postings {
+            let doc = if gives_ids {
                 let mut postings = def.postings.write();
                 let doc = postings.write_doc(key, &inner);
                 def.postings.done(postings);
@@ -1223,16 +1248,19 @@ pub fn backfill_from_db_progress(
                 }
             }
 
-            for fname in &text_field_names {
-                if let Some(raw) = inner.get(fname)
+            if text_fields.is_empty() {
+                continue;
+            }
+            let language = def.language_of(key, &inner);
+            let mut changes = Vec::new();
+            for (number, field) in text_fields.iter().enumerate() {
+                if let Some(raw) = inner.get(&field.name)
                     && let Ok(s) = std::str::from_utf8(raw)
                 {
-                    let tokens: Vec<String> = tokenize_for_vocab(s)
-                        .filter(|tok| !def.is_stopword(tok))
-                        .collect();
-                    def.set_text(key, fname, tokens);
+                    changes.push((number as u16, stem::index_words(def, field, language, s)));
                 }
             }
+            def.write_text(doc, &changes);
         }
     }
 }
@@ -1888,39 +1916,56 @@ pub fn maybe_index(
 /// fields, its TAG and NUMERIC values, and its vectors.
 fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
     let whole = how != Write::Fields;
-    {
-        // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
-        //
-        // Each TEXT field written replaces what it held before: its words,
-        // stopwords left out (see `IndexDef::set_text`).
-        for f in &def.fields {
-            if !matches!(f.field_type, FieldType::Text) || f.options.noindex {
-                continue;
-            }
+
+    // ── The words of the TEXT fields written ────────────────────────────────
+    //
+    // Each TEXT field written replaces what it held before: its words,
+    // stopwords left out, with their stems (see `IndexDef::write_text`).
+    // Read before any lock is taken.
+    let mut changes: Vec<(u16, Vec<String>)> = Vec::new();
+    let mut restemmed: Vec<(u16, bool)> = Vec::new();
+    let mut language = def.language.language;
+    if def.text_fields().next().is_some() {
+        let before = (def.language.field.is_some() && !whole).then(|| {
+            def.doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(def.language.language)
+        });
+        language = def.doc_language(key, fields, whole);
+        for (number, f) in def.text_fields().enumerate() {
+            let number = number as u16;
             let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
                 if whole {
-                    def.set_text(key, &f.name, Vec::new());
+                    changes.push((number, Vec::new()));
+                } else if before.is_some_and(|before| before != language) {
+                    // The document's language changed and this field did
+                    // not: its words are stemmed again in the new one.
+                    restemmed.push((number, !f.options.nostem));
                 }
                 continue;
             };
             let tokens: Vec<String> = match std::str::from_utf8(raw) {
-                Ok(s) => tokenize_for_vocab(s)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect(),
+                Ok(s) => stem::index_words(def, f, language, s),
                 Err(_) => Vec::new(),
             };
-            def.set_text(key, &f.name, tokens);
+            changes.push((number, tokens));
         }
     }
 
-    // ── TAG and NUMERIC postings ─────────────────────────────────────────────
+    // ── Document id, TAG and NUMERIC postings ───────────────────────────────
     //
     // Every document of the index is given an id, whatever it holds: `*`
-    // and `NOT` are in terms of all of them. A write that finds a query
-    // reading them is queued, not kept waiting (see `postings`): its vector
-    // then learns its id when a filtered search first asks.
-    let doc = if def.keeps_postings() {
-        def.postings.write_fields(key, fields, whole)
+    // and `NOT` are in terms of all of them, and the TEXT index is too. A
+    // write that finds a query reading them is queued, not kept waiting (see
+    // `postings`): its vector then learns its id when a filtered search
+    // first asks. Its words (inverted index, vocabulary, BM25 statistics) go
+    // with it: the postings write them with the id they give it, under their
+    // lock, at once or when the queue is applied (see `postings::WithId`).
+    let doc = if def.gives_ids() {
+        let words = def.text_write(changes, restemmed, language);
+        def.postings.write_fields(key, fields, whole, words)
     } else {
         postings::NO_DOC
     };
@@ -1968,6 +2013,31 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     }
 }
 
+/// The words TEXT field `number` of document `doc` holds in `text`, stemmed
+/// again in `language` if the field `stems`: `None` if it holds none.
+fn restem(
+    text: &text::TextIndex,
+    doc: u32,
+    number: u16,
+    stems: bool,
+    language: stem::Language,
+) -> Option<Vec<String>> {
+    let words = text.field_words(doc, number)?;
+    let mut tokens = Vec::with_capacity(words.len() * 2);
+    for word in words {
+        let stemmed = if stems {
+            stem::index_stem(language, &word)
+        } else {
+            None
+        };
+        tokens.push(word);
+        if let Some(s) = stemmed {
+            tokens.push(format!("{}{s}", stem::STEM_PREFIX));
+        }
+    }
+    Some(tokens)
+}
+
 /// Take the vector of the document at `key` out of a vector index: from a
 /// FLAT index, at once; from a graph, by deleting its node in place.
 fn unindex_vector(live: &LiveIndex, key: &str) {
@@ -1991,17 +2061,18 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
     }
 }
 
-/// The document at `key` has left `def`: its vectors, then its postings
-/// (the order a filtered search relies on: see [`HnswNode::doc`]), then its
-/// words.
+/// The document at `key` has left `def`: its vectors, then its words, then
+/// its postings and its id (the order a filtered search relies on: see
+/// [`HnswNode::doc`]; the words are in terms of the id).
 fn unindex_from(def: &IndexDef, key: &str) {
     for live in def.indexes.values() {
         unindex_vector(live, key);
     }
-    if def.keeps_postings() {
-        def.postings.remove(key);
+    // The words are taken out by the postings, before they give the id back.
+    if def.gives_ids() {
+        def.postings.remove(key, def.text_removal());
     }
-    def.remove_text(key);
+    def.forget_language(key);
 }
 
 // ── Keys that expire on being read ───────────────────────────────────────────
@@ -3334,6 +3405,7 @@ mod flush_index_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -3370,6 +3442,7 @@ mod flush_index_tests {
                 aliases: Vec::new(),
                 stopwords: None,
                 synonyms: Default::default(),
+                language: Default::default(),
             }
             .into_def()
         };
@@ -3400,6 +3473,7 @@ mod alias_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def()
     }
@@ -3443,18 +3517,8 @@ mod alias_tests {
             Write::Fields,
         );
         let g = store.read();
-        assert_eq!(
-            g["idx"]
-                .doc_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            g["alias"]
-                .doc_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(g["idx"].text.read().doc_count(), 1);
+        assert_eq!(g["alias"].text.read().doc_count(), 0);
     }
 
     #[test]
@@ -3469,6 +3533,7 @@ mod alias_tests {
             aliases: vec!["a".into()],
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();

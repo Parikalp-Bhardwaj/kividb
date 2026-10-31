@@ -118,7 +118,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let delete_documents = match &cmd[2..] {
         [] => false,
         [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
-        _ => return Some(resp_error("ERR syntax error")),
+        _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
     };
 
     // The documents it covered, if they go too: found before the index goes,
@@ -154,7 +154,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // The index goes, and its aliases with it.
     if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(name)));
     }
     // Then its documents. Not each as a DEL to replicas and the AOF: they
     // run this command, and delete theirs.
@@ -266,7 +266,11 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // Check for duplicate field names — Redis rejects them
@@ -435,15 +439,40 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         }
     }
-    let (filter, knn) = match crate::vector::filter::parse_query(&query_str, &params, &def) {
-        Ok(query) => (query.filter, query.knn),
-        Err(e) => return Some(resp_error(&e)),
+    // `VERBATIM`, `LANGUAGE` and `SCORER`, where an option may be.
+    let option = |name: &str| crate::commands::aggregate_pipeline::option_at(cmd, 3, name);
+    let value_of = |at: usize| cmd.get(at + 1).and_then(|a| std::str::from_utf8(a).ok());
+    let mut options = crate::vector::filter::QueryOptions {
+        verbatim: option("VERBATIM").is_some(),
+        language: None,
     };
+    if let Some(at) = option("LANGUAGE") {
+        match value_of(at).and_then(crate::vector::stem::Language::parse) {
+            Some(language) => options.language = Some(language),
+            None => return Some(resp_error("No such language")),
+        }
+    }
+    let scorer = match option("SCORER") {
+        Some(at) => match value_of(at).and_then(crate::vector::score::Scorer::parse) {
+            Some(scorer) => scorer,
+            None => {
+                return Some(resp_error(&format!(
+                    "No such scorer {}",
+                    value_of(at).unwrap_or_default()
+                )));
+            }
+        },
+        None => crate::vector::score::Scorer::default_scorer(),
+    };
+    let (filter, knn) =
+        match crate::vector::filter::parse_query_with(&query_str, &params, &def, options) {
+            Ok(query) => (query.filter, query.knn),
+            Err(e) => return Some(resp_error(&e)),
+        };
 
     // `ADDSCORES`: the relevance of each document, as `@__score`.
     let addscores = cmd.iter().any(|a| a.eq_ignore_ascii_case(b"ADDSCORES"));
-    let mut terms = ahash::AHashSet::new();
-    crate::commands::search::query_terms(&filter, &mut terms);
+    let scoring = crate::vector::score::Scoring::new(&def, &filter, scorer);
     let cursor = match crate::commands::search_tools::cursor_options(cmd) {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
@@ -489,7 +518,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             row.insert(
                 "__score".to_string(),
                 crate::commands::search::number_text(crate::commands::search::relevance(
-                    &def, inner, &terms,
+                    &def, key, inner, &scoring,
                 )),
             );
         }
@@ -946,7 +975,11 @@ fn ft_synupdate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // entry().or_insert_with() is the idiomatic Rust "get or create" pattern.
@@ -998,7 +1031,11 @@ fn ft_syndump(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let store = ctx.index_store.read();
     let def = match store.get(index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                index_name,
+            )));
+        }
     };
 
     if def.synonyms.is_empty() {
@@ -1132,13 +1169,17 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The vocab is maintained incrementally by maybe_index and backfill_index.
     // We clone the Arc to drop the IndexStore lock before doing the lookup
     // loop — keeps the fast path uncontended.
-    let vocab_arc = {
+    let text_arc = {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
-        Arc::clone(&def.vocab)
+        Arc::clone(&def.text)
     };
 
     // Take a read lock on the vocab itself. We need to convert it into a
@@ -1148,10 +1189,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     //
     // The vocab is then a local owned BTreeSet; we drop the read lock before
     // any further work so concurrent HSETs can keep updating the index.
-    let mut vocab: BTreeSet<String> = {
-        let v = vocab_arc.read();
-        v.clone()
-    };
+    let mut vocab: BTreeSet<String> = text_arc.read().words().map(str::to_string).collect();
 
     // AFTER the vocab-building loop over shards,
     // this block is used to merge in any INCLUDE dicts and remove EXCLUDE dicts.
@@ -1798,7 +1836,7 @@ fn ft_alias_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     // The target may itself be given by alias.
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1843,7 +1881,7 @@ fn ft_alias_update(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR Alias already exists as an index name"));
     }
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1870,7 +1908,7 @@ fn ft_alias_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .get(index)
         .is_none_or(|def| crate::vector::is_alias(index, def))
     {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
     }
     let aliases: Vec<Vec<u8>> = crate::vector::index_aliases(&store, index)
         .iter()
@@ -2059,7 +2097,11 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         match def.indexes.get(&field_name) {
             Some(crate::vector::LiveIndex::Hnsw(_)) => {}

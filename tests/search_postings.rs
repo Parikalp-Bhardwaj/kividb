@@ -1472,6 +1472,119 @@ fn a_count_from_postings_leaves_out_what_is_gone() {
 /// written and deleted between queries, so that queries meet waiting ids,
 /// runs, and merges under way, of the key order and of a NUMERIC field. Each
 /// page is the page of every match.
+/// With the TEXT index's words read off by id (#214), a TEXT query's
+/// documents are exactly known, and sorted by a NUMERIC field its page comes
+/// from the postings (#215): the same page, and the same scores, as reading
+/// every match, under every scorer; and without SORTBY where every match
+/// scores the same.
+#[test]
+fn a_text_query_sorted_by_a_number_is_paged_with_its_scores() {
+    let mut c = conn();
+    let reply = c.cmd(&[
+        "FT.CREATE",
+        "tq",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "tq:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+        "WEIGHT",
+        "2",
+        "b",
+        "TEXT",
+        "c",
+        "TAG",
+        "n",
+        "NUMERIC",
+        "SORTABLE",
+    ]);
+    assert!(reply.ok(), "{reply:?}");
+    let words = [
+        "hello", "world", "running", "runs", "ran", "blue", "green", "the", "quick", "fox",
+    ];
+    let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+    let write = |c: &mut Conn, rng: &mut Rng, i: usize| {
+        let mut doc = Doc::new();
+        let len = 1 + rng.below(12);
+        let t: Vec<&str> = (0..len).map(|_| rng.pick(&words)).collect();
+        doc.insert("t".into(), t.join(" "));
+        if rng.chance(50) {
+            doc.insert("b".into(), rng.pick(&words).to_string());
+        }
+        doc.insert("c".into(), rng.pick(&["x", "y", "z"]).to_string());
+        if rng.chance(90) {
+            // Ties, so that the key breaks them.
+            doc.insert("n".into(), (rng.below(40) as i64 - 20).to_string());
+        }
+        hset(c, &format!("tq:{i}"), &doc);
+    };
+    for i in 0..300 {
+        write(&mut c, &mut rng, i);
+    }
+    let queries = [
+        "hello",
+        "@t:world",
+        "hello world",
+        "hello | fox",
+        "run*",
+        "running",
+        "@t:(blue green) @c:{x}",
+        "fox -@c:{y}",
+        "@b:quick @n:[-5 5]",
+    ];
+    let scorers = [
+        "BM25STD",
+        "TFIDF",
+        "TFIDF.DOCNORM",
+        "BM25",
+        "DISMAX",
+        "DOCSCORE",
+    ];
+    for round in 0..3 {
+        for query in queries {
+            for scorer in scorers {
+                for (sort, limits) in [
+                    (Some("ASC"), ("0", "10")),
+                    (Some("DESC"), ("7", "15")),
+                    (None, ("3", "8")),
+                ] {
+                    let mut args: Vec<String> = vec![query.into(), "SCORER".into(), scorer.into()];
+                    if let Some(order) = sort {
+                        args.extend(["SORTBY".into(), "n".into(), order.into()]);
+                    }
+                    args.extend([
+                        "LIMIT".into(),
+                        limits.0.into(),
+                        limits.1.into(),
+                        "WITHSCORES".into(),
+                    ]);
+                    let (paged, whole, scanned) = three_ways(&mut c, "tq", &args);
+                    assert_eq!(paged, whole, "round {round}: {args:?}");
+                    assert_eq!(scanned, whole, "round {round}: {args:?}");
+                    assert!(
+                        total_of(&whole) > 0 || query.contains('@'),
+                        "{args:?}: {whole:?}"
+                    );
+                }
+            }
+        }
+        // Documents written again and deleted: their ids given back, and
+        // given out again, the words with them.
+        for _ in 0..60 {
+            let i = rng.below(320);
+            if rng.chance(30) {
+                c.cmd(&["DEL", &format!("tq:{i}")]);
+            } else {
+                write(&mut c, &mut rng, i);
+            }
+        }
+    }
+    c.cmd(&["FT.DROPINDEX", "tq"]);
+}
+
 #[test]
 fn a_page_is_right_while_the_postings_merge() {
     let mut c = conn();

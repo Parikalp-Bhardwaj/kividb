@@ -12,7 +12,8 @@
 // A query's TAG and NUMERIC clauses, and `AND`, `OR` and `NOT` of them, are
 // then a set of ids computed from these (see `commands::search::plan`),
 // instead of a filter tried on every document. An index without a TAG or a
-// NUMERIC field keeps none of this, and gives out no ids.
+// NUMERIC field keeps none of this; it gives out ids only if it has a TEXT
+// field, whose index (`text`) is in terms of them.
 //
 // What a document holds is read as the filter reads it (`filter::eval`): a
 // TAG value split at the field's separator, trimmed, lower-cased unless the
@@ -1353,14 +1354,30 @@ const STEP_MOST: std::time::Duration = std::time::Duration::from_millis(4);
 // queue first, in order: a write, the merging thread, or a query, which so
 // sees every write that returned before it began.
 
+/// What a write or a removal also does with the document's id, under the
+/// postings' lock: the TEXT index's part of it, which is in terms of ids
+/// (see `vector::IndexDef::text_write`). Run in the same hold of the lock
+/// that gives the document its id, or before the one that gives it back,
+/// whether the write was applied at once or queued: so the TEXT index never
+/// names an id the postings do not give that document, and an id is not
+/// given out again while it does.
+///
+/// Lock order: the postings, then the TEXT index. Nothing that holds the
+/// TEXT index's lock waits for the postings' lock.
+pub type WithId = Box<dyn FnOnce(u32) + Send>;
+
 /// A write that found the postings' lock taken.
 enum Pending {
     Write {
         key: Box<str>,
         fields: Vec<(String, Arc<[u8]>)>,
         whole: bool,
+        then: Option<WithId>,
     },
-    Remove(Box<str>),
+    Remove {
+        key: Box<str>,
+        first: Option<WithId>,
+    },
 }
 
 /// Writes queued past this many wait for the lock instead: a bound on what
@@ -1446,17 +1463,22 @@ impl PostingsLock {
     }
 
     /// What the document at `key` holds now, from `fields` (see
-    /// [`Postings::write`]): applied at once if the lock is free, queued if
-    /// not. Its id, or [`NO_DOC`] if it was queued.
+    /// [`Postings::write`]), and `then` run with its id: applied at once if
+    /// the lock is free, queued if not. Its id, or [`NO_DOC`] if it was
+    /// queued.
     pub fn write_fields(
         self: &Arc<Self>,
         key: &str,
         fields: &[(String, Arc<[u8]>)],
         whole: bool,
+        then: Option<WithId>,
     ) -> u32 {
         if let Some(mut postings) = self.lock.try_write() {
             self.apply(&mut postings);
             let doc = postings.write(key, fields, whole);
+            if let Some(then) = then {
+                then(doc);
+            }
             self.done(postings);
             return doc;
         }
@@ -1464,20 +1486,25 @@ impl PostingsLock {
             key: key.into(),
             fields: fields.to_vec(),
             whole,
+            then,
         });
         NO_DOC
     }
 
-    /// The document at `key` has left the index ([`Postings::remove`]): at
-    /// once if the lock is free, queued if not.
-    pub fn remove(self: &Arc<Self>, key: &str) {
+    /// The document at `key` has left the index ([`Postings::remove`]),
+    /// `first` run with its id before it is given back: at once if the lock
+    /// is free, queued if not.
+    pub fn remove(self: &Arc<Self>, key: &str, first: Option<WithId>) {
         if let Some(mut postings) = self.lock.try_write() {
             self.apply(&mut postings);
-            postings.remove(key);
+            remove_with(&mut postings, key, first);
             self.done(postings);
             return;
         }
-        self.enqueue(Pending::Remove(key.into()));
+        self.enqueue(Pending::Remove {
+            key: key.into(),
+            first,
+        });
     }
 
     fn enqueue(self: &Arc<Self>, write: Pending) {
@@ -1525,10 +1552,18 @@ impl PostingsLock {
         };
         for write in writes {
             match write {
-                Pending::Write { key, fields, whole } => {
-                    postings.write(&key, &fields, whole);
+                Pending::Write {
+                    key,
+                    fields,
+                    whole,
+                    then,
+                } => {
+                    let doc = postings.write(&key, &fields, whole);
+                    if let Some(then) = then {
+                        then(doc);
+                    }
                 }
-                Pending::Remove(key) => postings.remove(&key),
+                Pending::Remove { key, first } => remove_with(postings, &key, first),
             }
         }
     }
@@ -1539,6 +1574,14 @@ impl PostingsLock {
     fn wants_tidy(&self, postings: &Postings) -> bool {
         postings.behind() && !self.tidying.swap(true, SeqCst)
     }
+}
+
+/// [`Postings::remove`] of `key`, `first` run with its id before.
+fn remove_with(postings: &mut Postings, key: &str, first: Option<WithId>) {
+    if let (Some(first), Some(id)) = (first, postings.id(key)) {
+        first(id);
+    }
+    postings.remove(key);
 }
 
 /// Do the merging `shared`'s postings are behind on, on a thread of its own,
@@ -1858,6 +1901,20 @@ impl Postings {
         let mut out = Bits::new();
         tags.any_of(values, prefixes, &mut out);
         Some(out)
+    }
+
+    /// How many documents hold tag `tag` in TAG field `field`: its document
+    /// frequency, for relevance (see `score`).
+    pub fn tag_docs(&self, field: &str, tag: &str) -> usize {
+        self.fields
+            .iter()
+            .find_map(|f| match &f.kind {
+                Kind::Tag(t) if f.name == field => {
+                    t.numbers.get(tag).map(|&n| t.tags[n as usize].1.len())
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     fn numeric_field(&self, field: &str) -> Option<&NumericPostings> {
@@ -2364,10 +2421,15 @@ mod tests {
         // Two readers hold the lock most of the time, so that most writes
         // are queued, and the postings' thread merges meanwhile. Each writer
         // reads back what it wrote at once; in the end the postings are what
-        // the writes, one after the other, make.
+        // the writes, one after the other, make. Each write and removal also
+        // runs a hook with the id, as the TEXT index's part does (`WithId`):
+        // `named` is that index, by id; an id is never given to a key while
+        // it still names another, and in the end it names what the postings
+        // do.
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         let shared = PostingsLock::new(Postings::new(&schema()));
+        let named: Arc<parking_lot::Mutex<BTreeMap<u32, String>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..2)
             .map(|_| {
@@ -2387,6 +2449,7 @@ mod tests {
         let writers: Vec<_> = (0..4u64)
             .map(|w| {
                 let shared = Arc::clone(&shared);
+                let named = Arc::clone(&named);
                 std::thread::spawn(move || {
                     let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ ((w + 1) << 40);
                     let mut next = move || {
@@ -2400,7 +2463,11 @@ mod tests {
                     for _ in 0..3000 {
                         let key = format!("w{w}:{}", next() % 400);
                         if next() % 5 == 0 {
-                            shared.remove(&key);
+                            let (gone, of) = (key.clone(), Arc::clone(&named));
+                            let first: WithId = Box::new(move |id| {
+                                assert_eq!(of.lock().remove(&id).as_deref(), Some(&*gone));
+                            });
+                            shared.remove(&key, Some(first));
                             assert_eq!(shared.read().id(&key), None);
                             model.insert(key, None);
                             continue;
@@ -2411,7 +2478,13 @@ mod tests {
                             ("t".to_string(), Arc::from(tag.as_bytes())),
                             ("n".to_string(), Arc::from(n.to_string().as_bytes())),
                         ];
-                        if shared.write_fields(&key, &fields, true) == NO_DOC {
+                        let (to, of) = (key.clone(), Arc::clone(&named));
+                        let then: WithId = Box::new(move |id| {
+                            if let Some(was) = of.lock().insert(id, to.clone()) {
+                                assert_eq!(was, to, "id {id} given out while it names {was}");
+                            }
+                        });
+                        if shared.write_fields(&key, &fields, true, Some(then)) == NO_DOC {
                             queued += 1;
                         }
                         let p = shared.read();
@@ -2440,6 +2513,11 @@ mod tests {
         }
         assert!(queued > 0, "no write found the lock taken");
         let p = shared.read();
+        let named = named.lock();
+        assert_eq!(named.len(), p.len());
+        for (id, key) in named.iter() {
+            assert_eq!(p.key(*id).map(|k| &**k), Some(key.as_str()));
+        }
         let live: Vec<(&String, &(String, u64))> = model
             .iter()
             .filter_map(|(key, doc)| doc.as_ref().map(|doc| (key, doc)))
