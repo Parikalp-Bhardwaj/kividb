@@ -257,7 +257,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   0.08 ms instead of 305 (50), a quarter 0.08 instead of 142 (30), 2% 0.10
   instead of 7.6 (1.5); with `SORTBY` a NUMERIC field 0.11 instead of 752
   (53); `LIMIT 10000 10` of half 0.13 instead of 300 (53). A NUMERIC range
-  of half takes 1.2 ms instead of 273 (51), a quarter 0.64 instead of 132
+  of half takes 1.0 ms instead of 273 (51), a quarter 0.51 instead of 132
   (25), 2% 0.12 instead of 5.6 (2.0). With 8 clients, half the documents:
   57,000 queries a second instead of 18 (102). JSON documents are the same
   (half: 0.09 ms instead of 906). Memory: 10 bytes a document more (its
