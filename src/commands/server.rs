@@ -968,6 +968,23 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     "ERR argument must be between 0 and 9223372036854775807 inclusive",
                 )),
             },
+            // The shortest word whose stem is indexed: `FT.CONFIG
+            // MINSTEMLEN`.
+            "search-min-stem-len" => match value.parse::<u64>() {
+                Ok(len)
+                    if (2..=u64::from(u32::MAX)).contains(&len)
+                        && crate::commands::search_tools::set_config(
+                            "MINSTEMLEN",
+                            &len.to_string(),
+                        ) =>
+                {
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'search-min-stem-len') \
+                     - argument must be between 2 and 4294967295 inclusive",
+                )),
+            },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
                 if matches!(policy.as_str(), "return" | "fail" | "return_strict")
@@ -1588,6 +1605,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-on-timeout",
             crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
+        ),
+        (
+            "search-min-stem-len",
+            crate::commands::search_tools::config_value("MINSTEMLEN"),
         ),
     ];
     for (name, value) in in_effect {

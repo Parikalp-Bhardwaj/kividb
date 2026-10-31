@@ -68,6 +68,10 @@ const KDB_VECTOR_TYPES_MAGIC: &[u8; 8] = b"KIVIVT1\0";
 /// vector types: an older release reads everything else and stops here, as
 /// it did before libraries were kept.
 const KDB_FUNCTIONS_MAGIC: &[u8; 8] = b"KIVIFN1\0";
+/// The language of each index that is not English or that reads it from a
+/// field (`LANGUAGE`, `LANGUAGE_FIELD`). After the function libraries: an
+/// older release reads everything else, and stops here.
+const KDB_LANGUAGE_MAGIC: &[u8; 8] = b"KIVILG1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -716,7 +720,67 @@ pub fn write_kdb_image(
     }
     write_kdb_index_sections(w, index_store)?;
     write_kdb_alias_section(w, index_store)?;
-    write_kdb_functions_section(w, function_libraries().as_deref())
+    write_kdb_functions_section(w, function_libraries().as_deref())?;
+    write_kdb_language_section(w, index_store)
+}
+
+/// The language section: `index`, its language, its language field (empty
+/// for none), for each index with either set otherwise than the default.
+/// Absent when there is none, so such an image is what it was before.
+fn write_kdb_language_section(
+    w: &mut impl Write,
+    index_store: Option<&crate::vector::IndexStore>,
+) -> io::Result<()> {
+    let Some(store) = index_store else {
+        return Ok(());
+    };
+    let guard = store.read();
+    let mut set: Vec<&crate::vector::IndexDef> = guard
+        .iter()
+        .filter(|(key, def)| {
+            !crate::vector::is_alias(key, def) && def.language != Default::default()
+        })
+        .map(|(_, def)| def)
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    set.sort_by(|a, b| a.name.cmp(&b.name));
+    w.write_all(KDB_LANGUAGE_MAGIC)?;
+    w.write_all(&(set.len() as u32).to_le_bytes())?;
+    for def in set {
+        write_bytes(w, def.name.as_bytes())?;
+        write_bytes(w, def.language.language.name().as_bytes())?;
+        write_bytes(w, def.language.field.as_deref().unwrap_or("").as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Body of the language section; the magic has already been consumed. Not
+/// best-effort: an index in another language indexes other words.
+fn read_language_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::Result<()> {
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad index language utf8"))
+    };
+    for _ in 0..read_u32_le(r)? {
+        let index = text(read_bytes(r)?)?;
+        let name = text(read_bytes(r)?)?;
+        let field = text(read_bytes(r)?)?;
+        let language = crate::vector::stem::Language::parse(&name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown language `{name}` for index `{index}`"),
+            )
+        })?;
+        if let Some(schema) = schemas.iter_mut().find(|s| s.name == index) {
+            schema.language = crate::vector::stem::LanguageOptions {
+                language,
+                field: (!field.is_empty()).then_some(field),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// The libraries loaded now, as a `FUNCTION DUMP` payload: `None` when there
@@ -1679,6 +1743,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             // Not best-effort: a node that comes back without its libraries
             // fails every FCALL.
             functions = Some(read_bytes(&mut r)?);
+        } else if &magic == KDB_LANGUAGE_MAGIC {
+            read_language_section(&mut r, &mut index_schemas)?;
         } else {
             break;
         }
@@ -1866,6 +1932,7 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
         aliases: Vec::new(),
         stopwords: None,
         synonyms: Default::default(),
+        language: Default::default(),
     })
 }
 
@@ -3661,6 +3728,8 @@ pub struct FrozenDataset {
     alias_section: Vec<u8>,
     /// The function libraries at the same instant.
     functions: Option<Vec<u8>>,
+    /// The indexes' languages (see [`write_kdb_language_section`]).
+    language_section: Vec<u8>,
 }
 
 /// What one thread of the capture took: a hold on each string's entry
@@ -3791,12 +3860,15 @@ fn freeze(
     }
     let mut alias_section = Vec::new();
     write_kdb_alias_section(&mut alias_section, index_store)?;
+    let mut language_section = Vec::new();
+    write_kdb_language_section(&mut language_section, index_store)?;
 
     Ok(FrozenDataset {
         dbs,
         index_section,
         alias_section,
         functions: function_libraries(),
+        language_section,
     })
 }
 
@@ -3857,7 +3929,8 @@ impl FrozenDataset {
         out.write_all(&self.index_section)?;
         self.write_expiries(out)?;
         out.write_all(&self.alias_section)?;
-        write_kdb_functions_section(out, self.functions.as_deref())
+        write_kdb_functions_section(out, self.functions.as_deref())?;
+        out.write_all(&self.language_section)
     }
 }
 
@@ -4740,6 +4813,7 @@ mod field_option_tests {
             aliases: Vec::new(),
             stopwords: Some(vec!["foo".into(), "bar".into()]),
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def();
         let expected: Vec<(String, FieldOptions)> = def
@@ -4759,6 +4833,7 @@ mod field_option_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def();
         store.write().insert("bare".into(), bare);
@@ -4789,6 +4864,66 @@ mod field_option_tests {
             .unwrap();
         assert_eq!(bare.fields[0].options, FieldOptions::default());
         assert_eq!(bare.stopwords, None);
+    }
+
+    /// `LANGUAGE` and `LANGUAGE_FIELD` come back with the index; an index
+    /// in English takes no room.
+    #[test]
+    fn index_language_survives_a_snapshot() {
+        use crate::vector::stem::{Language, LanguageOptions};
+        let index = |name: &str, language: LanguageOptions| {
+            IndexSchema {
+                name: name.into(),
+                db_index: 0,
+                on: IndexOn::Hash,
+                prefixes: vec![],
+                fields: vec![SchemaField {
+                    name: "t".into(),
+                    field_type: FieldType::Text,
+                    options: FieldOptions::default(),
+                }],
+                aliases: Vec::new(),
+                stopwords: None,
+                synonyms: Default::default(),
+                language,
+            }
+            .into_def()
+        };
+        let german = LanguageOptions {
+            language: Language::German,
+            field: Some("lang".into()),
+        };
+        let store = crate::vector::new_index_store();
+        store
+            .write()
+            .insert("de".into(), index("de", german.clone()));
+        store
+            .write()
+            .insert("en".into(), index("en", LanguageOptions::default()));
+        let mut image = Vec::new();
+        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        let loaded = load_snapshot_from(image.as_slice()).unwrap();
+        let of = |name: &str| {
+            loaded
+                .index_schemas
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .language
+                .clone()
+        };
+        assert_eq!(of("de"), german);
+        assert_eq!(of("en"), LanguageOptions::default());
+
+        // Without the section (an image of an older release), the index is
+        // English.
+        let mut bare = Vec::new();
+        let empty = crate::vector::new_index_store();
+        empty
+            .write()
+            .insert("de".into(), index("de", LanguageOptions::default()));
+        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        assert!(!bare.windows(8).any(|w| w == KDB_LANGUAGE_MAGIC));
     }
 }
 

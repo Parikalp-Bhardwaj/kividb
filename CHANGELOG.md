@@ -31,6 +31,32 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **Stemming of TEXT fields, as in Redis.** A word is now found by its
+  other forms: `@t:preferences` finds a document that says `I prefer
+  email`, `run` finds `running`, and `dog` finds `dogs`. Before, only the
+  very word matched, so mem0's keyword search, among others, found less
+  than it does on Redis. It works as in RediSearch: each word of a TEXT
+  field is indexed together with its stem, and each word of a query is
+  looked for as itself, as its stem, and as the bare stem; `FT.EXPLAIN`
+  shows the expansion as Redis does (`+prefer(expanded)`). The language is
+  English unless `FT.CREATE … LANGUAGE <language>` names another, or a
+  document names its own in the field `LANGUAGE_FIELD` gives; `FT.SEARCH`
+  and `FT.AGGREGATE … LANGUAGE <language>` stem the query in another one.
+  `VERBATIM` turns the expansion off for one query, and `NOSTEM` for one
+  field. A word shorter than `MINSTEMLEN` bytes (`search-min-stem-len`, 4
+  by default, at least 2) is not stemmed. The stemmers are Snowball's,
+  from the `rust-stemmers` crate (MIT/BSD-3-Clause): Arabic, Danish, Dutch,
+  English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian,
+  Portuguese, Romanian, Russian, Spanish, Swedish, Tamil and Turkish. The
+  other languages Redis accepts are accepted, and their words are indexed
+  and searched as they are. Nothing needs doing on upgrade: indexes are
+  built again from their documents whenever the server starts, so an index
+  made by an older release gets its stems the first time 1.2.0 loads it.
+  An index's `LANGUAGE` and `LANGUAGE_FIELD` are kept in snapshots, in a
+  section of its own that older releases skip. Stems are words of the
+  TEXT index like any other, which now costs less than it did without them
+  (see *Full-text search: the TEXT index holds numbers, not strings*).
+
 - **Signed build provenance for every release file and image.** The
   release workflow signs a GitHub artifact attestation (Sigstore, with the
   workflow's own identity) for every tarball, `.deb` and `.rpm` in a
@@ -169,6 +195,48 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   skip it. Config file, command line, and `CONFIG SET` at runtime.
 
 ### Changed
+
+- **Full-text search: the TEXT index holds numbers, not strings.** The
+  inverted index kept, for every word of every TEXT field, a set of the
+  keys of the documents holding it, each key a string of its own; the
+  forward index kept every word of every document as a string again, and
+  the vocabulary and document frequencies a third and fourth copy of each
+  word. Now each word (or stem) is kept once and known by a number, and each
+  document by the number its index gives it (the one TAG and NUMERIC
+  postings use, now given in every index with a TEXT field too): a word's
+  documents are a sorted list of numbers, or a bitmap when that is smaller,
+  and a document's words one list of numbers, in order, which is where its
+  positions come from. A query's word, stem, prefix, suffix or infix, and
+  `AND`, `OR` and `NOT` of them, are now exactly the documents the index
+  names, which are no longer read and checked one by one; a phrase still
+  is, and a fuzzy word still reads every document. On an Azure D16s_v5, a
+  million hashes of a short text (6 to 14 words) and a tag, written by 8
+  clients: the dataset takes 827 bytes a document, stems included, instead
+  of 1,944 without them in 1.1 (2,596 with stems before this change);
+  indexing takes 18.7 to 20.7 microseconds of server CPU a document instead
+  of 25 (40), and the writes finish in 7 s instead of 22 (33); a one-word
+  query matching 16,000 documents takes 20 ms instead of 34 (49), a prefix
+  27 ms instead of 36 (91), a word and a tag 0.3 ms instead of 4.2 (7.3).
+  With 100,000 texts of 60 to 200 words: 3.8 KB a document instead of 13.7
+  (21.7), 110 microseconds of CPU instead of 189 (315), a one-word query
+  17 ms instead of 87 (93). `FT.INFO` gives what the TEXT index holds in
+  `text_terms_bytes`, `text_postings_bytes` and `text_docs_bytes`.
+
+- **Search scores are Redis's.** `WITHSCORES`, `ADDSCORES`, and the order
+  of results now come out as Redis 8.10 gives them for the same data and
+  query. KiviDB's BM25 had the standard formula, but scored a different
+  thing: a TAG value a query asks for (`@user_id:{alice}`) is a term Redis
+  scores, and KiviDB did not, which is why mem0 saw KiviDB's keyword scores
+  at about half of Redis's; a field's `WEIGHT` multiplied the score, where
+  Redis counts each occurrence of a word that many times (and so does the
+  document's length); the number of documents and their average length
+  left out documents without a TEXT field; a word's count was taken in one
+  field rather than the whole document; `*` and a TAG-only query scored 1,
+  and `NOT` and NUMERIC clauses did not score 0. `SCORER` is now honoured,
+  not ignored: `BM25STD` (the default, or `FT.CONFIG DEFAULT_SCORER`),
+  `BM25STD.TANH`, `BM25`, `TFIDF`, `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE` and
+  `HAMMING`; an unknown name is an error, as in Redis. A threshold an
+  application set on the old scores needs checking.
 
 - **Vector search: distances in SIMD, a filtered KNN without copies.**
   Every vector distance (HNSW search and insert, FLAT, the KNN step of a

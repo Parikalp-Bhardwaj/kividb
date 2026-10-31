@@ -2401,7 +2401,9 @@ fn explain_and_profile_describe_the_query() {
             "(alien | heat) @genre:{scifi} @rating:[8 +inf]"
         ])
         .s(),
-        "INTERSECT {\n  UNION {\n    alien\n    heat\n  }\n  TAG:@genre {\n    scifi\n  }\n  \
+        // As Redis 8.10 has it: each word with its stem.
+        "INTERSECT {\n  UNION {\n    UNION {\n      alien\n      +alien(expanded)\n    }\n    \
+         UNION {\n      heat\n      +heat(expanded)\n    }\n  }\n  TAG:@genre {\n    scifi\n  }\n  \
          NUMERIC {8.000000 <= @rating <= inf}\n}\n"
     );
     assert_eq!(
