@@ -236,12 +236,19 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   picked from the postings, only the documents on it are read, and the
   count is the size of the set. The order is the one it was, so replies are
   the same: without `SORTBY`, by key (every match scores the same without a
-  word to score), read off a list of each index's documents in key order,
-  which the queries that use it bring up to date; `SORTBY` a NUMERIC field,
-  by its values in order. NUMERIC values are now kept in a sorted list, with
-  a small B-tree of the ones written since, merged in when it holds an
-  eighth as many: a range is read off three to four times as fast as from a
-  B-tree of every value, in less memory. A query with words to score, a
+  word to score), read off a list of each index's documents in key order;
+  `SORTBY` a NUMERIC field, by its values in order. NUMERIC values are now
+  kept in a sorted list, with a small B-tree of the ones written since: a
+  range is read off three to four times as fast as from a B-tree of every
+  value, in less memory. Both are kept up to date by a thread of the index's
+  own, started by writes when there is work, a few hundred entries a step
+  under the index's lock: no write and no query waits on a merge or a sort
+  of the whole index. On 1 million documents the first query ordered by key
+  after a load, an `FT.CREATE` or a restart takes 2 to 3 ms, where sorting
+  every key on demand took 93 to 100 ms with writes to the index waiting;
+  with no reader, four writers adding documents to an index of 2.2 million
+  see a write take at most 3 ms (p99 0.12 ms). A query with words to score,
+  a
   vector clause, `SORTBY` a TAG or TEXT field, `SORTBY` a NUMERIC field that
   holds NaN, or more keys with a time to live than matches, still reads
   every match. `FT.DEBUG PAGE <index> ON|OFF` turns this off, to compare.
