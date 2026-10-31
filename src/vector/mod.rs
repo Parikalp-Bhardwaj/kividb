@@ -2797,6 +2797,12 @@ pub fn knn_hnsw(
 /// [`PreparedQuery::vector`]). After `budget` distances the search gives up
 /// and returns `None`: a filter that lets few nodes in makes the walk long,
 /// and measuring the few it lets in is then the cheaper way.
+///
+/// When `deadline` has passed, the search stops with the nearest of the
+/// nodes let in so far, and the second value is true: a query's `TIMEOUT`
+/// holds here as in a scan. `BATCHES` gives the walk no budget, and a filter
+/// that lets few nodes in makes it walk the whole graph.
+#[allow(clippy::too_many_arguments)]
 pub fn knn_hnsw_admitting(
     index: &HnswIndex,
     query: &[f32],
@@ -2805,7 +2811,8 @@ pub fn knn_hnsw_admitting(
     metric: &DistanceMetric,
     admit: &mut dyn FnMut(&HnswNode) -> bool,
     budget: usize,
-) -> Option<Vec<KnnResult>> {
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<KnnResult>, bool)> {
     use ordered_float::OrderedFloat;
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
@@ -2836,7 +2843,7 @@ pub fn knn_hnsw_admitting(
 
     let start = &nodes[curr];
     if start.vector.is_empty() {
-        return Some(Vec::new());
+        return Some((Vec::new(), false));
     }
     let d = OrderedFloat(distance_prenorm(metric, query, &start.vector));
     spent += 1;
@@ -2852,11 +2859,20 @@ pub fn knn_hnsw_admitting(
     };
 
     let mut expanded = 0usize;
+    let mut cut = false;
     while let Some(Reverse((d, id))) = candidates.pop() {
         if d.0 > bound && results.len() >= ef {
             break;
         }
         expanded += 1;
+        // The clock every DEADLINE_EXPANSIONS nodes expanded: a few
+        // thousand distances apart.
+        if expanded.is_multiple_of(DEADLINE_EXPANSIONS)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            cut = true;
+            break;
+        }
         if expanded.is_multiple_of(EXPANSIONS_PER_YIELD) {
             parking_lot::RwLockReadGuard::bump(&mut nodes);
         }
@@ -2896,17 +2912,20 @@ pub fn knn_hnsw_admitting(
     let mut found: Vec<(f32, usize)> = results.into_iter().map(|(d, id)| (d.0, id)).collect();
     found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     found.truncate(k);
-    Some(
-        found
-            .into_iter()
-            .filter(|(_, id)| !nodes[*id].vector.is_empty())
-            .map(|(score, id)| KnnResult {
-                key: nodes[id].key.clone(),
-                score,
-            })
-            .collect(),
-    )
+    let nearest = found
+        .into_iter()
+        .filter(|(_, id)| !nodes[*id].vector.is_empty())
+        .map(|(score, id)| KnnResult {
+            key: nodes[id].key.clone(),
+            score,
+        })
+        .collect();
+    Some((nearest, cut))
 }
+
+/// Nodes a filtered graph search expands between reads of the clock
+/// (`knn_hnsw_admitting`).
+const DEADLINE_EXPANSIONS: usize = 64;
 
 /// Called when a key is deleted. Removes it from any matching indexes.
 /// For FLAT this is O(1). For HNSW we tombstone — mark deleted but
