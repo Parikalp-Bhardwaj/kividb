@@ -241,13 +241,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   kept in a sorted list, with a small B-tree of the ones written since: a
   range is read off three to four times as fast as from a B-tree of every
   value, in less memory. Both are kept up to date by a thread of the index's
-  own, started by writes when there is work, a few hundred entries a step
-  under the index's lock: no write and no query waits on a merge or a sort
-  of the whole index. On 1 million documents the first query ordered by key
-  after a load, an `FT.CREATE` or a restart takes 2 to 3 ms, where sorting
-  every key on demand took 93 to 100 ms with writes to the index waiting;
-  with no reader, four writers adding documents to an index of 2.2 million
-  see a write take at most 3 ms (p99 0.12 ms). A query with words to score,
+  own, started by writes when there is work, a few steps at a time under the
+  index's lock: no query waits on a merge or a sort of the whole index. A
+  write never waits for the lock: one that finds a query or the merging
+  thread holding it is queued, and the next query applies the queue before
+  it reads, so it sees every write that returned before it began. On 1
+  million documents the first query ordered by key after a load, an
+  `FT.CREATE` or a restart takes 2.6 to 3.3 ms, where sorting every key on
+  demand took 93 to 100 ms with writes to the index waiting. Four writers
+  adding documents to an index of 1 million write as fast as before postings
+  with two readers asking a page each, flat out or 200 times a second: 98,000
+  to 101,000 writes a second (p99 0.06 ms, p99.9 0.10 to 0.29 ms), where they
+  managed 82,000 to 85,000 with the readers reading every match, and 18,000
+  with the readers holding the postings' lock; the pages take 0.3 to 2.5 ms
+  (p99 7 ms). Past 1.8 million documents, a write no longer waits 150 ms
+  while the table of keys grows: the most any took, up to 2.3 million, was 7
+  ms. A query with words to score,
   a
   vector clause, `SORTBY` a TAG or TEXT field, `SORTBY` a NUMERIC field that
   holds NaN, or more keys with a time to live than matches, still reads
