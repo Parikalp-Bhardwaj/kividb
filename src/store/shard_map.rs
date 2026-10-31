@@ -753,10 +753,22 @@ impl ShardMap {
         })
     }
 
+    /// The entry in bucket `index`, if it holds one: with a bucket picked
+    /// at random, and another until one is full, a key picked at random
+    /// with every key as likely as any other (see `eviction`).
+    #[inline]
+    pub fn entry_at(&self, index: usize) -> Option<EntryView<'_>> {
+        self.table.get_bucket(index).map(|s| EntryView {
+            entry: s.entry(),
+            _map: std::marker::PhantomData,
+        })
+    }
+
     /// Up to `count` entries from the buckets at and after `start` (taken
-    /// modulo the bucket count), wrapping round once: what a sample from a
-    /// random place in the table is. Costs about `count` divided by how
-    /// full the table is, where walking to the n-th key cost n.
+    /// modulo the bucket count), wrapping round once. Costs about `count`
+    /// divided by how full the table is. Not a sample of keys each as
+    /// likely as the next: a key after a run of empty buckets comes first
+    /// far more often than one after a full one.
     pub fn sample_from(&self, start: usize, count: usize) -> impl Iterator<Item = EntryView<'_>> {
         let buckets = self.buckets();
         let start = if buckets == 0 { 0 } else { start % buckets };
@@ -907,6 +919,15 @@ impl<'a> EntryView<'a> {
     /// The key's access word (`eviction::Access`).
     pub fn access(&self) -> u32 {
         self.entry.access()
+    }
+
+    /// Which entry this is, as long as it lives: a number no other entry
+    /// has meanwhile. A place found holding the same number later holds
+    /// the same entry, or one made since in the same memory; either is
+    /// that place's key now.
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.entry.base() as usize
     }
 
     /// A hold on the entry, to read it once the shard is let go of.
