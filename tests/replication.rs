@@ -2003,3 +2003,307 @@ fn test_a_silent_replica_is_dropped_after_repl_timeout() {
     };
     assert!(closed, "the silent replica's connection is still open");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FT.DROPINDEX DD — a DEL of each document, then the drop
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A replica of `master_port` made by hand: synced, and then reading the
+/// stream itself. Returns the connection, positioned after the payload.
+fn attach_stream_reader(master_port: u16) -> Conn {
+    let mut tap = Conn::connect(master_port);
+    assert!(tap.cmds(&["REPLCONF", "listening-port", "7778"]).is_ok());
+    tap.stream
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut line = String::new();
+    tap.reader.read_line(&mut line).unwrap();
+    assert!(line.starts_with("+FULLRESYNC"), "{line:?}");
+    // The payload, after any newlines the master sends while it prepares it.
+    let len = loop {
+        line.clear();
+        tap.reader.read_line(&mut line).unwrap();
+        if let Some(len) = line.trim_end().strip_prefix('$') {
+            break len.parse::<usize>().unwrap();
+        }
+    };
+    let mut payload = vec![0u8; len];
+    tap.reader.read_exact(&mut payload).unwrap();
+    tap
+}
+
+/// The commands `tap` is sent, each as its arguments joined by spaces, up to
+/// and including the one `last` picks. The link's own (`PING`, `REPLCONF`)
+/// are left out.
+fn stream_until(tap: &mut Conn, last: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut seen = Vec::new();
+    loop {
+        let command = tap
+            .read_value()
+            .as_array()
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = command.split(' ').next().unwrap_or("").to_ascii_uppercase();
+        if name == "PING" || name == "REPLCONF" {
+            continue;
+        }
+        let done = last(&command);
+        seen.push(command);
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// `FT.DROPINDEX … DD` reaches replicas as Redis 8.10 sends it: a DEL of
+/// each document deleted, and then the drop without `DD` — for a HASH index,
+/// a JSON one and one in another database, whose DELs are sent in it. The
+/// replica deletes what it is sent: it used to be sent the `DD` and delete
+/// whatever its own copy of the index covered.
+#[test]
+fn test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    let mut tap = attach_stream_reader(master_port);
+
+    let create = |c: &mut Conn, name: &str, on: &str, prefix: &str, field: &[&str]| {
+        let mut args = vec!["FT.CREATE", name, "ON", on, "PREFIX", "1", prefix, "SCHEMA"];
+        args.extend_from_slice(field);
+        let reply = c.cmds(&args);
+        assert!(reply.is_ok(), "{reply:?}");
+    };
+    create(&mut master, "idx:h", "HASH", "h:", &["t", "TEXT"]);
+    master.cmds(&["HSET", "h:1", "t", "a"]);
+    master.cmds(&["HSET", "h:2", "t", "b"]);
+    master.cmds(&["SET", "h:3", "a string, not a document"]);
+    master.cmds(&["HSET", "other:1", "t", "c"]);
+    create(
+        &mut master,
+        "idx:j",
+        "JSON",
+        "j:",
+        &["$.t", "AS", "t", "TEXT"],
+    );
+    master.cmds(&["JSON.SET", "j:1", "$", r#"{"t":"a"}"#]);
+    master.cmds(&["HSET", "j:2", "t", "a hash, not a JSON document"]);
+    let mut db3 = Conn::connect(master_port);
+    assert!(db3.cmds(&["SELECT", "3"]).is_ok());
+    create(&mut db3, "idx:d", "HASH", "d:", &["t", "TEXT"]);
+    db3.cmds(&["HSET", "d:1", "t", "a"]);
+    db3.cmds(&["HSET", "d:2", "t", "b"]);
+    // The same name in database 0: not a document of the index.
+    master.cmds(&["HSET", "d:1", "t", "database 0's"]);
+    wait_until("the replica has the keys", Duration::from_secs(10), || {
+        replica
+            .cmds(&["EXISTS", "h:1", "h:2", "h:3", "other:1", "j:1", "j:2", "d:1"])
+            .as_int()
+            == 7
+    });
+
+    assert!(master.cmds(&["FT.DROPINDEX", "idx:h", "DD"]).is_ok());
+    assert!(master.cmds(&["FT.DROPINDEX", "idx:j", "dd"]).is_ok());
+    assert!(db3.cmds(&["FT.DROPINDEX", "idx:d", "DD"]).is_ok());
+
+    let stream = stream_until(&mut tap, |command| command == "FT.DROPINDEX idx:d");
+    let first_del = stream
+        .iter()
+        .position(|command| command.starts_with("DEL "))
+        .unwrap_or_else(|| panic!("no DEL sent: {stream:?}"));
+    // Once a database other than 0 has been used, every command carries its
+    // own `SELECT`: only those that change the database are kept here.
+    let mut db = "0";
+    let mut sent: Vec<String> = Vec::new();
+    for command in &stream[first_del..] {
+        if let Some(selected) = command.strip_prefix("SELECT ") {
+            if selected == db {
+                continue;
+            }
+            db = selected;
+        }
+        sent.push(command.clone());
+    }
+    assert_eq!(
+        dels_merged(&sent),
+        [
+            "DEL h:1 h:2",
+            "FT.DROPINDEX idx:h",
+            "DEL j:1",
+            "FT.DROPINDEX idx:j",
+            "SELECT 3",
+            "DEL d:1 d:2",
+            "FT.DROPINDEX idx:d",
+        ]
+    );
+
+    wait_until(
+        "the replica deletes the documents",
+        Duration::from_secs(10),
+        || replica.cmds(&["EXISTS", "h:1", "h:2", "j:1"]).as_int() == 0,
+    );
+    assert_eq!(
+        replica
+            .cmds(&["EXISTS", "h:3", "other:1", "j:2", "d:1"])
+            .as_int(),
+        4
+    );
+    assert!(replica.cmds(&["SELECT", "3"]).is_ok());
+    wait_until(
+        "the replica deletes the documents of database 3",
+        Duration::from_secs(10),
+        || replica.cmds(&["EXISTS", "d:1", "d:2"]).as_int() == 0,
+    );
+    assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
+}
+
+/// `commands` with each run of DELs made one, its keys in order: the
+/// documents of an index are deleted in no particular order, and sent in
+/// as many DELs as it takes.
+fn dels_merged(commands: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+    for command in commands {
+        match (command.strip_prefix("DEL "), merged.last_mut()) {
+            (Some(keys), Some(last)) if last.starts_with("DEL ") => {
+                last.push(' ');
+                last.push_str(keys);
+            }
+            _ => merged.push(command.clone()),
+        }
+    }
+    for command in &mut merged {
+        if let Some(keys) = command.strip_prefix("DEL ") {
+            let mut keys: Vec<&str> = keys.split(' ').collect();
+            keys.sort();
+            *command = format!("DEL {}", keys.join(" "));
+        }
+    }
+    merged
+}
+
+/// A stand-in master that answers the handshake, sends `payload` and then
+/// `commands`, and keeps the link open. Returns its port.
+fn spawn_master_sending(payload: Vec<u8>, commands: Vec<Vec<String>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Some(Ok(mut stream)) = listener.incoming().next() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let line = read_line_raw(&mut reader);
+            let argc: usize = line.trim_start_matches('*').parse().unwrap_or(0);
+            if argc == 0 {
+                return;
+            }
+            let mut args = Vec::new();
+            for _ in 0..argc {
+                let len: usize = read_line_raw(&mut reader)
+                    .trim_start_matches('$')
+                    .parse()
+                    .unwrap();
+                let mut data = vec![0u8; len + 2];
+                reader.read_exact(&mut data).unwrap();
+                data.truncate(len);
+                args.push(String::from_utf8_lossy(&data).to_ascii_uppercase());
+            }
+            match args[0].as_str() {
+                "PING" => stream.write_all(b"+PONG\r\n").unwrap(),
+                "REPLCONF" => stream.write_all(b"+OK\r\n").unwrap(),
+                "PSYNC" => break,
+                _ => return,
+            }
+        }
+        stream
+            .write_all(b"+FULLRESYNC 0123456789012345678901234567890123456789 0\r\n")
+            .unwrap();
+        stream
+            .write_all(format!("${}\r\n", payload.len()).as_bytes())
+            .unwrap();
+        stream.write_all(&payload).unwrap();
+        for command in &commands {
+            let mut encoded = format!("*{}\r\n", command.len()).into_bytes();
+            for part in command {
+                encoded.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            if stream.write_all(&encoded).is_err() {
+                return;
+            }
+        }
+        let mut sink = [0u8; 256];
+        while reader.read(&mut sink).unwrap_or(0) > 0 {}
+    });
+    port
+}
+
+/// A replica deletes the documents its master sends it a DEL of, and no
+/// others: the drop it is sent after them, without `DD`, drops the index
+/// only. A `DD` it is sent comes from a master before this release, which
+/// left each replica to delete the documents itself, and is run as such a
+/// replica ran it.
+#[test]
+fn test_a_replica_deletes_only_the_documents_its_master_sends() {
+    let empty = spawn_server(Config::default());
+    let payload = full_sync_payload_of(empty);
+    let commands: Vec<Vec<String>> = [
+        &["SELECT", "0"][..],
+        &[
+            "FT.CREATE",
+            "idx:new",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "n:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ],
+        &["HSET", "n:1", "t", "a"],
+        // One its master kept: written to the master after the DD found
+        // the documents, say, or deleted there by something else first.
+        &["HSET", "n:2", "t", "b"],
+        &["DEL", "n:1"],
+        &["FT.DROPINDEX", "idx:new"],
+        &[
+            "FT.CREATE",
+            "idx:old",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "o:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ],
+        &["HSET", "o:1", "t", "a"],
+        &["HSET", "o:2", "t", "b"],
+        &["FT.DROPINDEX", "idx:old", "DD"],
+        &["HSET", "o:3", "t", "after the drop"],
+        &["SET", "done", "1"],
+    ]
+    .iter()
+    .map(|command| command.iter().map(|part| part.to_string()).collect())
+    .collect();
+    let master = spawn_master_sending(payload, commands);
+    let replica_port = spawn_server(replica_of(master));
+    let mut replica = Conn::connect(replica_port);
+    wait_until("the stream is applied", Duration::from_secs(10), || {
+        replica.cmds(&["EXISTS", "done"]).as_int() == 1
+    });
+
+    assert_eq!(replica.cmds(&["EXISTS", "n:1"]).as_int(), 0);
+    assert_eq!(
+        replica.cmds(&["EXISTS", "n:2"]).as_int(),
+        1,
+        "the replica deleted a document its master did not"
+    );
+    assert_eq!(replica.cmds(&["EXISTS", "o:1", "o:2"]).as_int(), 0);
+    assert_eq!(replica.cmds(&["EXISTS", "o:3"]).as_int(), 1);
+    assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
+}

@@ -111,70 +111,176 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
     let name = match std::str::from_utf8(cmd[1]) {
-        Ok(s) => s,
+        Ok(s) => s.to_string(),
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
+    // `DD` deletes the documents too. A master sends what it deleted as a
+    // DEL of each, and the drop without `DD` (below), so a `DD` a replica or
+    // an AOF replay meets was written by a master before this one, which
+    // sent the command as typed and had each replica delete what it found:
+    // it is run as that master ran it.
     let delete_documents = match &cmd[2..] {
         [] => false,
         [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
         _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
     };
 
-    // The documents it covered, if they go too: found before the index goes,
-    // by its definition. They were kept whatever was asked (#162).
-    let documents: Vec<(usize, String)> = if delete_documents {
-        let store = ctx.index_store.read();
-        match store
-            .get(name)
-            .filter(|def| !crate::vector::is_alias(name, def))
-        {
-            Some(def) => {
-                let db = def.db_index;
-                let mut keys = Vec::new();
-                for shard in ctx.store[db].iter() {
-                    let map = shard.read();
-                    for (key, value) in map.iter() {
-                        let covered = def.prefixes.is_empty()
-                            || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-                        if covered
-                            && crate::vector::doc_fields(&def.on, &def.fields, value).is_some()
-                        {
-                            keys.push((db, key.to_string()));
-                        }
-                    }
-                }
-                keys
-            }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    // The index's database, and what its documents are: taken from its
+    // definition, which is not held while the keys are looked through.
+    let found = ctx
+        .index_store
+        .read()
+        .get(&name)
+        .filter(|def| !crate::vector::is_alias(&name, def))
+        .map(|def| (def.db_index, def.on.clone(), def.prefixes.clone()));
+    let Some((db, on, prefixes)) = found else {
+        return Some(resp_error(&crate::commands::search::no_such_index(&name)));
     };
+    // The documents, if they go too: found before anything is deleted, one
+    // shard at a time.
+    let mut documents = Vec::new();
+    if delete_documents {
+        for shard in ctx.store[db].iter() {
+            let map = shard.read();
+            for (key, value) in map.iter() {
+                let covered =
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                if covered && crate::vector::is_document(&on, value) {
+                    documents.push(key.to_string());
+                }
+            }
+        }
+    }
+
+    // Replicas and the AOF get it as Redis 8.10 sends it: the documents
+    // deleted as DELs, and then the drop, without `DD`. A replica then
+    // deletes what its master deleted and nothing else, where it used to
+    // run `DD` itself and delete whatever its own copy of the index covered.
+    //
+    // The documents go a few at a time, each few a whole write of its own:
+    // the write gate and the order of their keys are held for them only, so
+    // a full resync or a checkpoint can cut between them, and writes to
+    // other keys go on, however many documents there are. The index goes
+    // last, as in Redis, so the state of this node after each record it
+    // sends is the state a replica reaches by applying it, and a `DD` cut
+    // short (the server killed part way, or a replica promoted with half
+    // of it) leaves the index there to run it again: the documents left
+    // are not orphaned. Dropping the index first would spare this node and
+    // its replicas taking each document out of it (about two seconds a
+    // million documents, measured), but not that.
+    //
+    // Each few is sent as one DEL of them all, where Redis sends a DEL of
+    // each: a record apiece cost more than the deletes themselves (half
+    // again as long, with the AOF on, for a million documents). In a
+    // cluster, one DEL names the keys of one slot only, as a command from a
+    // client would: a slot migration following the stream sends a command
+    // on by its first key. So the documents are taken a slot at a time.
+    let propagate = !ctx.apply_replication && crate::replication::write_is_observed(ctx);
+    let by_slot = propagate && ctx.cluster.enabled;
+    let slot_of = |key: &str| {
+        if by_slot {
+            crate::cluster::key_hash_slot(key.as_bytes())
+        } else {
+            0
+        }
+    };
+    if by_slot {
+        documents.sort_by_cached_key(|key| slot_of(key));
+    }
+    let nested = crate::write_gate::held_by_this_thread();
+    let mut deleted = 0usize;
+    let mut del: Vec<Vec<u8>> = Vec::new();
+    for chunk in documents.chunks(DROPINDEX_DOCUMENTS_PER_WRITE) {
+        let _gate = dropindex_write_gate(ctx, nested);
+        let _order = propagate
+            .then(|| crate::write_order::lock_keys(db, chunk.iter().map(|k| k.as_bytes())));
+        let mut slot = chunk.first().map(|key| slot_of(key));
+        for key in chunk {
+            if by_slot && slot != Some(slot_of(key)) {
+                slot = Some(slot_of(key));
+                send_dels(ctx, db, &mut del);
+            }
+            // One that has expired is gone already, as any read finds it.
+            if crate::commands::helpers::is_expired(ctx.store, db, key) {
+                crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
+                continue;
+            }
+            if !crate::commands::helpers::delete_key(ctx.store, db, key) {
+                continue;
+            }
+            deleted += 1;
+            crate::vector::maybe_unindex(ctx.index_store, db, key);
+            crate::stats::record_rdb_change();
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                db,
+                crate::keyspace_events::KS_GENERIC,
+                "del",
+                key,
+            );
+            ctx.watch_registry.notify(db, key);
+            crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+            if propagate {
+                if del.is_empty() {
+                    del.push(b"DEL".to_vec());
+                }
+                del.push(key.as_bytes().to_vec());
+            }
+        }
+        // Sent before the order of these keys is let go of.
+        send_dels(ctx, db, &mut del);
+    }
 
     // The index goes, and its aliases with it.
-    if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        return Some(resp_error(&crate::commands::search::no_such_index(name)));
-    }
-    // Then its documents. Not each as a DEL to replicas and the AOF: they
-    // run this command, and delete theirs.
-    for (db, key) in &documents {
-        if !crate::commands::helpers::delete_key(ctx.store, *db, key) {
-            continue;
+    let _gate = dropindex_write_gate(ctx, nested);
+    if !crate::vector::remove_index(&mut ctx.index_store.write(), &name) {
+        // Dropped meanwhile by another client, which sent the drop.
+        if deleted == 0 {
+            return Some(resp_error(&crate::commands::search::no_such_index(&name)));
         }
-        crate::vector::maybe_unindex(ctx.index_store, *db, key);
-        crate::stats::record_rdb_change();
-        crate::keyspace_events::notify(
-            ctx.pubsub,
-            *db,
-            crate::keyspace_events::KS_GENERIC,
-            "del",
-            key,
-        );
-        ctx.watch_registry.notify(*db, key);
-        crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+        return Some(resp_simple("OK"));
+    }
+    if propagate {
+        propagate_in_db(ctx, db, &[b"FT.DROPINDEX".to_vec(), name.into_bytes()]);
     }
     Some(resp_simple("OK"))
+}
+
+/// How many documents `FT.DROPINDEX … DD` deletes under one hold of the
+/// write gate and of their keys' order.
+const DROPINDEX_DOCUMENTS_PER_WRITE: usize = 256;
+
+/// The write gate, for one part of an `FT.DROPINDEX`, which the handler
+/// leaves it to take (see `handler::run_command`): stepped out of while a
+/// handoff is under way, as the handler does for any other write. Inside a
+/// transaction or a script the gate is held already, and this takes nothing.
+fn dropindex_write_gate(ctx: &Ctx, nested: bool) -> crate::write_gate::WriteGuard {
+    let mut gate = crate::write_gate::enter();
+    while !nested && !ctx.apply_replication && crate::pause::handoff() {
+        drop(gate);
+        crate::pause::wait_out_handoff();
+        gate = crate::write_gate::enter();
+    }
+    gate
+}
+
+/// The DEL `del` holds, if it names a key, to replicas and the AOF; `del`
+/// is left empty.
+fn send_dels(ctx: &mut Ctx, db: usize, del: &mut Vec<Vec<u8>>) {
+    if del.len() > 1 {
+        propagate_in_db(ctx, db, del);
+    }
+    del.clear();
+}
+
+/// Hand `parts` to replicas and the AOF as a write made in database `db`,
+/// which need not be the one selected: an index's documents are in its own.
+fn propagate_in_db(ctx: &mut Ctx, db: usize, parts: &[Vec<u8>]) {
+    let selected = *ctx.selected_db;
+    *ctx.selected_db = db;
+    crate::replication::replicate_one_write(ctx, parts);
+    *ctx.selected_db = selected;
 }
 
 // ── FT.ALTER ─────────────────────────────────────────────────────────────────
