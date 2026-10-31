@@ -2100,7 +2100,9 @@ fn test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop() {
     master.cmds(&["HSET", "d:1", "t", "database 0's"]);
     wait_until("the replica has the keys", Duration::from_secs(10), || {
         replica
-            .cmds(&["EXISTS", "h:1", "h:2", "h:3", "other:1", "j:1", "j:2", "d:1"])
+            .cmds(&[
+                "EXISTS", "h:1", "h:2", "h:3", "other:1", "j:1", "j:2", "d:1",
+            ])
             .as_int()
             == 7
     });

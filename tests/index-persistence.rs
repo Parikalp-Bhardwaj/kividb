@@ -2542,7 +2542,9 @@ fn dropindex_dd_is_logged_as_a_del_of_each_document_then_the_drop() {
     thread::sleep(Duration::from_millis(1500));
     let records = aof_records(&std::fs::read(dir.join("appendonly.aof")).unwrap());
     assert!(
-        !records.iter().any(|r| r.to_ascii_uppercase().ends_with(" DD")),
+        !records
+            .iter()
+            .any(|r| r.to_ascii_uppercase().ends_with(" DD")),
         "DD logged: {records:?}"
     );
     let first_del = records
