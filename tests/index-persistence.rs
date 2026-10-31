@@ -2255,3 +2255,148 @@ fn postings_are_the_same_after_an_aof_replay() {
     let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A reply as text: its strings and numbers, spaced.
+fn text_of(v: &RespValue) -> String {
+    match v {
+        RespValue::Array(items) => items.iter().map(text_of).collect::<Vec<_>>().join(" "),
+        RespValue::Int(n) => n.to_string(),
+        other => other.try_as_str().unwrap_or("?").to_string(),
+    }
+}
+
+/// The stems of TEXT fields, the index's language and its language field
+/// come back after a restart from the snapshot and the AOF written after it:
+/// the same documents found, with the same scores.
+#[test]
+fn stems_and_languages_survive_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("stems");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+
+    let queries: &[(&str, &str)] = &[
+        ("en", "@t:preferences"),
+        ("en", "dog"),
+        ("en", "@n:run"),
+        ("de", "häusern"),
+        ("ml", "haus"),
+    ];
+    let run = |c: &mut Conn| -> Vec<String> {
+        queries
+            .iter()
+            .map(|(index, query)| {
+                let mut args = vec!["FT.SEARCH", index, query, "WITHSCORES", "NOCONTENT"];
+                if *index == "ml" {
+                    args.extend(["LANGUAGE", "german"]);
+                }
+                text_of(&c.cmds(&args))
+            })
+            .collect()
+    };
+    let before = {
+        let mut c = Conn::connect(port1);
+        for create in [
+            &[
+                "FT.CREATE",
+                "en",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "en:",
+                "SCHEMA",
+                "t",
+                "TEXT",
+                "n",
+                "TEXT",
+                "NOSTEM",
+            ][..],
+            &[
+                "FT.CREATE",
+                "de",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "de:",
+                "LANGUAGE",
+                "german",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ],
+            &[
+                "FT.CREATE",
+                "ml",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "ml:",
+                "LANGUAGE_FIELD",
+                "lang",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ],
+        ] {
+            assert!(c.cmds(create).is_ok());
+        }
+        c.cmds(&["HSET", "en:1", "t", "I prefer email", "n", "running"]);
+        c.cmds(&["HSET", "de:1", "t", "Die Häuser sind schön"]);
+        c.cmds(&["HSET", "ml:1", "t", "laufende Häuser", "lang", "german"]);
+        // Into the snapshot: dump.kdb, and an AOF delta after it.
+        assert!(!c.cmds(&["BGREWRITEAOF"]).is_error());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while c
+            .cmds(&["INFO", "persistence"])
+            .as_str()
+            .contains("aof_rewrite_in_progress:1")
+        {
+            assert!(Instant::now() < deadline, "the rewrite did not finish");
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(Duration::from_millis(500));
+        // Into the AOF only.
+        c.cmds(&["HSET", "en:2", "t", "running dogs"]);
+        c.cmds(&["HSET", "de:2", "t", "ein Haus"]);
+        c.cmds(&["HSET", "ml:2", "t", "Häuser", "lang", "german"]);
+        let before = run(&mut c);
+        assert!(before[0].contains("en:1"), "{before:?}");
+        assert!(before[1].contains("en:2"), "{before:?}");
+        assert!(!before[2].contains("en:"), "NOSTEM: {before:?}");
+        assert!(
+            before[3].contains("de:1") && before[3].contains("de:2"),
+            "{before:?}"
+        );
+        assert!(
+            before[4].contains("ml:1") && before[4].contains("ml:2"),
+            "{before:?}"
+        );
+        before
+    };
+    kill_server(&mut srv1);
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(run(&mut c), before);
+        let info = text_of(&c.cmds(&["FT.INFO", "de"]));
+        assert!(info.contains("default_language"), "{info}");
+        let info = text_of(&c.cmds(&["FT.INFO", "ml"]));
+        assert!(info.contains("language_field"), "{info}");
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -435,15 +435,40 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         }
     }
-    let (filter, knn) = match crate::vector::filter::parse_query(&query_str, &params, &def) {
-        Ok(query) => (query.filter, query.knn),
-        Err(e) => return Some(resp_error(&e)),
+    // `VERBATIM`, `LANGUAGE` and `SCORER`, where an option may be.
+    let option = |name: &str| crate::commands::aggregate_pipeline::option_at(cmd, 3, name);
+    let value_of = |at: usize| cmd.get(at + 1).and_then(|a| std::str::from_utf8(a).ok());
+    let mut options = crate::vector::filter::QueryOptions {
+        verbatim: option("VERBATIM").is_some(),
+        language: None,
     };
+    if let Some(at) = option("LANGUAGE") {
+        match value_of(at).and_then(crate::vector::stem::Language::parse) {
+            Some(language) => options.language = Some(language),
+            None => return Some(resp_error("No such language")),
+        }
+    }
+    let scorer = match option("SCORER") {
+        Some(at) => match value_of(at).and_then(crate::vector::score::Scorer::parse) {
+            Some(scorer) => scorer,
+            None => {
+                return Some(resp_error(&format!(
+                    "No such scorer {}",
+                    value_of(at).unwrap_or_default()
+                )));
+            }
+        },
+        None => crate::vector::score::Scorer::default_scorer(),
+    };
+    let (filter, knn) =
+        match crate::vector::filter::parse_query_with(&query_str, &params, &def, options) {
+            Ok(query) => (query.filter, query.knn),
+            Err(e) => return Some(resp_error(&e)),
+        };
 
     // `ADDSCORES`: the relevance of each document, as `@__score`.
     let addscores = cmd.iter().any(|a| a.eq_ignore_ascii_case(b"ADDSCORES"));
-    let mut terms = ahash::AHashSet::new();
-    crate::commands::search::query_terms(&filter, &mut terms);
+    let scoring = crate::vector::score::Scoring::new(&def, &filter, scorer);
     let cursor = match crate::commands::search_tools::cursor_options(cmd) {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
@@ -489,7 +514,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             row.insert(
                 "__score".to_string(),
                 crate::commands::search::number_text(crate::commands::search::relevance(
-                    &def, inner, &terms,
+                    &def, key, inner, &scoring,
                 )),
             );
         }

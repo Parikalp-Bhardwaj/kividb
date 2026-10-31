@@ -683,6 +683,20 @@ impl Postings {
         Some(out)
     }
 
+    /// How many documents hold tag `tag` in TAG field `field`: its document
+    /// frequency, for relevance (see `score`).
+    pub fn tag_docs(&self, field: &str, tag: &str) -> usize {
+        self.fields
+            .iter()
+            .find_map(|f| match &f.kind {
+                Kind::Tag(t) if f.name == field => {
+                    t.numbers.get(tag).map(|&n| t.tags[n as usize].1.len())
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     fn numeric_field(&self, field: &str) -> Option<&NumericPostings> {
         self.fields.iter().find_map(|f| match &f.kind {
             Kind::Numeric(n) if f.name == field => Some(n),

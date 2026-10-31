@@ -1,6 +1,8 @@
 pub mod filter;
 pub mod postings;
+pub mod score;
 pub mod simd;
+pub mod stem;
 use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use parking_lot::RwLock;
@@ -379,6 +381,7 @@ impl IndexDef {
             a.push(self.prefixes.len().to_string());
             a.extend(self.prefixes.iter().cloned());
         }
+        a.extend(self.language.words());
         if let Some(words) = &self.stopwords {
             a.push("STOPWORDS".into());
             a.push(words.len().to_string());
@@ -649,6 +652,12 @@ pub struct IndexDef {
     /// index. `None` is the default list; an empty list is "none at all".
     pub stopwords: Option<Arc<Vec<String>>>,
     pub synonyms: SynonymGroups,
+    /// `LANGUAGE` and `LANGUAGE_FIELD`: what TEXT fields are stemmed in.
+    pub language: stem::LanguageOptions,
+    /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
+    /// language other than the index's, and that language. For a write of
+    /// some fields of a hash that leaves its language field as it was.
+    pub doc_languages: Arc<RwLock<AHashMap<String, stem::Language>>>,
     /// Indexed vocabulary — every distinct token observed in any TEXT field
     /// of any indexed key. Used by FT.SPELLCHECK to find candidates near
     /// a misspelled query term without re-scanning the keyspace.
@@ -692,7 +701,8 @@ pub struct IndexDef {
 }
 
 /// By document key, by TEXT field: the words it put in (see
-/// [`IndexDef::forward`]).
+/// [`IndexDef::forward`]), each followed by its stem if it was indexed with
+/// one (`stem::index_words`).
 pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
 
 impl IndexDef {
@@ -714,6 +724,66 @@ impl IndexDef {
     /// put in.
     pub fn remove_text(&self, key: &str) {
         self.change_text(key, |fields| fields.clear());
+        if self.language.field.is_some() {
+            self.doc_languages.write().remove(key);
+        }
+    }
+
+    /// What an occurrence of a word in TEXT field `field` counts: its
+    /// `WEIGHT`, truncated, and at least 1 (RediSearch's frequencies are
+    /// whole numbers).
+    pub fn weight_unit(&self, field: &str) -> usize {
+        self.fields
+            .iter()
+            .find(|f| f.name == field)
+            .map_or(1, |f| (f.options.weight as u32).max(1) as usize)
+    }
+
+    /// The language the words of the document at `key` are stemmed in, for a
+    /// write of `fields` (all of the document's if `whole`): the one its
+    /// language field names, or for a write that leaves that field as it
+    /// was, the one it had. Kept for the next write.
+    fn doc_language(
+        &self,
+        key: &str,
+        fields: &[(String, Arc<[u8]>)],
+        whole: bool,
+    ) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
+        };
+        let given = fields.iter().find(|(n, _)| n == name).map(|(_, v)| &**v);
+        if given.is_none() && !whole {
+            return self
+                .doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(self.language.language);
+        }
+        let language = self.language.of(given);
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
+        }
+        language
+    }
+
+    /// The language of the document at `key`, whose fields are all of `doc`.
+    fn language_of(&self, key: &str, doc: &Fields) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
+        };
+        let language = self.language.of(doc.get(name.as_str()).map(|v| &**v));
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
+        }
+        language
     }
 
     fn change_text(&self, key: &str, change: impl FnOnce(&mut AHashMap<String, Vec<String>>)) {
@@ -725,8 +795,16 @@ impl IndexDef {
         if old.is_empty() && new.is_empty() {
             return;
         }
+        // The document's length: its words, not their stems, each counted by
+        // its field's weight, as RediSearch counts it (see `score`).
         let words = |fields: &AHashMap<String, Vec<String>>| -> (usize, AHashSet<String>) {
-            let total = fields.values().map(Vec::len).sum();
+            let total = fields
+                .iter()
+                .map(|(field, tokens)| {
+                    let words = tokens.iter().filter(|t| !stem::is_stem(t)).count();
+                    words * self.weight_unit(field)
+                })
+                .sum();
             let unique = fields.values().flatten().cloned().collect();
             (total, unique)
         };
@@ -772,7 +850,7 @@ impl IndexDef {
         }
         if !new_unique.is_empty() {
             let mut vocab = self.vocab.write();
-            for word in &new_unique {
+            for word in new_unique.iter().filter(|w| !stem::is_stem(w)) {
                 if !vocab.contains(word) {
                     vocab.insert(word.clone());
                 }
@@ -915,6 +993,7 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         aliases: Vec::new(),
         stopwords: None,
         synonyms: Default::default(),
+        language: Default::default(),
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -969,6 +1048,8 @@ pub struct IndexSchema {
     pub stopwords: Option<Vec<String>>,
     /// The index's synonym groups (`FT.SYNUPDATE`).
     pub synonyms: SynonymGroups,
+    /// See [`IndexDef::language`].
+    pub language: stem::LanguageOptions,
 }
 
 impl IndexSchema {
@@ -997,6 +1078,8 @@ impl IndexSchema {
             indexes,
             stopwords: self.stopwords.map(Arc::new),
             synonyms: self.synonyms,
+            language: self.language,
+            doc_languages: Arc::new(RwLock::new(AHashMap::new())),
             vocab: Arc::new(RwLock::new(BTreeSet::new())),
             doc_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             total_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1024,13 +1107,15 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
+            let language = def.language_of(key, &inner);
             for field in fields {
                 let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                     continue;
                 };
-                let tokens: Vec<String> = tokenize_for_vocab(text)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect();
+                let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
+                    continue;
+                };
+                let tokens = stem::index_words(def, schema, language, text);
                 def.set_text(key, field, tokens);
             }
         }
@@ -1085,6 +1170,7 @@ pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
                 aliases: Vec::new(),
                 stopwords: def.stopwords.as_deref().cloned(),
                 synonyms: def.synonyms.clone(),
+                language: def.language.clone(),
             }
             .into_def();
             indexes.insert(name, fresh.clone());
@@ -1161,11 +1247,10 @@ pub fn backfill_from_db_progress(
         });
     }
 
-    let text_field_names: Vec<String> = def
+    let text_fields: Vec<&SchemaField> = def
         .fields
         .iter()
         .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
-        .map(|f| f.name.clone())
         .collect();
     let keeps_postings = def.keeps_postings();
 
@@ -1219,14 +1304,13 @@ pub fn backfill_from_db_progress(
                 }
             }
 
-            for fname in &text_field_names {
-                if let Some(raw) = inner.get(fname)
+            let language = def.language_of(key, &inner);
+            for field in &text_fields {
+                if let Some(raw) = inner.get(&field.name)
                     && let Ok(s) = std::str::from_utf8(raw)
                 {
-                    let tokens: Vec<String> = tokenize_for_vocab(s)
-                        .filter(|tok| !def.is_stopword(tok))
-                        .collect();
-                    def.set_text(key, fname, tokens);
+                    let tokens = stem::index_words(def, field, language, s);
+                    def.set_text(key, &field.name, tokens);
                 }
             }
         }
@@ -1888,7 +1972,15 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
         // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
         //
         // Each TEXT field written replaces what it held before: its words,
-        // stopwords left out (see `IndexDef::set_text`).
+        // stopwords left out, with their stems (see `IndexDef::set_text`).
+        let before = (def.language.field.is_some() && !whole).then(|| {
+            def.doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(def.language.language)
+        });
+        let language = def.doc_language(key, fields, whole);
         for f in &def.fields {
             if !matches!(f.field_type, FieldType::Text) || f.options.noindex {
                 continue;
@@ -1896,13 +1988,15 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
             let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
                 if whole {
                     def.set_text(key, &f.name, Vec::new());
+                } else if before.is_some_and(|before| before != language) {
+                    // The document's language changed and this field did
+                    // not: its words are stemmed again in the new one.
+                    restem(def, key, f, language);
                 }
                 continue;
             };
             let tokens: Vec<String> = match std::str::from_utf8(raw) {
-                Ok(s) => tokenize_for_vocab(s)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect(),
+                Ok(s) => stem::index_words(def, f, language, s),
                 Err(_) => Vec::new(),
             };
             def.set_text(key, &f.name, tokens);
@@ -1960,6 +2054,37 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
             }
         }
     }
+}
+
+/// Stem the words TEXT field `field` of the document at `key` holds in the
+/// index again, in `language`.
+fn restem(def: &IndexDef, key: &str, field: &SchemaField, language: stem::Language) {
+    let words: Option<Vec<String>> = def.forward.read().get(key).and_then(|fields| {
+        fields.get(&field.name).map(|tokens| {
+            tokens
+                .iter()
+                .filter(|t| !stem::is_stem(t))
+                .cloned()
+                .collect()
+        })
+    });
+    let Some(words) = words else {
+        return;
+    };
+    let stems = !field.options.nostem;
+    let mut tokens = Vec::with_capacity(words.len() * 2);
+    for word in words {
+        let stemmed = if stems {
+            stem::index_stem(language, &word)
+        } else {
+            None
+        };
+        tokens.push(word);
+        if let Some(s) = stemmed {
+            tokens.push(format!("{}{s}", stem::STEM_PREFIX));
+        }
+    }
+    def.set_text(key, &field.name, tokens);
 }
 
 /// Take the vector of the document at `key` out of a vector index: from a
@@ -3328,6 +3453,7 @@ mod flush_index_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -3364,6 +3490,7 @@ mod flush_index_tests {
                 aliases: Vec::new(),
                 stopwords: None,
                 synonyms: Default::default(),
+                language: Default::default(),
             }
             .into_def()
         };
@@ -3394,6 +3521,7 @@ mod alias_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def()
     }
@@ -3463,6 +3591,7 @@ mod alias_tests {
             aliases: vec!["a".into()],
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();

@@ -4,7 +4,7 @@
 // query (`vector::filter`) against an index, and the reply.
 
 use crate::store::ValueRef;
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -277,6 +277,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut on = IndexOn::Hash;
     let mut prefixes: Vec<String> = Vec::new();
     let mut stopwords: Option<Vec<String>> = None;
+    let mut language = crate::vector::stem::LanguageOptions::default();
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -333,10 +334,26 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 skip_initial_scan = true;
                 i += 1;
             }
+            // What the words of TEXT fields are stemmed in (see `stem`).
+            "LANGUAGE" => {
+                let name = cmd
+                    .get(i + 1)
+                    .map(|a| text(a))
+                    .ok_or_else(|| "Bad arguments for LANGUAGE: expected a value".to_string())?;
+                language.language = crate::vector::stem::Language::parse(name)
+                    .ok_or_else(|| "Invalid language".to_string())?;
+                i += 2;
+            }
+            "LANGUAGE_FIELD" => {
+                let field = cmd.get(i + 1).map(|a| text(a)).ok_or_else(|| {
+                    "Bad arguments for LANGUAGE_FIELD: expected a value".to_string()
+                })?;
+                language.field = Some(field.to_string());
+                i += 2;
+            }
             // Ranking and storage hints with no counterpart here. They
             // change no result a query can see.
-            "LANGUAGE" | "LANGUAGE_FIELD" | "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD"
-            | "TEMPORARY" => {
+            "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD" | "TEMPORARY" => {
                 if cmd.get(i + 1).is_none() {
                     return Err(format!("Bad arguments for {word}: expected a value"));
                 }
@@ -372,6 +389,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         aliases: Vec::new(),
         stopwords,
         synonyms: Default::default(),
+        language,
     }
     .into_def();
 
@@ -391,6 +409,21 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
 }
 
 // ── FT.INFO ───────────────────────────────────────────────────────────────────
+
+/// What `index_definition` of FT.INFO says of the index's language, as Redis
+/// says it: nothing for English.
+fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if language.language != crate::vector::stem::Language::English {
+        out.push(resp_bulk_str("default_language"));
+        out.push(resp_bulk_str(language.language.name()));
+    }
+    if let Some(field) = &language.field {
+        out.push(resp_bulk_str("language_field"));
+        out.push(resp_bulk_str(field));
+    }
+    out
+}
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
 fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
@@ -469,9 +502,11 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }),
                 resp_bulk_str("prefixes"),
                 resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-                resp_bulk_str("default_score"),
-                resp_bulk_str("1"),
-            ],
+            ]
+            .into_iter()
+            .chain(language_definition(&def.language))
+            .chain([resp_bulk_str("default_score"), resp_bulk_str("1")])
+            .collect(),
         ),
     );
     put(
@@ -739,10 +774,17 @@ pub(crate) fn on_timeout_fails() -> bool {
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     match filter {
         Filter::Text {
-            term: TextMatch::Exact(term),
+            term: TextMatch::Exact(term) | TextMatch::Expanded(term),
             ..
         } => {
             out.insert(term.clone());
+        }
+        // A stem, written as the index has it.
+        Filter::Text {
+            term: TextMatch::Stem(stem),
+            ..
+        } => {
+            out.insert(format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem));
         }
         Filter::Phrase { terms, .. } => out.extend(terms.iter().cloned()),
         Filter::And(l, r) | Filter::Or(l, r) => {
@@ -786,7 +828,11 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
     match filter {
         Filter::MatchNone => Some(AHashSet::new()),
         Filter::Text { fields, term } => Some(match term {
-            TextMatch::Exact(t) => postings(fields, &|_| false, Some(t)),
+            TextMatch::Exact(t) | TextMatch::Expanded(t) => postings(fields, &|_| false, Some(t)),
+            TextMatch::Stem(stem) => {
+                let term = format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem);
+                postings(fields, &|_| false, Some(&term))
+            }
             TextMatch::Prefix(p) => postings(fields, &|tok| tok.starts_with(p.as_str()), None),
             TextMatch::Suffix(s) => postings(fields, &|tok| tok.ends_with(s.as_str()), None),
             TextMatch::Infix(s) => postings(fields, &|tok| tok.contains(s.as_str()), None),
@@ -990,57 +1036,15 @@ pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
     ids.iter().filter_map(|id| p.key(id).cloned()).collect()
 }
 
-/// BM25 relevance of one document for the query's words.
-///
-///   score(d, Q) = Σ_t  IDF(t) · tf_norm(t, d) · weight(field)
-///
-///   IDF(t)       = ln((N - df(t) + 0.5) / (df(t) + 0.5) + 1)
-///   tf_norm(t,d) = tf · (k1 + 1) / (tf + k1 · (1 - b + b · dl/avgdl))
-pub(crate) fn relevance(def: &IndexDef, fields: &Fields, terms: &AHashSet<String>) -> f64 {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-    if terms.is_empty() {
-        return 1.0;
-    }
-    use std::sync::atomic::Ordering::Relaxed;
-    let n = def.doc_count.load(Relaxed).max(1) as f64;
-    let avgdl = (def.total_tokens.load(Relaxed) as f64 / n).max(1.0);
-    let df_map = def.doc_freq.read();
-
-    let mut score = 0.0f64;
-    for field in &def.fields {
-        if !matches!(field.field_type, FieldType::Text) || field.options.noindex {
-            continue;
-        }
-        let Some(value) = fields
-            .get(&field.name)
-            .and_then(|b| std::str::from_utf8(b).ok())
-        else {
-            continue;
-        };
-        let mut tf: AHashMap<&str, usize> = AHashMap::new();
-        let mut dl = 0usize;
-        for token in crate::vector::tokenize_for_vocab(value) {
-            if def.is_stopword(&token) {
-                continue;
-            }
-            dl += 1;
-            if let Some(term) = terms.get(&token) {
-                *tf.entry(term.as_str()).or_insert(0) += 1;
-            }
-        }
-        if dl == 0 {
-            continue;
-        }
-        for (term, count) in tf {
-            let df = df_map.get(term).copied().unwrap_or(1) as f64;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            let count = count as f64;
-            let tf_norm = (count * (K1 + 1.0)) / (count + K1 * (1.0 - B + B * dl as f64 / avgdl));
-            score += idf * tf_norm * field.options.weight;
-        }
-    }
-    score.max(0.001)
+/// Relevance of the document at `key`, whose fields are `fields`, for the
+/// query `scoring` was made for: as Redis 8 scores it (see `vector::score`).
+pub(crate) fn relevance(
+    def: &IndexDef,
+    key: &str,
+    fields: &Fields,
+    scoring: &crate::vector::score::Scoring,
+) -> f64 {
+    scoring.score(def, key, fields)
 }
 
 /// Every document of the index that the filter accepts. In no particular
@@ -1052,14 +1056,26 @@ pub(crate) fn filter_search(
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
 ) -> FilterHits {
-    let mut terms = AHashSet::new();
-    query_terms(filter, &mut terms);
+    let scorer = crate::vector::score::Scorer::default_scorer();
+    filter_search_scored(ctx, def, filter, only, deadline, scorer)
+}
+
+/// [`filter_search`], scored by `scorer` (`SCORER`).
+pub(crate) fn filter_search_scored(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+    deadline: Option<Instant>,
+    scorer: crate::vector::score::Scorer,
+) -> FilterHits {
+    let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
     let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
         out.push(Match {
             key: key.to_string(),
-            score: relevance(def, fields, &terms),
+            score: relevance(def, key, fields, &scoring),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
     });
@@ -1193,6 +1209,10 @@ struct SearchArgs {
     highlight: Option<(Vec<String>, String, String)>,
     /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
     timeout_ms: Option<u64>,
+    /// `VERBATIM` and `LANGUAGE`: how the query's words are expanded.
+    query: filter::QueryOptions,
+    /// `SCORER`; `FT.CONFIG DEFAULT_SCORER` if not given.
+    scorer: Option<crate::vector::score::Scorer>,
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -1230,9 +1250,14 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 args.withsortkeys = true;
                 i += 1;
             }
-            // How words are expanded, and how phrases are held together:
-            // none of it applies to an index without stemming or slop.
-            "VERBATIM" | "NOSTOPWORDS" | "INORDER" => i += 1,
+            // The query's words are looked for as they are, not also as
+            // their stems.
+            "VERBATIM" => {
+                args.query.verbatim = true;
+                i += 1;
+            }
+            // How phrases are held together: not applied here.
+            "NOSTOPWORDS" | "INORDER" => i += 1,
             "TIMEOUT" => {
                 let raw = arg(i + 1, "TIMEOUT")?;
                 args.timeout_ms = Some(raw.parse::<u64>().map_err(|_| {
@@ -1240,13 +1265,24 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 })?);
                 i += 2;
             }
-            "SLOP" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
+            "LANGUAGE" => {
+                let name = arg(i + 1, "LANGUAGE")?;
+                args.query.language = Some(
+                    crate::vector::stem::Language::parse(name)
+                        .ok_or_else(|| "No such language".to_string())?,
+                );
+                i += 2;
+            }
+            "SLOP" | "EXPANDER" | "PAYLOAD" => {
                 arg(i + 1, &word)?;
                 i += 2;
             }
-            // One ranking function is implemented: BM25.
             "SCORER" => {
-                arg(i + 1, "SCORER")?;
+                let name = arg(i + 1, "SCORER")?;
+                args.scorer = Some(
+                    crate::vector::score::Scorer::parse(name)
+                        .ok_or_else(|| format!("No such scorer {name}"))?,
+                );
                 i += 2;
             }
             "DIALECT" => {
@@ -1437,15 +1473,30 @@ pub(crate) fn distance_text(distance: f32) -> String {
 }
 
 /// `text`, with each word that is one of `terms` wrapped in the two tags.
-fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> String {
+fn highlight(
+    value: &str,
+    terms: &AHashSet<String>,
+    open: &str,
+    close: &str,
+    language: crate::vector::stem::Language,
+) -> String {
+    use crate::vector::stem;
     let mut out = String::with_capacity(value.len() + 16);
     let mut word = String::new();
+    // A word is marked if the query found it by its stem, too.
+    let stems = terms.iter().any(|t| stem::is_stem(t));
+    let found = |t: &str| {
+        terms.contains(t)
+            || (stems
+                && stem::index_stem(language, t)
+                    .is_some_and(|s| terms.contains(&format!("{}{s}", stem::STEM_PREFIX))))
+    };
     let flush = |word: &mut String, out: &mut String| {
         if word.is_empty() {
             return;
         }
         let token = crate::vector::tokenize_for_vocab(word).next();
-        if token.is_some_and(|t| terms.contains(&t)) {
+        if token.is_some_and(|t| found(&t)) {
             out.push_str(open);
             out.push_str(word);
             out.push_str(close);
@@ -1500,7 +1551,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .get(index_name)
         .cloned()
         .ok_or_else(|| no_such_index(index_name))?;
-    let query = filter::parse_query(query_text, &args.params, &def)?;
+    let query = filter::parse_query_with(query_text, &args.params, &def, args.query)?;
     // Ordered by distance rather than relevance.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
@@ -1627,7 +1678,11 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 _ => None,
             };
             let by_distance = filter.vector_range().is_some() && !filter.has_text();
-            let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
+            let scorer = args
+                .scorer
+                .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+            let found =
+                filter_search_scored(ctx, &def, &filter, args.inkeys.as_ref(), deadline, scorer);
             timed_out = found.timed_out;
             let mut matches = found.matches;
             // A sort cannot stop part-way. Past the deadline it is left
@@ -1755,7 +1810,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         .iter()
                         .any(|name| field.is_some_and(|f| f.attribute() == name)));
             match std::str::from_utf8(value) {
-                Ok(value) if wanted => highlight(value, &terms, open, close).into_bytes(),
+                Ok(value) if wanted => {
+                    highlight(value, &terms, open, close, def.language.language).into_bytes()
+                }
                 _ => value.to_vec(),
             }
         };
@@ -2276,7 +2333,13 @@ mod tests {
     fn highlighting_marks_whole_words() {
         let terms: AHashSet<String> = ["fox".to_string(), "quick".to_string()].into();
         assert_eq!(
-            highlight("The Quick brown fox, foxes", &terms, "<b>", "</b>"),
+            highlight(
+                "The Quick brown fox, foxes",
+                &terms,
+                "<b>",
+                "</b>",
+                crate::vector::stem::Language::English
+            ),
             "The <b>Quick</b> brown <b>fox</b>, foxes"
         );
     }
