@@ -31,6 +31,30 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **Stemming of TEXT fields, as in Redis.** A word is now found by its
+  other forms: `@t:preferences` finds a document that says `I prefer
+  email`, `run` finds `running`, and `dog` finds `dogs`. Before, only the
+  very word matched, so mem0's keyword search, among others, found less
+  than it does on Redis. It works as in RediSearch: each word of a TEXT
+  field is indexed together with its stem, and each word of a query is
+  looked for as itself, as its stem, and as the bare stem; `FT.EXPLAIN`
+  shows the expansion as Redis does (`+prefer(expanded)`). The language is
+  English unless `FT.CREATE … LANGUAGE <language>` names another, or a
+  document names its own in the field `LANGUAGE_FIELD` gives; `FT.SEARCH`
+  and `FT.AGGREGATE … LANGUAGE <language>` stem the query in another one.
+  `VERBATIM` turns the expansion off for one query, and `NOSTEM` for one
+  field. A word shorter than `MINSTEMLEN` bytes (`search-min-stem-len`, 4
+  by default, at least 2) is not stemmed. The stemmers are Snowball's,
+  from the `rust-stemmers` crate (MIT/BSD-3-Clause): Arabic, Danish, Dutch,
+  English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian,
+  Portuguese, Romanian, Russian, Spanish, Swedish, Tamil and Turkish. The
+  other languages Redis accepts are accepted, and their words are indexed
+  and searched as they are. Nothing needs doing on upgrade: indexes are
+  built again from their documents whenever the server starts, so an index
+  made by an older release gets its stems the first time 1.2.0 loads it.
+  An index's `LANGUAGE` and `LANGUAGE_FIELD` are kept in snapshots, in a
+  section of its own that older releases skip. It costs memory and indexing time: on a million short texts (6 to 14 words each) the dataset took 2.60 KB a document instead of 1.94 KB, and indexing a document took about 60% more of the server's CPU; a `NOSTEM` field costs what it did. Each stem is one more word in the inverted and forward indexes, which hold each word and each document key as a string of its own.
+
 - **Signed build provenance for every release file and image.** The
   release workflow signs a GitHub artifact attestation (Sigstore, with the
   workflow's own identity) for every tarball, `.deb` and `.rpm` in a
@@ -169,6 +193,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   skip it. Config file, command line, and `CONFIG SET` at runtime.
 
 ### Changed
+
+- **Search scores are Redis's.** `WITHSCORES`, `ADDSCORES`, and the order
+  of results now come out as Redis 8.10 gives them for the same data and
+  query. KiviDB's BM25 had the standard formula, but scored a different
+  thing: a TAG value a query asks for (`@user_id:{alice}`) is a term Redis
+  scores, and KiviDB did not, which is why mem0 saw KiviDB's keyword scores
+  at about half of Redis's; a field's `WEIGHT` multiplied the score, where
+  Redis counts each occurrence of a word that many times (and so does the
+  document's length); the number of documents and their average length
+  left out documents without a TEXT field; a word's count was taken in one
+  field rather than the whole document; `*` and a TAG-only query scored 1,
+  and `NOT` and NUMERIC clauses did not score 0. `SCORER` is now honoured,
+  not ignored: `BM25STD` (the default, or `FT.CONFIG DEFAULT_SCORER`),
+  `BM25STD.TANH`, `BM25`, `TFIDF`, `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE` and
+  `HAMMING`; an unknown name is an error, as in Redis. A threshold an
+  application set on the old scores needs checking.
 
 - **Vector search: distances in SIMD, a filtered KNN without copies.**
   Every vector distance (HNSW search and insert, FLAT, the KNN step of a
